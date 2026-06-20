@@ -1,4 +1,5 @@
-# 🧠 Pluribus — Servei de Memòria Compartida Multi-Agent
+# Pluribus
+*"e pluribus unum" — del llati «de molts, un»*
 
 **Pluribus** és un servei lleuger de memòria compartida central per a múltiples agents d'IA. Dissenyat per a l'ecosistema Hermes, permet que diversos agents (Hetzner, RPi local, Picoclaw) emmagatzemin i consultin informació compartida de manera eficient.
 
