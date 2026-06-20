@@ -1,0 +1,14 @@
+[Unit]
+Description=Brain - Multi-agent shared memory service
+After=network.target
+
+[Service]
+Type=simple
+User=root
+WorkingDirectory=/opt/brain
+ExecStart=/opt/brain/venv/bin/uvicorn brain.main:app --host 0.0.0.0 --port 8790
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target
