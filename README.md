@@ -1,3 +1,7 @@
+<p align="center">
+  <img src="assets/pluribus-logo.jpg" alt="Pluribus Logo" width="400">
+</p>
+
 # Pluribus
 *"e pluribus unum" — del llati «de molts, un»*
 
