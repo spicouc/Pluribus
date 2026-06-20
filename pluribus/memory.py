@@ -18,10 +18,14 @@ from pluribus.config import settings
 from pluribus.db import get_db
 from pluribus.webhooks import trigger_fact_created_webhooks
 from pluribus.embedding import embedding_service
+from pluribus.expiry_worker import expire_old_facts
 from pluribus.models import (
     AuditEntry,
     FactResponse,
     LsResponse,
+    MemoryListRequest,
+    MemoryListResponse,
+    MemoryResponse,
     QueryParams,
     SearchRequest,
     SearchResponse,
@@ -117,12 +121,17 @@ async def write_memory(
     _check_permission(agent, "write", body.scope)
 
     async with get_db() as db:
+        # Calculate expires_at if ttl_days is set
+        expires_at = None
+        if body.ttl_days is not None:
+            import datetime as _dt
+            expires_at = (_dt.datetime.utcnow() + _dt.timedelta(days=body.ttl_days)).strftime("%Y-%m-%d %H:%M:%S")
         cursor = await db.execute(
             """
-            INSERT INTO facts (scope, category, agent_id, key, content, metadata)
-            VALUES (?, ?, ?, ?, ?, ?)
+            INSERT INTO facts (scope, category, agent_id, key, content, metadata, ttl_days, expires_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
             """,
-            (body.scope, body.category or "events", agent["id"], body.key, body.content, json.dumps(body.metadata)),
+            (body.scope, body.category or "events", agent["id"], body.key, body.content, json.dumps(body.metadata), body.ttl_days, expires_at),
         )
         # Obtenim l'UUID generat pel DEFAULT de la columna id
         rowid = cursor.lastrowid
@@ -833,6 +842,118 @@ async def ls_memory(
     return LsResponse(items=items, total=total, scope=scope, filters={
         "category": category, "agent_id": agent_id,
     })
+
+
+@router.get("", response_model=MemoryListResponse)
+async def list_memory(
+    request: Request,
+    limit: int = Query(50, ge=1, le=500),
+    offset: int = Query(0, ge=0),
+    agent_id: Optional[str] = Query(None),
+    scope: Optional[str] = Query(None),
+    category: Optional[str] = Query(None),
+    from_date: Optional[str] = Query(None, alias="from"),
+    to_date: Optional[str] = Query(None, alias="to"),
+    sort: str = Query("created_at:desc"),
+) -> MemoryListResponse:
+    """Llista fets amb paginació i filtres.
+
+    Suporta:
+    - limit (default 50, max 500)
+    - offset (default 0)
+    - agent_id, scope, category
+    - from, to (dates for created_at)
+    - sort (created_at:asc|desc)
+    """
+    agent: dict[str, Any] = request.state.agent
+    _check_permission(agent, "read")
+
+    # Parse sort
+    sort_field = "created_at"
+    sort_dir = "DESC"
+    if sort:
+        parts = sort.split(":")
+        if len(parts) == 2:
+            sort_field = parts[0] if parts[0] in ("created_at", "updated_at") else "created_at"
+            sort_dir = "DESC" if parts[1].upper() == "DESC" else "ASC"
+
+    async with get_db() as db:
+        where = ["f.deleted_at IS NULL"]
+        bind: list[Any] = []
+
+        if scope:
+            where.append("f.scope = ?")
+            bind.append(scope)
+        if category:
+            where.append("f.category = ?")
+            bind.append(category)
+        if agent_id:
+            where.append("f.agent_id = ?")
+            bind.append(agent_id)
+        if from_date:
+            where.append("f.created_at >= ?")
+            bind.append(from_date)
+        if to_date:
+            where.append("f.created_at <= ?")
+            bind.append(to_date)
+
+        where_clause = " AND ".join(where) if where else "1=1"
+
+        # Count total
+        cursor = await db.execute(
+            f"SELECT COUNT(*) as cnt FROM facts f WHERE {where_clause}", bind
+        )
+        row = await cursor.fetchone()
+        total = row["cnt"] if row else 0
+
+        # Fetch items
+        cursor = await db.execute(
+            f"""SELECT f.id, f.scope, f.category, f.agent_id, f.key, f.content,
+                       f.metadata, f.version, f.created_at, f.updated_at,
+                       f.ttl_days, f.expires_at
+                FROM facts f
+                WHERE {where_clause}
+                ORDER BY f.{sort_field} {sort_dir}
+                LIMIT ? OFFSET ?""",
+            [*bind, limit, offset],
+        )
+        rows = await cursor.fetchall()
+
+        facts = []
+        for row in rows:
+            row_dict = dict(row)
+            try:
+                metadata = json.loads(row_dict["metadata"]) if isinstance(row_dict["metadata"], str) else row_dict["metadata"]
+            except (json.JSONDecodeError, TypeError):
+                metadata = {}
+            facts.append(MemoryResponse(
+                id=row_dict["id"],
+                scope=row_dict["scope"],
+                category=row_dict.get("category", ""),
+                agent_id=row_dict["agent_id"],
+                key=row_dict["key"],
+                content=row_dict["content"],
+                metadata=metadata,
+                version=row_dict["version"],
+                created_at=row_dict["created_at"],
+                updated_at=row_dict["updated_at"],
+                ttl_days=row_dict.get("ttl_days"),
+                expires_at=row_dict.get("expires_at"),
+            ))
+
+    return MemoryListResponse(facts=facts, total=total, limit=limit, offset=offset)
+
+
+@router.post("/expire", status_code=200)
+async def expire_memory(
+    request: Request,
+) -> dict:
+    """Força l'expiració manual de facts amb TTL vençut. Admin només."""
+    agent: dict[str, Any] = request.state.agent
+    _check_permission(agent, "admin")
+
+    count = await expire_old_facts()
+    return {"message": f"Expirats {count} facts", "expired_count": count}
 
 
 @router.get("/audit", response_model=list[AuditEntry])

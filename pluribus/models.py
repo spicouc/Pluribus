@@ -26,6 +26,7 @@ class WriteRequest(BaseModel):
     category: str = "events"
     key: Optional[str] = None
     metadata: dict[str, Any] = Field(default_factory=dict)
+    ttl_days: int | None = None
 
 
 class WriteResponse(BaseModel):
@@ -168,6 +169,44 @@ class StatsResponse(BaseModel):
     total_consolidated: int = 0
     total_notion_cached: int = 0
     ollama_connected: bool = False
+
+# ─── Memory list / pagination models ──────────────────
+
+class MemoryListRequest(BaseModel):
+    """Parámetres per llistar fets amb paginació i filtres."""
+    limit: int = Field(default=50, ge=1, le=500)
+    offset: int = Field(default=0, ge=0)
+    agent_id: Optional[str] = None
+    scope: Optional[str] = None
+    category: Optional[str] = None
+    from_date: Optional[str] = None  # created_at >=
+    to_date: Optional[str] = None    # created_at <=
+    sort: str = "created_at:desc"
+
+
+class MemoryResponse(BaseModel):
+    """Representació d'un fet per a la llista paginada."""
+    id: str
+    scope: str
+    category: str = "events"
+    agent_id: Optional[str] = None
+    key: Optional[str] = None
+    content: str
+    metadata: dict[str, Any] = Field(default_factory=dict)
+    version: int = 1
+    created_at: str
+    updated_at: str
+    ttl_days: Optional[int] = None
+    expires_at: Optional[str] = None
+
+
+class MemoryListResponse(BaseModel):
+    """Resposta paginada de la llista de fets."""
+    facts: list[MemoryResponse]
+    total: int
+    limit: int
+    offset: int
+
 
 # ─── Agent models ──────────────────────────────────────
 
