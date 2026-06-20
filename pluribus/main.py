@@ -8,7 +8,9 @@ from __future__ import annotations
 
 from contextlib import asynccontextmanager
 
-from fastapi import FastAPI
+import asyncio
+import json
+from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse
 
 from pluribus.config import settings
@@ -62,7 +64,7 @@ async def lifespan(app: FastAPI):
             try:
                 await asyncio.sleep(86400)  # 24 hores
                 print("🗜 Iniciant compactació programada...")
-                result = await compact_database()
+                result = await asyncio.to_thread(compact_database)
                 print(f"🗜 Compactació completada: {json.dumps(result)}")
             except asyncio.CancelledError:
                 break
@@ -124,7 +126,7 @@ async def admin_compact(request: Request) -> dict:
         from fastapi import HTTPException
         raise HTTPException(status_code=403, detail="Permís admin requerit")
 
-    result = await compact_database()
+    result = await asyncio.to_thread(compact_database)
     return {
         "message": "Compactació completada",
         "archived_facts": result["archived_facts"],

@@ -3,42 +3,36 @@ Compactació programada de la base de dades.
 
 Executa VACUUM i arxiva facts marcats com deleted_at > 30 dies
 a un fitxer SQLite separat.
+
+Funció sincrona (sqlite3) per evitar conflictes amb aiosqlite.
+Des de FastAPI, cridar amb: await asyncio.to_thread(compact_database)
 """
 
 import json
 import logging
 import os
 import sqlite3
-import time
 from datetime import datetime, timedelta
 from pathlib import Path
 
 logger = logging.getLogger("pluribus.compact")
 
-# Configuració
 DB_PATH = "/opt/brain/data/brain.db"
 ARCHIVE_PATH = "/opt/brain/data/archive.db"
 
 
 def get_db_size(path: str) -> int:
-    """Retorna la mida de la base de dades en bytes."""
     try:
         return os.path.getsize(path)
     except OSError:
         return 0
 
 
-async def compact_database(db_path: str = DB_PATH, archive_path: str = ARCHIVE_PATH) -> dict:
-    """Executa VACUUM i arxiva facts antics.
+def compact_database(db_path: str = DB_PATH, archive_path: str = ARCHIVE_PATH) -> dict:
+    """Executa VACUUM i arxiva facts antics (SINCRON).
 
-    Returns:
-        dict amb estadístiques: {
-            "archived_facts": int,
-            "space_before": int,
-            "space_after": int,
-            "space_saved": int,
-            "vacuum_done": bool
-        }
+    Retorna dict amb estadistiques.
+    Nota: Funcio sincrona. Cridar amb asyncio.to_thread() desde FastAPI.
     """
     result = {
         "archived_facts": 0,
@@ -50,46 +44,36 @@ async def compact_database(db_path: str = DB_PATH, archive_path: str = ARCHIVE_P
 
     db_path = str(db_path)
     archive_path = str(archive_path)
-
-    # Mida abans
     result["space_before"] = get_db_size(db_path)
 
-    # Archivar facts deleted > 30 dies
+    # Arxivar facts deleted > 30 dies
     try:
         conn = sqlite3.connect(db_path)
         conn.row_factory = sqlite3.Row
         conn.execute("PRAGMA journal_mode=WAL")
-        conn.execute("PRAGMA foreign_keys=ON")
 
-        cursor = conn.execute(
-            """SELECT id, scope, category, agent_id, key, content, metadata,
-                      version, created_at, updated_at, deleted_at,
-                      ttl_days, expires_at
-               FROM facts
-               WHERE deleted_at IS NOT NULL
-                 AND deleted_at < datetime('now', '-30 days')"""
-        )
+        cursor = conn.execute("""
+            SELECT id, scope, category, agent_id, key, content, metadata,
+                   version, created_at, updated_at, deleted_at,
+                   ttl_days, expires_at
+            FROM facts
+            WHERE deleted_at IS NOT NULL
+              AND deleted_at < datetime('now', '-30 days')
+        """)
         old_facts = cursor.fetchall()
 
         if old_facts:
-            # Crear/obrir archive.db
             arch_conn = sqlite3.connect(archive_path)
-            arch_conn.execute("""CREATE TABLE IF NOT EXISTS archived_facts (
-                id TEXT PRIMARY KEY,
-                scope TEXT,
-                category TEXT,
-                agent_id TEXT,
-                key TEXT,
-                content TEXT,
-                metadata TEXT,
-                version INTEGER,
-                created_at TEXT,
-                updated_at TEXT,
-                deleted_at TEXT,
-                ttl_days INTEGER,
-                expires_at TEXT,
-                archived_at TEXT DEFAULT (datetime('now'))
-            )""")
+            arch_conn.execute("""
+                CREATE TABLE IF NOT EXISTS archived_facts (
+                    id TEXT PRIMARY KEY,
+                    scope TEXT, category TEXT, agent_id TEXT, key TEXT,
+                    content TEXT, metadata TEXT, version INTEGER,
+                    created_at TEXT, updated_at TEXT, deleted_at TEXT,
+                    ttl_days INTEGER, expires_at TEXT,
+                    archived_at TEXT DEFAULT (datetime('now'))
+                )
+            """)
 
             for fact in old_facts:
                 arch_conn.execute(
@@ -97,16 +81,15 @@ async def compact_database(db_path: str = DB_PATH, archive_path: str = ARCHIVE_P
                        (id, scope, category, agent_id, key, content, metadata,
                         version, created_at, updated_at, deleted_at, ttl_days, expires_at)
                        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
-                    (fact["id"], fact["scope"], fact["category"], fact["agent_id"],
-                     fact["key"], fact["content"], fact["metadata"],
-                     fact["version"], fact["created_at"], fact["updated_at"],
-                     fact["deleted_at"], fact["ttl_days"], fact["expires_at"]),
+                    (fact["id"], fact["scope"], fact["category"],
+                     fact["agent_id"], fact["key"], fact["content"],
+                     fact["metadata"], fact["version"], fact["created_at"],
+                     fact["updated_at"], fact["deleted_at"],
+                     fact["ttl_days"], fact["expires_at"]),
                 )
-
             arch_conn.commit()
             arch_conn.close()
 
-            # Eliminar fets arxivats de la DB principal
             ids = [f["id"] for f in old_facts]
             placeholders = ",".join("?" * len(ids))
             conn.execute(f"DELETE FROM chunks WHERE fact_id IN ({placeholders})", ids)
@@ -131,7 +114,6 @@ async def compact_database(db_path: str = DB_PATH, archive_path: str = ARCHIVE_P
     except Exception as exc:
         logger.error("Error en VACUUM: %s", exc)
 
-    # Mida després
     result["space_after"] = get_db_size(db_path)
     result["space_saved"] = result["space_before"] - result["space_after"]
 
@@ -139,12 +121,6 @@ async def compact_database(db_path: str = DB_PATH, archive_path: str = ARCHIVE_P
 
 
 if __name__ == "__main__":
-    import asyncio
-
     logging.basicConfig(level=logging.INFO)
-
-    async def run():
-        result = await compact_database()
-        print(json.dumps(result, indent=2))
-
-    asyncio.run(run())
+    result = compact_database()
+    print(json.dumps(result, indent=2))
