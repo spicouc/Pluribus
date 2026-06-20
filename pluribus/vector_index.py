@@ -17,7 +17,7 @@ from typing import Any, Optional
 import numpy as np
 from turbovec import IdMapIndex
 
-from brain.config import settings
+from pluribus.config import settings
 
 logger = logging.getLogger(__name__)
 

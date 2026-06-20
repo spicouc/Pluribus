@@ -15,8 +15,8 @@ import bcrypt
 from fastapi import FastAPI, Request, Response
 from fastapi.responses import JSONResponse
 
-from brain.config import settings
-from brain.db import get_db
+from pluribus.config import settings
+from pluribus.db import get_db
 
 
 # ── Cache LRU per bcrypt ──────────────────────────────────────────────

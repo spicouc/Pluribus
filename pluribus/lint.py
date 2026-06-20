@@ -16,7 +16,7 @@ from typing import Any
 from fastapi import APIRouter, HTTPException, Request
 from starlette.responses import JSONResponse
 
-from brain.db import get_db
+from pluribus.db import get_db
 
 router = APIRouter(prefix="/v1/memory", tags=["lint"])
 

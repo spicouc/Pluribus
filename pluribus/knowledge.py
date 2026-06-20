@@ -8,8 +8,8 @@ from typing import Any, Optional
 from fastapi import APIRouter, HTTPException, Query, Request
 from starlette.responses import JSONResponse
 
-from brain.db import get_db
-from brain.models import (
+from pluribus.db import get_db
+from pluribus.models import (
     CreateRelationRequest,
     GraphEdge,
     GraphNode,

@@ -11,16 +11,16 @@ from contextlib import asynccontextmanager
 from fastapi import FastAPI
 from fastapi.responses import JSONResponse
 
-from brain.config import settings
-from brain.dashboard import router as dashboard_router
-from brain.db import init_db
-from brain.embedding import embedding_service
-from brain.mcp import router as mcp_router
-from brain.agents import router as agents_router
-from brain.webhooks import router as webhooks_router
-from brain.memory import router as memory_router
-from brain.security import register_security_middleware
-from brain.knowledge import router as knowledge_router
+from pluribus.config import settings
+from pluribus.dashboard import router as dashboard_router
+from pluribus.db import init_db
+from pluribus.embedding import embedding_service
+from pluribus.mcp import router as mcp_router
+from pluribus.agents import router as agents_router
+from pluribus.webhooks import router as webhooks_router
+from pluribus.memory import router as memory_router
+from pluribus.security import register_security_middleware
+from pluribus.knowledge import router as knowledge_router
 
 
 @asynccontextmanager

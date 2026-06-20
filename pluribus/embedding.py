@@ -10,7 +10,7 @@ from typing import Optional
 import numpy as np
 import requests
 
-from brain.config import settings
+from pluribus.config import settings
 
 
 class EmbeddingService:
@@ -181,7 +181,7 @@ class EmbeddingService:
         Falls back to numpy dot products if TurboVec fails.
         """
         try:
-            from brain.vector_index import vector_index
+            from pluribus.vector_index import vector_index
             results = await vector_index.search(
                 query_vec,
                 scope_filter=scope_filter,

@@ -4,7 +4,7 @@ import aiosqlite
 from contextlib import asynccontextmanager
 from pathlib import Path
 
-from brain.config import settings
+from pluribus.config import settings
 
 
 @asynccontextmanager

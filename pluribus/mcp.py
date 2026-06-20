@@ -16,10 +16,10 @@ from typing import Any
 from fastapi import APIRouter, HTTPException, Request
 from fastapi.responses import JSONResponse
 
-from brain.audit import log_audit
-from brain.config import settings
-from brain.db import get_db
-from brain.embedding import embedding_service
+from pluribus.audit import log_audit
+from pluribus.config import settings
+from pluribus.db import get_db
+from pluribus.embedding import embedding_service
 
 router = APIRouter(prefix="/mcp", tags=["mcp"])
 

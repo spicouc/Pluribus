@@ -23,7 +23,7 @@ import aiosqlite
 import numpy as np
 import requests
 
-from brain.config import settings
+from pluribus.config import settings
 import urllib.request
 import json as _json
 
@@ -136,8 +136,8 @@ async def _check_contradictions_impl(
     agent_id: str,
 ) -> None:
     """Implementació interna de la detecció de contradiccions."""
-    from brain.embedding import embedding_service
-    from brain.vector_index import vector_index
+    from pluribus.embedding import embedding_service
+    from pluribus.vector_index import vector_index
 
     # 1. Generar embedding del nou contingut
     vec = await asyncio.to_thread(

@@ -13,7 +13,7 @@ from typing import Optional
 import aiosqlite
 import requests
 
-from brain.config import settings
+from pluribus.config import settings
 
 logger = logging.getLogger(__name__)
 
@@ -123,7 +123,7 @@ async def sync_notion_cache() -> dict:
 
     embed_service = None
     try:
-        from brain.embedding import embedding_service as es
+        from pluribus.embedding import embedding_service as es
         embed_service = es
     except ImportError:
         pass
@@ -176,7 +176,7 @@ async def search_notion(query: str, top_k: int = 5) -> list[dict]:
     """
     embed_service = None
     try:
-        from brain.embedding import embedding_service as es
+        from pluribus.embedding import embedding_service as es
         embed_service = es
     except ImportError:
         pass
@@ -196,7 +196,7 @@ async def search_notion(query: str, top_k: int = 5) -> list[dict]:
                     if blob is None:
                         continue
                     vec = __import__("numpy", fromlist=[""]).frombuffer(blob, dtype="float32")
-                    from brain.embedding import EmbeddingService
+                    from pluribus.embedding import EmbeddingService
                     norm_func = EmbeddingService._normalize
                     vec = norm_func(vec)
                     score = float(vec @ query_vec)

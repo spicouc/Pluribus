@@ -7,8 +7,8 @@ from typing import Any
 
 from fastapi import APIRouter, HTTPException, Request
 
-from brain.db import get_db
-from brain.models import AgentResponse, AgentUpdateRequest
+from pluribus.db import get_db
+from pluribus.models import AgentResponse, AgentUpdateRequest
 
 router = APIRouter(prefix="/v1/agents", tags=["agents"])
 
@@ -145,7 +145,7 @@ async def update_agent(request: Request, agent_id: str, body: AgentUpdateRequest
 import secrets
 from fastapi import Body
 
-from brain.models import AgentRegisterRequest, AgentRegisterResponse
+from pluribus.models import AgentRegisterRequest, AgentRegisterResponse
 
 
 @router.post("/register", status_code=201, response_model=AgentRegisterResponse)

@@ -1,6 +1,6 @@
-# 🧠 Brain — Servei de Memòria Compartida Multi-Agent
+# 🧠 Pluribus — Servei de Memòria Compartida Multi-Agent
 
-**Brain** és un servei lleuger de memòria compartida central per a múltiples agents d'IA. Dissenyat per a l'ecosistema Hermes, permet que diversos agents (Hetzner, RPi local, Picoclaw) emmagatzemin i consultin informació compartida de manera eficient.
+**Pluribus** és un servei lleuger de memòria compartida central per a múltiples agents d'IA. Dissenyat per a l'ecosistema Hermes, permet que diversos agents (Hetzner, RPi local, Picoclaw) emmagatzemin i consultin informació compartida de manera eficient.
 
 ## 📋 Requisits del Sistema
 
@@ -92,14 +92,14 @@ KEY="<la_teva_clau_api>"
 curl -X POST http://localhost:8790/v1/memory/write \
   -H "X-API-Key: $KEY" \
   -H "Content-Type: application/json" \
-  -d '{"content": "Hola món des del Brain!", "scope": "shared"}'
+  -d '{"content": "Hola món des del Pluribus!", "scope": "shared"}'
 ```
 
 ## 📐 Arquitectura
 
 ```
 ┌─────────────────────────────────────────────────────┐
-│                    Brain Server                      │
+│                    Pluribus Server                   │
 │  ┌──────────┐  ┌──────────┐  ┌──────────────────┐  │
 │  │  FastAPI  │  │  SQLite  │  │  fastembed (lazy)│  │
 │  │  (Uvicorn)│  │ (aiosql) │  │  ONNX Runtime    │  │
@@ -255,4 +255,4 @@ sqlite3 /opt/brain/data/brain.db "DELETE FROM embedding_cache; VACUUM;"
 
 ---
 
-**Brain** — *La memòria compartida que fa intel·ligent el teu ecosistema d'agents.*
+**Pluribus** — *La memòria compartida que fa intel·ligent el teu ecosistema d'agents.*

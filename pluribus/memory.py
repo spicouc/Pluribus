@@ -13,12 +13,12 @@ import numpy as np
 from fastapi import APIRouter, BackgroundTasks, Depends, HTTPException, Query, Request
 from starlette.responses import JSONResponse
 
-from brain.audit import log_audit
-from brain.config import settings
-from brain.db import get_db
-from brain.webhooks import trigger_fact_created_webhooks
-from brain.embedding import embedding_service
-from brain.models import (
+from pluribus.audit import log_audit
+from pluribus.config import settings
+from pluribus.db import get_db
+from pluribus.webhooks import trigger_fact_created_webhooks
+from pluribus.embedding import embedding_service
+from pluribus.models import (
     AuditEntry,
     FactResponse,
     LsResponse,

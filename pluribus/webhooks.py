@@ -15,7 +15,7 @@ import httpx
 from fastapi import APIRouter, BackgroundTasks, HTTPException, Request
 from pydantic import BaseModel, Field
 
-from brain.db import get_db
+from pluribus.db import get_db
 
 router = APIRouter(prefix="/v1/webhooks", tags=["webhooks"])
 

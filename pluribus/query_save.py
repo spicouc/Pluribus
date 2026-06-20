@@ -12,10 +12,10 @@ from fastapi import APIRouter, BackgroundTasks, Depends, HTTPException, Request
 from pydantic import BaseModel, Field
 from starlette.responses import JSONResponse
 
-from brain.audit import log_audit
-from brain.db import get_db
-from brain.embedding import embedding_service
-from brain.memory import (
+from pluribus.audit import log_audit
+from pluribus.db import get_db
+from pluribus.embedding import embedding_service
+from pluribus.memory import (
     _check_permission,
     _generate_embeddings_background,
     WriteResponse,
@@ -90,7 +90,7 @@ async def query_and_save(
             # Cerca semàntica per trobar facts relacionats amb la query
             try:
                 query_vec = embedding_service.get_embedding(body.query, "query: ")
-                from brain.vector_index import vector_index
+                from pluribus.vector_index import vector_index
                 scored = await vector_index.search(
                     query_vec,
                     scope_filter=body.scope,

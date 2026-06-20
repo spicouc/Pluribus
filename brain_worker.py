@@ -372,12 +372,12 @@ async def maintenance(db: aiosqlite.Connection) -> dict[str, Any]:
 async def run_notion_sync(db: aiosqlite.Connection) -> dict[str, Any]:
     try:
         import importlib
-        notion = importlib.import_module("brain.notion")
+        notion = importlib.import_module("pluribus.notion")
         result = await notion.sync_notion_cache()
         logger.info(f"Notion sync: {result}")
         return result
     except ImportError:
-        logger.info("Mòdul brain.notion no disponible, ometent sync Notion.")
+        logger.info("Mòdul pluribus.notion no disponible, ometent sync Notion.")
         return {"synced": 0, "error": "notion module not found"}
     except Exception as exc:
         logger.warning(f"Error en sync Notion: {exc}")

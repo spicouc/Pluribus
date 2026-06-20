@@ -10,10 +10,10 @@ from datetime import datetime, timedelta
 from fastapi import APIRouter, Request
 from fastapi.responses import HTMLResponse, JSONResponse
 
-from brain.config import settings
-from brain.db import get_db
-from brain.embedding import embedding_service
-from brain.models import AuditEntry
+from pluribus.config import settings
+from pluribus.db import get_db
+from pluribus.embedding import embedding_service
+from pluribus.models import AuditEntry
 
 router = APIRouter(tags=["dashboard"])
 
@@ -122,7 +122,7 @@ async def search_facts(q: str = "", category: str = "", limit: int = 20) -> JSON
     if not q.strip():
         return JSONResponse({"results": [], "total": 0})
     try:
-        from brain.db import get_db
+        from pluribus.db import get_db
         
         async with get_db() as db:
             terms = q.strip().split()
@@ -172,7 +172,7 @@ async def get_config() -> JSONResponse:
     
     # Afegir settings de runtime
     try:
-        from brain.config import settings as s
+        from pluribus.config import settings as s
         config["_OLLAMA_BASE_URL"] = s.OLLAMA_BASE_URL
         config["_OLLAMA_MODEL"] = s.OLLAMA_MODEL
         config["_CONSOLIDATION_MODEL"] = s.CONSOLIDATION_MODEL
