@@ -27,21 +27,21 @@ sudo apt install -y python3-venv python3-pip sqlite3 git
 ### 2. Crear l'estructura de directoris
 
 ```bash
-sudo mkdir -p /opt/brain/data /opt/brain/cache
+sudo mkdir -p /opt/pluribus/data /opt/pluribus/cache
 ```
 
-Copia tots els fitxers del projecte a `/opt/brain/`:
+Copia tots els fitxers del projecte a `/opt/pluribus/`:
 
 ```bash
 # Si tens els fitxers localment
-cp -r brain/ scripts/ systemd/ requirements.txt README.md /opt/brain/
+cp -r pluribus/ scripts/ systemd/ requirements.txt README.md /opt/pluribus/
 ```
 
 ### 3. Crear l'entorn virtual i instal·lar dependències
 
 ```bash
-python3 -m venv /opt/brain/venv
-/opt/brain/venv/bin/pip install -r /opt/brain/requirements.txt
+python3 -m venv /opt/pluribus/venv
+/opt/pluribus/venv/bin/pip install -r /opt/pluribus/requirements.txt
 ```
 
 > ⚠ **Nota**: `fastembed` utilitza ONNX Runtime, **no** PyTorch. Això redueix significativament l'ús de memòria.
@@ -50,8 +50,8 @@ python3 -m venv /opt/brain/venv
 ### 4. Inicialitzar la base de dades
 
 ```bash
-mkdir -p /opt/brain/data
-sqlite3 /opt/brain/data/brain.db < /opt/brain/scripts/init_db.sql
+mkdir -p /opt/pluribus/data
+sqlite3 /opt/pluribus/data/pluribus.db < /opt/pluribus/scripts/init_db.sql
 ```
 
 Això crearà totes les taules, índexs i triggers necessaris, incloent:
@@ -65,7 +65,7 @@ Això crearà totes les taules, índexs i triggers necessaris, incloent:
 ### 5. Crear un agent
 
 ```bash
-/opt/brain/venv/bin/python /opt/brain/scripts/create_agent.py
+/opt/pluribus/venv/bin/python /opt/pluribus/scripts/create_agent.py
 ```
 
 Segueix les instruccions interactives:
@@ -78,16 +78,16 @@ Segueix les instruccions interactives:
 ### 6. Configurar systemd
 
 ```bash
-sudo cp /opt/brain/systemd/brain.service /etc/systemd/system/brain.service
+sudo cp /opt/pluribus/systemd/pluribus.service /etc/systemd/system/pluribus.service
 sudo systemctl daemon-reload
-sudo systemctl enable --now brain.service
+sudo systemctl enable --now pluribus.service
 ```
 
 ### 7. Verificar la instal·lació
 
 ```bash
 # Comprovar que el servei està actiu
-sudo systemctl status brain.service
+sudo systemctl status pluribus.service
 
 # Test ràpid
 curl -s http://localhost:8790/health | python3 -m json.tool
@@ -109,8 +109,8 @@ curl -X POST http://localhost:8790/v1/memory/write \
 │  │  FastAPI  │  │  SQLite  │  │  fastembed (lazy)│  │
 │  │  (Uvicorn)│  │ (aiosql) │  │  ONNX Runtime    │  │
 │  └──────────┘  └──────────┘  └──────────────────┘  │
-│  Port 8790       /opt/brain/    intfloat/e5-small   │
-│                  data/brain.db                       │
+│  Port 8790       /opt/pluribus/    intfloat/e5-small   │
+│                  data/pluribus.db                       │
 └─────────────────────────────────────────────────────┘
          ▲                ▲                ▲
          │                │                │
@@ -199,25 +199,25 @@ El dashboard HTML a `/dashboard` inclou:
 
 ## ⚙️ Configuració
 
-Variables d'entorn (prefix `BRAIN_`) o camps a `brain/config.py`:
+Variables d'entorn (prefix `PLURIBUS_`) o camps a `pluribus/config.py`:
 
 | Variable | Default | Descripció |
 |----------|---------|------------|
-| `BRAIN_DB_PATH` | `/opt/brain/data/brain.db` | Ruta de la base de dades |
-| `BRAIN_API_PORT` | `8790` | Port del servei |
-| `BRAIN_EMBED_MODEL` | `intfloat/multilingual-e5-small` | Model d'embeddings |
-| `BRAIN_EMBED_DIM` | `384` | Dimensions del vector |
-| `BRAIN_MAX_CHUNK_SIZE` | `500` | Màxim de caràcters per fragment |
-| `BRAIN_CHUNK_OVERLAP` | `50` | Solapament entre fragments |
-| `BRAIN_RATE_LIMIT` | `100` | Peticions per finestra |
-| `BRAIN_RATE_LIMIT_WINDOW` | `60` | Finestra de rate limit (segons) |
+| `PLURIBUS_DB_PATH` | `/opt/pluribus/data/pluribus.db` | Ruta de la base de dades |
+| `PLURIBUS_API_PORT` | `8790` | Port del servei |
+| `PLURIBUS_EMBED_MODEL` | `intfloat/multilingual-e5-small` | Model d'embeddings |
+| `PLURIBUS_EMBED_DIM` | `384` | Dimensions del vector |
+| `PLURIBUS_MAX_CHUNK_SIZE` | `500` | Màxim de caràcters per fragment |
+| `PLURIBUS_CHUNK_OVERLAP` | `50` | Solapament entre fragments |
+| `PLURIBUS_RATE_LIMIT` | `100` | Peticions per finestra |
+| `PLURIBUS_RATE_LIMIT_WINDOW` | `60` | Finestra de rate limit (segons) |
 
 ## 🚀 Desplegament en Producció
 
 ### LXC (recomanat)
 ```bash
 # Dins del contenidor LXC
-lxc exec brain -- bash
+lxc exec pluribus -- bash
 # Segueix la guia d'instal·lació pas a pas
 ```
 
@@ -230,28 +230,28 @@ sudo tailscale up
 
 ### Systemd
 ```bash
-sudo systemctl enable brain.service
-sudo systemctl start brain.service
+sudo systemctl enable pluribus.service
+sudo systemctl start pluribus.service
 
 # Logs
-sudo journalctl -u brain.service -f
+sudo journalctl -u pluribus.service -f
 ```
 
 ## 🛠 Manteniment
 
 ### Compactar base de dades
 ```bash
-sqlite3 /opt/brain/data/brain.db "VACUUM;"
+sqlite3 /opt/pluribus/data/pluribus.db "VACUUM;"
 ```
 
 ### Reiniciar el servei
 ```bash
-sudo systemctl restart brain.service
+sudo systemctl restart pluribus.service
 ```
 
 ### Netejar la cache d'embeddings
 ```bash
-sqlite3 /opt/brain/data/brain.db "DELETE FROM embedding_cache; VACUUM;"
+sqlite3 /opt/pluribus/data/pluribus.db "DELETE FROM embedding_cache; VACUUM;"
 ```
 
 ## 📝 Llicència
