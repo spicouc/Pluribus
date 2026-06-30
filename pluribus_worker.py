@@ -28,13 +28,13 @@ logging.basicConfig(
     format="%(asctime)s [%(levelname)s] %(message)s",
     handlers=[logging.StreamHandler(sys.stdout)],
 )
-logger = logging.getLogger("brain_worker")
+logger = logging.getLogger("pluribus_worker")
 
 # Constants
-DB_PATH = "/opt/brain/data/brain.db"
-OLLAMA_BASE_URL = "http://192.168.1.39:11434"
-OLLAMA_MODEL = "nomic-embed-text"
-CONSOLIDATION_MODEL = "mistral:7b-instruct-v0.3-q4_K_M"
+DB_PATH = "/opt/pluribus/data/brain.db"
+OLLAMA_BASE_URL = "http://100.85.57.11:11434"
+OLLAMA_MODEL = "nomic-embed-text-v2-moe:latest"
+CONSOLIDATION_MODEL = "qwen2.5:3b"
 EMBED_DIM = 768
 BATCH_SIZE = 10
 SEMANTIC_THRESHOLD = 0.55  # Cosine similarity threshold for relation discovery

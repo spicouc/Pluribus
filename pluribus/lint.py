@@ -1,5 +1,5 @@
 """
-Endpoint de linting (health check) per a la memòria del Brain v2.
+Endpoint de linting (health check) per a la memòria de Pluribus v2.
 
 Genera un report estructurat amb:
 - Facts orfes (0 relacions)

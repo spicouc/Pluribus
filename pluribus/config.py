@@ -4,8 +4,8 @@ from pydantic_settings import BaseSettings
 
 
 class Settings(BaseSettings):
-    """Paràmetres de configuració del servei Brain."""
-    DB_PATH: str = "/opt/brain/data/brain.db"
+    """Paràmetres de configuració del servei Pluribus."""
+    DB_PATH: str = "/opt/pluribus/data/pluribus.db"
     API_PORT: int = 8790
 
     # Ollama embeddings
@@ -29,7 +29,7 @@ class Settings(BaseSettings):
     CONSOLIDATION_MODEL: str = "qwen2.5:3b"
 
     class Config:
-        env_prefix = "BRAIN_"
+        env_prefix = "PLURIBUS_"
         env_file = ".env"
         extra = "ignore"
 

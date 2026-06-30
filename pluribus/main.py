@@ -1,4 +1,4 @@
-"""Punt d'entrada principal de l'aplicació Brain.
+"""Punt d'entrada principal de l'aplicació Pluribus.
 
 Crea l'instància FastAPI, registra el middleware de seguretat,
 els routers i el lifespan per inicialitzar la base de dades.
@@ -82,13 +82,13 @@ async def lifespan(app: FastAPI):
         task.cancel()
     await asyncio.gather(*task_handles, return_exceptions=True)
     print("✓ Workers aturats correctament")
-    print("✓ Servicio Brain aturat")
+    print("✓ Servei Pluribus aturat")
 
 
 # Creació de l'aplicació FastAPI
 app = FastAPI(
     title="Pluribus - Multi-agent shared memory service",
-    description="Servei de memòria compartida multi-agent (ex Brain)",
+    description="Servei de memòria compartida multi-agent — Pluribus",
     version="1.0.0",
     lifespan=lifespan,
 )
@@ -140,7 +140,7 @@ async def admin_compact(request: Request) -> dict:
 if __name__ == "__main__":
     import uvicorn
     uvicorn.run(
-        "brain.main:app",
+        "pluribus.main:app",
         host="0.0.0.0",
         port=settings.API_PORT,
         workers=1,

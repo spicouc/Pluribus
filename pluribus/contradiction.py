@@ -1,5 +1,5 @@
 """
-Detecció de contradiccions entre fets del Brain v2.
+Detecció de contradiccions entre fets de Pluribus v2.
 
 Quan s'escriu un fact nou:
 1. Es genera l'embedding del contingut

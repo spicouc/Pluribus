@@ -15,6 +15,9 @@ from pluribus.models import (
     GraphNode,
     GraphResponse,
     RelationResponse,
+    TraverseEdge,
+    TraverseNode,
+    TraverseResponse,
 )
 
 router = APIRouter(prefix="/v1/knowledge", tags=["knowledge"])
@@ -239,3 +242,117 @@ async def delete_relation(request: Request, relation_id: str) -> None:
     async with get_db() as db:
         await db.execute("DELETE FROM fact_relations WHERE id = ?", (relation_id,))
         await db.commit()
+
+
+@router.get("/traverse", response_model=TraverseResponse)
+async def traverse_graph(
+    request: Request,
+    entity: str = Query(..., description="Entity ID or name to start traversal from"),
+    hops: int = Query(2, ge=1, le=3, description="Number of hops (1-3)"),
+    direction: str = Query("both", pattern="^(out|in|both)$", description="Traversal direction: out, in, or both"),
+) -> TraverseResponse:
+    """Graph traversal 2-hop sobre triples (entitats).
+
+    Busca tots els camins de fins a N arestes des de l'entitat donada,
+    utilitzant SQL pur sobre la taula triples -- sense embeddings.
+    """
+    agent: dict[str, Any] = request.state.agent
+    _check_read_permission(agent)
+
+    async with get_db() as db:
+        # 1. Find the starting entity (by ID or name)
+        cursor = await db.execute(
+            "SELECT id, name, type FROM entities WHERE (id = ? OR name = ?) AND deleted_at IS NULL",
+            (entity, entity),
+        )
+        start = await cursor.fetchone()
+        if not start:
+            raise HTTPException(status_code=404, detail=f"Entity not found: {entity}")
+
+        start_entity = dict(start)
+        visited_nodes: dict[str, dict] = {
+            start_entity["id"]: {
+                "id": start_entity["id"],
+                "name": start_entity["name"],
+                "type": start_entity.get("type", ""),
+                "hop": 0,
+            }
+        }
+        all_edges: list[dict] = []
+        current_node_ids: set[str] = {start_entity["id"]}
+
+        # 2. Iterative BFS traversal
+        for hop_level in range(1, hops + 1):
+            if not current_node_ids:
+                break
+
+            node_id_list = list(current_node_ids)
+            placeholders = ",".join("?" for _ in node_id_list)
+
+            # Build direction-sensitive query
+            if direction == "out":
+                where_clause = f"t.subject_id IN ({placeholders})"
+                params = node_id_list[:]
+            elif direction == "in":
+                where_clause = f"t.object_id IN ({placeholders})"
+                params = node_id_list[:]
+            else:  # both
+                where_clause = f"(t.subject_id IN ({placeholders}) OR t.object_id IN ({placeholders}))"
+                params = node_id_list + node_id_list
+
+            sql = f"""
+                SELECT t.id, t.subject_id, t.predicate, t.object_id, t.confidence,
+                       e1.name AS subject_name, e2.name AS object_name
+                FROM triples t
+                JOIN entities e1 ON t.subject_id = e1.id
+                JOIN entities e2 ON t.object_id = e2.id
+                WHERE {where_clause}
+                  AND t.deleted_at IS NULL
+                  AND e1.deleted_at IS NULL
+                  AND e2.deleted_at IS NULL
+                LIMIT 500
+            """
+
+            cursor = await db.execute(sql, params)
+            rows = await cursor.fetchall()
+
+            # Collect newly discovered node IDs
+            next_node_ids: set[str] = set()
+            for row in rows:
+                rdict = dict(row)
+                rdict["hop"] = hop_level
+                all_edges.append(rdict)
+
+                # Add neighbor nodes
+                for nid_key, nname_key in [("subject_id", "subject_name"), ("object_id", "object_name")]:
+                    nid = rdict[nid_key]
+                    nname = rdict[nname_key]
+                    if nid not in visited_nodes:
+                        visited_nodes[nid] = {"id": nid, "name": nname, "type": "", "hop": hop_level}
+                        next_node_ids.add(nid)
+
+            current_node_ids = next_node_ids
+
+        # 3. Build response
+        nodes_list = sorted(visited_nodes.values(), key=lambda x: (x["hop"], x["name"]))
+        edges_list = [
+            TraverseEdge(
+                subject_id=e["subject_id"],
+                subject_name=e["subject_name"],
+                predicate=e["predicate"],
+                object_id=e["object_id"],
+                object_name=e["object_name"],
+                confidence=e.get("confidence", 1.0),
+                hop=e["hop"],
+            )
+            for e in all_edges
+        ]
+
+        return TraverseResponse(
+            entity=entity,
+            nodes=[TraverseNode(**n) for n in nodes_list],
+            edges=edges_list,
+            hops=hops,
+            total_nodes=len(nodes_list),
+            total_edges=len(edges_list),
+        )

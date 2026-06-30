@@ -290,3 +290,34 @@ class RelationResponse(BaseModel):
     relation_strength: float = 0.5
     discovered_by: str = "worker"
     created_at: str = ""
+
+
+# ─── Graph Traversal models (triples-based) ──────────
+
+class TraverseNode(BaseModel):
+    """Node del graph traversal basat en triples."""
+    id: str
+    name: str
+    type: str = ""
+    hop: int = 0
+
+
+class TraverseEdge(BaseModel):
+    """Aresta del graph traversal basada en un triple."""
+    subject_id: str
+    subject_name: str
+    predicate: str
+    object_id: str
+    object_name: str
+    confidence: float = 1.0
+    hop: int = 0
+
+
+class TraverseResponse(BaseModel):
+    """Resposta completa del graph traversal."""
+    entity: str
+    nodes: list[TraverseNode] = []
+    edges: list[TraverseEdge] = []
+    hops: int = 0
+    total_nodes: int = 0
+    total_edges: int = 0

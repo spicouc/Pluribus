@@ -56,7 +56,7 @@ async def get_stats() -> JSONResponse:
         facts_by_category = [{"category": row["category"] or "sense", "count": row["count"]} for row in await cursor.fetchall()]
 
         # Mida de la base de dades
-        db_path = "/opt/brain/data/brain.db"
+        db_path = "/opt/pluribus/data/brain.db"
         try:
             db_size = os.path.getsize(db_path) if os.path.exists(db_path) else 0
         except OSError:
@@ -152,7 +152,7 @@ async def search_facts(q: str = "", category: str = "", limit: int = 20) -> JSON
 @router.get("/api/config")
 async def get_config() -> JSONResponse:
     """Retorna la configuració actual del Brain (lectura del .env + runtime)."""
-    env_path = "/opt/brain/.env"
+    env_path = "/opt/pluribus/.env"
     config = {}
     
     # Llegir .env
@@ -196,7 +196,7 @@ async def get_config() -> JSONResponse:
 async def save_config(request: Request) -> JSONResponse:
     """Guarda canvis de configuració al .env i reinicia el servei."""
     body = await request.json()
-    env_path = "/opt/brain/.env"
+    env_path = "/opt/pluribus/.env"
     restart = body.pop("_restart", False)
     
     # Llegir .env actual
@@ -238,7 +238,7 @@ async def save_config(request: Request) -> JSONResponse:
             subprocess.Popen(["systemctl", "restart", "brain"],
                              stdout=subprocess.DEVNULL,
                              stderr=subprocess.DEVNULL)
-            result["message"] = "Configuració guardada. Reiniciant Brain..."
+            result["message"] = "Configuració guardada. Reiniciant Pluribus..."
             result["restarting"] = True
         except Exception as e:
             result["error"] = f"Error al reiniciar: {e}"
@@ -248,12 +248,12 @@ async def save_config(request: Request) -> JSONResponse:
 
 @router.get("/api/config/restart")
 async def restart_brain() -> JSONResponse:
-    """Reinicia el servei Brain."""
+    """Reinicia el servei Pluribus."""
     try:
         subprocess.Popen(["systemctl", "restart", "brain"],
                          stdout=subprocess.DEVNULL,
                          stderr=subprocess.DEVNULL)
-        return JSONResponse({"message": "Reiniciant Brain..."})
+        return JSONResponse({"message": "Reiniciant Pluribus..."})
     except Exception as e:
         return JSONResponse({"error": str(e)}, status_code=500)
 
@@ -450,7 +450,7 @@ label { display: block; color: #94a3b8; font-size: 12px; margin-bottom: 4px; }
     <div style="display:flex;gap:12px;flex-wrap:wrap;align-items:center;">
       <button onclick="saveConfig(false)" class="btn btn-primary">💾 Guardar</button>
       <button onclick="saveConfig(true)" class="btn btn-danger">💾 Guardar & Reiniciar</button>
-      <button onclick="restartBrain()" class="btn btn-warn">🔄 Reiniciar Pluribus</button>
+      <button onclick="restartPluribus()" class="btn btn-warn">🔄 Reiniciar Pluribus</button>
       <span style="color:#64748b;font-size:12px;" id="config-info">Els canvis requereixen reinici</span>
     </div>
   </div>
@@ -596,7 +596,7 @@ async function saveConfig(restart) {
   }
 }
 
-async function restartBrain() {
+async function restartPluribus() {
   const status = document.getElementById('config-status');
   status.style.display = 'block';
   status.style.color = '#fbbf24';
@@ -605,7 +605,7 @@ async function restartBrain() {
   try {
     const res = await fetch('/api/config/restart');
     const data = await res.json();
-    status.textContent = data.message || 'Reiniciant Brain...';
+    status.textContent = data.message || 'Reiniciant Pluribus...';
     status.style.color = '#86efac';
   } catch (err) {
     status.textContent = 'Error: ' + err.message;

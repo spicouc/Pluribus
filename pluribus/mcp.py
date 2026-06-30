@@ -1,5 +1,5 @@
 """
-Router MCP (Model Context Protocol) lleuger per Brain v2.
+Router MCP (Model Context Protocol) lleuger per Pluribus v2.
 
 Permet que Cursor, Claude Desktop i altres clients MCP descobreixin
 i cridin eines de memòria del Brain.
@@ -28,7 +28,7 @@ router = APIRouter(prefix="/mcp", tags=["mcp"])
 TOOLS = [
     {
         "name": "memory_write",
-        "description": "Escriu un fet a la memòria compartida del Brain. El Brain desa fets, els fragmenta i genera embeddings per cerca semàntica.",
+        "description": "Escriu un fet a la memòria compartida de Pluribus. Pluribus desa fets, els fragmenta i genera embeddings per cerca semàntica.",
         "input_schema": {
             "type": "object",
             "properties": {
@@ -113,6 +113,19 @@ TOOLS = [
             "required": [],
         },
     },
+    {
+        "name": "knowledge_traverse",
+        "description": "Navega el knowledge graph des d'una entitat: troba nodes i arestes relacionats amb BFS pur (sense embeddings, nomes SQL). Ideal per consultes relacionals rapides com 'que coneix X?' o 'qui treballa amb Y?'.",
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "entity": {"type": "string", "description": "ID o nom de l'entitat inicial (ex: 'Alice', 'uuid-xxx')"},
+                "hops": {"type": "integer", "default": 2, "description": "Profunditat BFS (1-3)"},
+                "direction": {"type": "string", "enum": ["out", "in", "both"], "default": "both", "description": "Direccio: out (subject->object), in (object->subject), both"}
+            },
+            "required": ["entity"]
+        },
+    },
 ]
 
 
@@ -124,8 +137,10 @@ def _get_agent_from_request(request: Request) -> dict[str, Any] | None:
 
 
 def _error(code: int, message: str, id_: Any = None) -> JSONResponse:
+    # JSON-RPC error codes can be negative (e.g. -32603); use HTTP 500 for transport
+    http_code = 500 if code < 0 else code
     return JSONResponse(
-        status_code=code,
+        status_code=http_code,
         content={"jsonrpc": "2.0", "error": {"code": code, "message": message}, "id": id_},
     )
 
@@ -173,7 +188,7 @@ async def mcp_handle(request: Request) -> JSONResponse:
         arguments = params.get("arguments", {})
         return await _handle_tool_call(request, tool_name, arguments, id_)
 
-    return _error(-32601, f"Method not found: {method}", id_)
+    return _error(-32601, "Method not found: {method}", id_)
 
 
 async def _handle_tool_call(
@@ -195,8 +210,10 @@ async def _handle_tool_call(
         return await _tool_stats(id_)
     elif tool_name == "memory_ls":
         return await _tool_ls(arguments, id_)
+    elif tool_name == "knowledge_traverse":
+        return await _tool_knowledge_traverse(arguments, id_)
     else:
-        return _error(-32602, f"Unknown tool: {tool_name}", id_)
+        return _error(-32602, "Unknown tool: {tool_name}", id_)
 
 
 # ── Implementacions de les eines ──────────────────────────────────────
@@ -384,7 +401,7 @@ async def _tool_delete(args: dict[str, Any], id_: Any) -> JSONResponse:
             )
             existing = await cursor.fetchone()
             if not existing:
-                return _error(-32602, f"Fact not found: {fact_id}", id_)
+                return _error(-32602, "Fact not found: {fact_id}", id_)
 
             await db.execute("UPDATE facts SET deleted_at = datetime('now') WHERE id = ?", (fact_id,))
             await db.execute("DELETE FROM chunks WHERE fact_id = ?", (fact_id,))
@@ -409,7 +426,7 @@ async def _tool_get_fact(args: dict[str, Any], id_: Any) -> JSONResponse:
             )
             row = await cursor.fetchone()
             if not row:
-                return _error(-32602, f"Fact not found: {fact_id}", id_)
+                return _error(-32602, "Fact not found: {fact_id}", id_)
 
             rd = dict(row)
             try:
@@ -491,3 +508,117 @@ async def _tool_ls(args: dict[str, Any], id_: Any) -> JSONResponse:
         }, id_)
     except Exception as e:
         return _error(-32603, f"Error listing facts: {str(e)}", id_)
+async def _tool_knowledge_traverse(args, id_):
+    """Graph traversal BFS pur (sense embeddings) via /v1/knowledge/traverse."""
+    entity = args.get("entity", "")
+    if not entity:
+        return _error(-32602, "entity is required", id_)
+
+    hops = args.get("hops", 2)
+    if not isinstance(hops, int) or hops < 1 or hops > 3:
+        hops = 2
+
+    direction = args.get("direction", "both")
+    if direction not in ("out", "in", "both"):
+        direction = "both"
+
+    try:
+        async with get_db() as db:
+            cursor = await db.execute(
+                "SELECT id, name, type FROM entities WHERE (id = ? OR name = ?) AND deleted_at IS NULL",
+                (entity, entity),
+            )
+            start = await cursor.fetchone()
+            if not start:
+                return _error(-32602, "Entity not found: " + str(entity), id_)
+
+            start_id = start["id"]
+            nodes = {start_id: {"id": start_id, "name": start["name"], "type": start["type"] or "", "hop": 0}}
+            edges = []
+            current_ids = {start_id}
+            visited_ids = {start_id}
+            edge_ids = set()
+
+            for hop in range(1, hops + 1):
+                if not current_ids:
+                    break
+
+                ids_list = list(current_ids)
+                placeholders = ",".join(["?"] * len(ids_list))
+
+                if direction == "out":
+                    sql = f"""SELECT t.id, t.subject_id, t.predicate, t.object_id, t.confidence,
+                                     es.name as subject_name, es.type as subject_type,
+                                     eo.name as object_name, eo.type as object_type
+                              FROM triples t
+                              JOIN entities es ON t.subject_id = es.id
+                              JOIN entities eo ON t.object_id = eo.id
+                              WHERE t.subject_id IN ({placeholders})
+                                AND t.deleted_at IS NULL
+                                AND es.deleted_at IS NULL
+                                AND eo.deleted_at IS NULL"""
+                elif direction == "in":
+                    sql = f"""SELECT t.id, t.subject_id, t.predicate, t.object_id, t.confidence,
+                                     es.name as subject_name, es.type as subject_type,
+                                     eo.name as object_name, eo.type as object_type
+                              FROM triples t
+                              JOIN entities es ON t.subject_id = es.id
+                              JOIN entities eo ON t.object_id = eo.id
+                              WHERE t.object_id IN ({placeholders})
+                                AND t.deleted_at IS NULL
+                                AND es.deleted_at IS NULL
+                                AND eo.deleted_at IS NULL"""
+                else:
+                    sql = f"""SELECT t.id, t.subject_id, t.predicate, t.object_id, t.confidence,
+                                     es.name as subject_name, es.type as subject_type,
+                                     eo.name as object_name, eo.type as object_type
+                              FROM triples t
+                              JOIN entities es ON t.subject_id = es.id
+                              JOIN entities eo ON t.object_id = eo.id
+                              WHERE (t.subject_id IN ({placeholders}) OR t.object_id IN ({placeholders}))
+                                AND t.deleted_at IS NULL
+                                AND es.deleted_at IS NULL
+                                AND eo.deleted_at IS NULL"""
+                    ids_list = ids_list * 2
+
+                cursor = await db.execute(sql, ids_list)
+                rows = await cursor.fetchall()
+
+                next_ids = set()
+                for row in rows:
+                    if row["id"] in edge_ids:
+                        continue
+                    edge_ids.add(row["id"])
+
+                    for nid, nname, ntype in [
+                        (row["subject_id"], row["subject_name"], row["subject_type"]),
+                        (row["object_id"], row["object_name"], row["object_type"]),
+                    ]:
+                        if nid not in nodes:
+                            nodes[nid] = {"id": nid, "name": nname, "type": ntype or "", "hop": hop}
+                        if nid not in visited_ids:
+                            next_ids.add(nid)
+
+                    edges.append({
+                        "subject_id": row["subject_id"],
+                        "subject_name": row["subject_name"],
+                        "predicate": row["predicate"],
+                        "object_id": row["object_id"],
+                        "object_name": row["object_name"],
+                        "confidence": float(row["confidence"]) if row["confidence"] else 1.0,
+                        "hop": hop,
+                    })
+
+                current_ids = next_ids - visited_ids
+                visited_ids.update(next_ids)
+
+        return _success({
+            "entity": entity,
+            "nodes": [nodes[k] for k in nodes],
+            "edges": edges,
+            "hops": hops,
+            "total_nodes": len(nodes),
+            "total_edges": len(edges),
+        }, id_)
+    except Exception as e:
+        return _error(-32603, "Error traversing graph: " + str(e), id_)

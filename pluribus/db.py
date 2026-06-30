@@ -39,6 +39,50 @@ async def _migrate_db() -> None:
             print("Columna expires_at afegida a facts")
         except Exception:
             pass  # Ja existeix
+        # Migració 3: entities table for graph traversal
+        try:
+            await db.execute("""
+                CREATE TABLE IF NOT EXISTS entities (
+                    id TEXT PRIMARY KEY DEFAULT (lower(hex(randomblob(16)))),
+                    name TEXT NOT NULL,
+                    type TEXT DEFAULT '',
+                    aliases TEXT DEFAULT '[]',
+                    description TEXT DEFAULT '',
+                    metadata TEXT DEFAULT '{}',
+                    created_at TEXT DEFAULT (datetime('now')),
+                    updated_at TEXT DEFAULT (datetime('now')),
+                    deleted_at TEXT
+                )
+            """)
+            await db.execute("CREATE INDEX IF NOT EXISTS idx_entities_name ON entities(name)")
+            await db.execute("CREATE INDEX IF NOT EXISTS idx_entities_type ON entities(type)")
+            print("Taula entities creada per graph traversal")
+        except Exception:
+            pass  # Ja existeix
+        # Migració 4: triples table for graph traversal
+        try:
+            await db.execute("""
+                CREATE TABLE IF NOT EXISTS triples (
+                    id TEXT PRIMARY KEY DEFAULT (lower(hex(randomblob(16)))),
+                    subject_id TEXT NOT NULL REFERENCES entities(id),
+                    predicate TEXT NOT NULL,
+                    object_id TEXT NOT NULL REFERENCES entities(id),
+                    confidence REAL DEFAULT 1.0,
+                    source_agent_id TEXT,
+                    metadata TEXT DEFAULT '{}',
+                    created_at TEXT DEFAULT (datetime('now')),
+                    updated_at TEXT DEFAULT (datetime('now')),
+                    expires_at TEXT,
+                    deleted_at TEXT
+                )
+            """)
+            await db.execute("CREATE INDEX IF NOT EXISTS idx_triples_subject ON triples(subject_id)")
+            await db.execute("CREATE INDEX IF NOT EXISTS idx_triples_object ON triples(object_id)")
+            await db.execute("CREATE INDEX IF NOT EXISTS idx_triples_predicate ON triples(predicate)")
+            await db.execute("CREATE INDEX IF NOT EXISTS idx_triples_deleted ON triples(deleted_at)")
+            print("Taula triples creada per graph traversal")
+        except Exception:
+            pass  # Ja existeix
         await db.commit()
 
 

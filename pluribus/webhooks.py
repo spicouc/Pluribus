@@ -1,5 +1,5 @@
 """
-Webhook system for Pluribus (Brain v2).
+Webhook system for Pluribus (Pluribus v2).
 
 Permet als agents configurar webhooks per rebre notificacions
 quan es creen fets nous, amb filtre per scope i category.
