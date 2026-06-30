@@ -17,14 +17,14 @@ import bcrypt
 
 def main() -> None:
     """Punt d'entrada principal."""
-    db_path = "/opt/brain/data/brain.db"
+    db_path = "/opt/pluribus/data/pluribus.db"
 
     if not Path(db_path).exists():
         print(f"Error: No es troba la base de dades a {db_path}", file=sys.stderr)
         print("Assegura't d'haver executat: sqlite3 {db_path} < scripts/init_db.sql", file=sys.stderr)
         sys.exit(1)
 
-    print("=== Creació d'Agent Brain ===")
+    print("=== Creació d Agent Pluribus ===")
     name = input("Nom de l'agent: ").strip()
     if not name:
         print("Error: El nom és obligatori", file=sys.stderr)

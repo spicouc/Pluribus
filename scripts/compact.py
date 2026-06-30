@@ -17,8 +17,8 @@ from pathlib import Path
 
 logger = logging.getLogger("pluribus.compact")
 
-DB_PATH = "/opt/brain/data/brain.db"
-ARCHIVE_PATH = "/opt/brain/data/archive.db"
+DB_PATH = "/opt/pluribus/data/pluribus.db"
+ARCHIVE_PATH = "/opt/pluribus/data/archive.db"
 
 
 def get_db_size(path: str) -> int:

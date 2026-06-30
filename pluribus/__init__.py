@@ -1,1 +1,1 @@
-# Brain — Servei de memòria compartida multi-agent
+# Pluribus — Servei de memòria compartida multi-agent

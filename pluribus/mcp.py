@@ -2,7 +2,7 @@
 Router MCP (Model Context Protocol) lleuger per Pluribus v2.
 
 Permet que Cursor, Claude Desktop i altres clients MCP descobreixin
-i cridin eines de memòria del Brain.
+i cridin eines de memòria de Pluribus.
 
 Endpoints:
   POST /mcp  → JSON-RPC entry point (tools/list, tools/call)

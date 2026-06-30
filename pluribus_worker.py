@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Brain Worker v2 — Consolidació, relacions semàntiques, manteniment i sincronització Notion.
+"""Pluribus Worker — Consolidació, relacions semàntiques, manteniment i sincronització Notion.
 
 Script autònom que corre periòdicament (via systemd timer) per:
 1. Consolidació: detecta fets sense consolidar, els resumeix amb LLM (Ollama)
@@ -31,7 +31,7 @@ logging.basicConfig(
 logger = logging.getLogger("pluribus_worker")
 
 # Constants
-DB_PATH = "/opt/pluribus/data/brain.db"
+DB_PATH = "/opt/pluribus/data/pluribus.db"
 OLLAMA_BASE_URL = "http://100.85.57.11:11434"
 OLLAMA_MODEL = "nomic-embed-text-v2-moe:latest"
 CONSOLIDATION_MODEL = "qwen2.5:3b"
@@ -387,7 +387,7 @@ async def run_notion_sync(db: aiosqlite.Connection) -> dict[str, Any]:
 async def run() -> dict[str, Any]:
     start_time = time.time()
     logger.info("=" * 60)
-    logger.info("🧠 Brain Worker v2 iniciant ronda...")
+    logger.info("🧠 Pluribus Worker iniciant ronda...")
     logger.info("=" * 60)
 
     results: dict[str, Any] = {"started_at": datetime.now(timezone.utc).isoformat()}

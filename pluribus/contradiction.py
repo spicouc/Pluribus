@@ -28,7 +28,7 @@ import urllib.request
 import json as _json
 
 # Webhook URL for contradiction notifications (from .env or empty)
-WEBHOOK_URL = ""  # Set via BRAIN_CONTRADICTION_WEBHOOK in .env or edit here
+WEBHOOK_URL = ""  # Set via PLURIBUS_CONTRADICTION_WEBHOOK in .env or edit here
 
 
 logger = logging.getLogger(__name__)
@@ -247,7 +247,7 @@ async def _check_contradictions_impl(
 
         if new_relations > 0:
             # Notify webhook if configured
-            wh_url = WEBHOOK_URL or os.environ.get("BRAIN_CONTRADICTION_WEBHOOK", "")
+            wh_url = WEBHOOK_URL or os.environ.get("PLURIBUS_CONTRADICTION_WEBHOOK", "")
             if wh_url:
                 try:
                     payload = _json.dumps({

@@ -1,28 +1,28 @@
 #!/bin/bash
-# Brain v2 automated backup
+# Pluribus automated backup
 # Runs: daily via crontab
 # Keeps: last 14 daily backups
 # Backups: SQLite DB, TurboVec index
 
-BACKUP_DIR="/opt/brain/backups"
-DATA_DIR="/opt/brain/data"
+BACKUP_DIR="/opt/pluribus/backups"
+DATA_DIR="/opt/pluribus/data"
 TIMESTAMP=$(date +%Y%m%d_%H%M%S)
 RETENTION_DAYS=14
-LOG_FILE="/var/log/brain-backup.log"
+LOG_FILE="/var/log/pluribus-backup.log"
 
 mkdir -p "$BACKUP_DIR"
 
-echo "[$(date "+%Y-%m-%d %H:%M:%S")] Starting Brain backup..." >> "$LOG_FILE"
+echo "[$(date "+%Y-%m-%d %H:%M:%S")] Starting Pluribus backup..." >> "$LOG_FILE"
 
 # 1. Backup SQLite DB (vacuum + compress)
-if [ -f "$DATA_DIR/brain.db" ]; then
-    sqlite3 "$DATA_DIR/brain.db" "VACUUM;"
-    cp "$DATA_DIR/brain.db" "$BACKUP_DIR/brain_$TIMESTAMP.db"
-    gzip -f "$BACKUP_DIR/brain_$TIMESTAMP.db"
-    SIZE=$(du -h "$BACKUP_DIR/brain_$TIMESTAMP.db.gz" | cut -f1)
-    echo "  DB backed up: brain_$TIMESTAMP.db.gz ($SIZE)" >> "$LOG_FILE"
+if [ -f "$DATA_DIR/pluribus.db" ]; then
+    sqlite3 "$DATA_DIR/pluribus.db" "VACUUM;"
+    cp "$DATA_DIR/pluribus.db" "$BACKUP_DIR/pluribus_$TIMESTAMP.db"
+    gzip -f "$BACKUP_DIR/pluribus_$TIMESTAMP.db"
+    SIZE=$(du -h "$BACKUP_DIR/pluribus_$TIMESTAMP.db.gz" | cut -f1)
+    echo "  DB backed up: pluribus_$TIMESTAMP.db.gz ($SIZE)" >> "$LOG_FILE"
 else
-    echo "  brain.db not found!" >> "$LOG_FILE"
+    echo "  pluribus.db not found!" >> "$LOG_FILE"
 fi
 
 # 2. Backup TurboVec index
@@ -35,7 +35,7 @@ else
 fi
 
 # 3. Clean old backups (retention)
-find "$BACKUP_DIR" -name "brain_*.db.gz" -mtime +$RETENTION_DAYS -delete 2>/dev/null
+find "$BACKUP_DIR" -name "pluribus_*.db.gz" -mtime +$RETENTION_DAYS -delete 2>/dev/null
 find "$BACKUP_DIR" -name "turbovec_*.tvim" -mtime +$RETENTION_DAYS -delete 2>/dev/null
 echo "  Cleaned backups older than $RETENTION_DAYS days" >> "$LOG_FILE"
 

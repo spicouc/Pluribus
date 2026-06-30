@@ -56,7 +56,7 @@ async def get_stats() -> JSONResponse:
         facts_by_category = [{"category": row["category"] or "sense", "count": row["count"]} for row in await cursor.fetchall()]
 
         # Mida de la base de dades
-        db_path = "/opt/pluribus/data/brain.db"
+        db_path = "/opt/pluribus/data/pluribus.db"
         try:
             db_size = os.path.getsize(db_path) if os.path.exists(db_path) else 0
         except OSError:
@@ -151,7 +151,7 @@ async def search_facts(q: str = "", category: str = "", limit: int = 20) -> JSON
 
 @router.get("/api/config")
 async def get_config() -> JSONResponse:
-    """Retorna la configuració actual del Brain (lectura del .env + runtime)."""
+    """Retorna la configuració actual de Pluribus (lectura del .env + runtime)."""
     env_path = "/opt/pluribus/.env"
     config = {}
     
@@ -207,10 +207,10 @@ async def save_config(request: Request) -> JSONResponse:
     except FileNotFoundError:
         lines = []
     
-    # Actualitzar només les claus enviades (que comencin per BRAIN_)
+    # Actualitzar només les claus enviades (que comencin per PLURIBUS_)
     updated_keys = []
     for key, value in body.items():
-        if key.startswith("BRAIN_") and value is not None:
+        if key.startswith("PLURIBUS_") and value is not None:
             found = False
             for i, line in enumerate(lines):
                 stripped = line.strip()
@@ -235,7 +235,7 @@ async def save_config(request: Request) -> JSONResponse:
     
     if restart:
         try:
-            subprocess.Popen(["systemctl", "restart", "brain"],
+            subprocess.Popen(["systemctl", "restart", "pluribus"],
                              stdout=subprocess.DEVNULL,
                              stderr=subprocess.DEVNULL)
             result["message"] = "Configuració guardada. Reiniciant Pluribus..."
@@ -247,10 +247,10 @@ async def save_config(request: Request) -> JSONResponse:
 
 
 @router.get("/api/config/restart")
-async def restart_brain() -> JSONResponse:
+async def restart_pluribus() -> JSONResponse:
     """Reinicia el servei Pluribus."""
     try:
-        subprocess.Popen(["systemctl", "restart", "brain"],
+        subprocess.Popen(["systemctl", "restart", "pluribus"],
                          stdout=subprocess.DEVNULL,
                          stderr=subprocess.DEVNULL)
         return JSONResponse({"message": "Reiniciant Pluribus..."})
@@ -417,25 +417,25 @@ label { display: block; color: #94a3b8; font-size: 12px; margin-bottom: 4px; }
   <div id="config-form" style="display:none;">
     <div class="config-grid">
       <div>
-        <label for="cfg-BRAIN_OLLAMA_BASE_URL">Ollama Base URL</label>
-        <input type="text" id="cfg-BRAIN_OLLAMA_BASE_URL" placeholder="http://localhost:11434">
+        <label for="cfg-PLURIBUS_OLLAMA_BASE_URL">Ollama Base URL</label>
+        <input type="text" id="cfg-PLURIBUS_OLLAMA_BASE_URL" placeholder="http://localhost:11434">
       </div>
       <div>
-        <label for="cfg-BRAIN_CONSOLIDATION_MODEL">Model de consolidació
-          <button onclick="loadOllamaModels('cfg-BRAIN_CONSOLIDATION_MODEL')" class="btn" style="padding:2px 8px;font-size:11px;float:right;" title="Carregar models d'Ollama">🔄</button>
+        <label for="cfg-PLURIBUS_CONSOLIDATION_MODEL">Model de consolidació
+          <button onclick="loadOllamaModels('cfg-PLURIBUS_CONSOLIDATION_MODEL')" class="btn" style="padding:2px 8px;font-size:11px;float:right;" title="Carregar models d'Ollama">🔄</button>
         </label>
         <div style="position:relative;">
-          <input type="text" id="cfg-BRAIN_CONSOLIDATION_MODEL" placeholder="llama3.2:3b" autocomplete="off" onfocus="showModelDropdown('cfg-BRAIN_CONSOLIDATION_MODEL')" onblur="setTimeout(()=>hideModelDropdown(),200)">
-          <div id="dropdown-cfg-BRAIN_CONSOLIDATION_MODEL" class="model-dropdown"></div>
+          <input type="text" id="cfg-PLURIBUS_CONSOLIDATION_MODEL" placeholder="llama3.2:3b" autocomplete="off" onfocus="showModelDropdown('cfg-PLURIBUS_CONSOLIDATION_MODEL')" onblur="setTimeout(()=>hideModelDropdown(),200)">
+          <div id="dropdown-cfg-PLURIBUS_CONSOLIDATION_MODEL" class="model-dropdown"></div>
         </div>
       </div>
       <div>
-        <label for="cfg-BRAIN_OLLAMA_MODEL">Model d'embedding
-          <button onclick="loadOllamaModels('cfg-BRAIN_OLLAMA_MODEL')" class="btn" style="padding:2px 8px;font-size:11px;float:right;" title="Carregar models d'Ollama">🔄</button>
+        <label for="cfg-PLURIBUS_OLLAMA_MODEL">Model d'embedding
+          <button onclick="loadOllamaModels('cfg-PLURIBUS_OLLAMA_MODEL')" class="btn" style="padding:2px 8px;font-size:11px;float:right;" title="Carregar models d'Ollama">🔄</button>
         </label>
         <div style="position:relative;">
-          <input type="text" id="cfg-BRAIN_OLLAMA_MODEL" placeholder="nomic-embed-text-v2-moe" autocomplete="off" onfocus="showModelDropdown('cfg-BRAIN_OLLAMA_MODEL')" onblur="setTimeout(()=>hideModelDropdown(),200)">
-          <div id="dropdown-cfg-BRAIN_OLLAMA_MODEL" class="model-dropdown"></div>
+          <input type="text" id="cfg-PLURIBUS_OLLAMA_MODEL" placeholder="nomic-embed-text-v2-moe" autocomplete="off" onfocus="showModelDropdown('cfg-PLURIBUS_OLLAMA_MODEL')" onblur="setTimeout(()=>hideModelDropdown(),200)">
+          <div id="dropdown-cfg-PLURIBUS_OLLAMA_MODEL" class="model-dropdown"></div>
         </div>
       </div>
       <div>
@@ -559,9 +559,9 @@ async function loadConfig() {
   try {
     const res = await fetch('/api/config');
     const data = await res.json();
-    document.getElementById('cfg-BRAIN_OLLAMA_BASE_URL').value = data.BRAIN_OLLAMA_BASE_URL || data._OLLAMA_BASE_URL || '';
-    document.getElementById('cfg-BRAIN_CONSOLIDATION_MODEL').value = data.BRAIN_CONSOLIDATION_MODEL || data._CONSOLIDATION_MODEL || '';
-    document.getElementById('cfg-BRAIN_OLLAMA_MODEL').value = data.BRAIN_OLLAMA_MODEL || data._OLLAMA_MODEL || '';
+    document.getElementById('cfg-PLURIBUS_OLLAMA_BASE_URL').value = data.PLURIBUS_OLLAMA_BASE_URL || data._OLLAMA_BASE_URL || '';
+    document.getElementById('cfg-PLURIBUS_CONSOLIDATION_MODEL').value = data.PLURIBUS_CONSOLIDATION_MODEL || data._CONSOLIDATION_MODEL || '';
+    document.getElementById('cfg-PLURIBUS_OLLAMA_MODEL').value = data.PLURIBUS_OLLAMA_MODEL || data._OLLAMA_MODEL || '';
     document.getElementById('cfg-MAX_CHUNK_SIZE').value = data.MAX_CHUNK_SIZE || data._MAX_CHUNK_SIZE || '500';
     document.getElementById('cfg-CHUNK_OVERLAP').value = data.CHUNK_OVERLAP || data._CHUNK_OVERLAP || '50';
     document.getElementById('config-loading').style.display = 'none';
@@ -573,7 +573,7 @@ async function loadConfig() {
 
 async function saveConfig(restart) {
   const body = {};
-  const keys = ['BRAIN_OLLAMA_BASE_URL','BRAIN_CONSOLIDATION_MODEL','BRAIN_OLLAMA_MODEL','MAX_CHUNK_SIZE','CHUNK_OVERLAP'];
+  const keys = ['PLURIBUS_OLLAMA_BASE_URL','PLURIBUS_CONSOLIDATION_MODEL','PLURIBUS_OLLAMA_MODEL','MAX_CHUNK_SIZE','CHUNK_OVERLAP'];
   keys.forEach(k => {
     const el = document.getElementById('cfg-'+k);
     if (el) body[k] = el.value.trim();
