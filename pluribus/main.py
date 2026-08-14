@@ -36,6 +36,7 @@ from pluribus.security import register_security_middleware
 from pluribus.semantic_async import router as semantic_router
 from pluribus.webhooks import router as webhooks_router
 from pluribus.xerrameca import router as xerrameca_router
+from pluribus.xerrameca.console_entry import router as xerrameca_console_entry_router
 from pluribus.xerrameca.runner import runner_loop
 from pluribus.xerrameca.runner_router import router as xerrameca_runner_router
 from pluribus.xerrameca.runner_schema import init_xerrameca_runner_db
@@ -104,7 +105,7 @@ async def lifespan(app: FastAPI):
 app = FastAPI(
     title="Pluribus - Multi-agent shared memory service",
     description="Servei de memòria compartida multi-agent — Pluribus",
-    version="2.2.0",
+    version="2.3.0",
     lifespan=lifespan,
 )
 
@@ -116,6 +117,10 @@ app.include_router(semantic_router, dependencies=memory_dependencies)
 app.include_router(memory_router, dependencies=memory_dependencies)
 app.include_router(query_save_router, dependencies=memory_dependencies)
 app.include_router(lint_router, dependencies=memory_dependencies)
+# The public dashboard entry switches to Xerrameca with ?view=xerrameca and
+# delegates the default view to the legacy dashboard. It must precede the
+# legacy /dashboard route; data APIs remain authenticated.
+app.include_router(xerrameca_console_entry_router)
 # Hardened config read/mutation routes must precede dashboard.py's legacy duplicates.
 app.include_router(admin_config_view_router, dependencies=[Depends(dashboard_authorize)])
 app.include_router(admin_config_router, dependencies=[Depends(dashboard_authorize)])
@@ -167,7 +172,7 @@ async def health() -> JSONResponse:
             "status": status,
             "sqlite": sqlite_ok,
             "embedding_ready": embedding_ready,
-            "version": "2.2.0",
+            "version": "2.3.0",
         },
     )
 
