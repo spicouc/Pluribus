@@ -11,6 +11,7 @@ from fastapi import Depends, FastAPI, Request
 from fastapi.responses import JSONResponse
 
 from pluribus.admin_config import router as admin_config_router
+from pluribus.admin_config_view import router as admin_config_view_router
 from pluribus.agents import router as agents_router
 from pluribus.authorization import (
     agents_authorize,
@@ -96,7 +97,8 @@ app.include_router(semantic_router, dependencies=memory_dependencies)
 app.include_router(memory_router, dependencies=memory_dependencies)
 app.include_router(query_save_router, dependencies=memory_dependencies)
 app.include_router(lint_router, dependencies=memory_dependencies)
-# Hardened mutation routes must precede dashboard.py's legacy duplicates.
+# Hardened config read/mutation routes must precede dashboard.py's legacy duplicates.
+app.include_router(admin_config_view_router, dependencies=[Depends(dashboard_authorize)])
 app.include_router(admin_config_router, dependencies=[Depends(dashboard_authorize)])
 app.include_router(dashboard_router, dependencies=[Depends(dashboard_authorize)])
 # Intercept MCP semantic calls while delegating other tools to legacy handlers.
