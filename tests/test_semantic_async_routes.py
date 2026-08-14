@@ -8,6 +8,7 @@ import unittest
 from pathlib import Path
 from unittest.mock import AsyncMock, patch
 
+import httpx
 import numpy as np
 from starlette.requests import Request
 
@@ -110,29 +111,76 @@ class SemanticLookupTests(unittest.IsolatedAsyncioTestCase):
         get_embedding.assert_awaited_once()
 
 
-class SemanticRoutePrecedenceTests(unittest.TestCase):
-    def _endpoint_index(self, endpoint_name: str) -> int:
-        for index, route in enumerate(main.app.routes):
-            endpoint = getattr(route, "endpoint", None)
-            if getattr(endpoint, "__name__", None) == endpoint_name:
-                return index
-        self.fail(f"Endpoint {endpoint_name!r} no registrat")
+class SemanticRoutePrecedenceTests(unittest.IsolatedAsyncioTestCase):
+    async def asyncSetUp(self) -> None:
+        self.agent = {
+            "id": "semantic-route-test",
+            "name": "reader",
+            "permissions": '{"read":true,"write":false,"delete":false,"admin":false}',
+            "allowed_scopes": '["shared"]',
+        }
+        self.client = httpx.AsyncClient(
+            transport=httpx.ASGITransport(app=main.app),
+            base_url="http://testserver",
+            headers={"X-API-Key": "test-reader-key-long-enough"},
+        )
+        self.rows = [
+            {
+                "fact_id": "f1",
+                "content": "async-result",
+                "scope": "shared",
+                "category": "events",
+                "agent_id": None,
+                "key": None,
+                "metadata": {},
+                "score": 0.0,
+            }
+        ]
 
-    def test_async_rest_routes_precede_legacy_duplicates(self) -> None:
-        self.assertLess(
-            self._endpoint_index("semantic_search_async"),
-            self._endpoint_index("semantic_search"),
-        )
-        self.assertLess(
-            self._endpoint_index("search_memory_async"),
-            self._endpoint_index("search_memory"),
-        )
+    async def asyncTearDown(self) -> None:
+        await self.client.aclose()
 
-    def test_async_mcp_post_precedes_legacy_post(self) -> None:
-        self.assertLess(
-            self._endpoint_index("mcp_handle_async"),
-            self._endpoint_index("mcp_handle"),
-        )
+    async def test_async_rest_post_shadows_legacy_semantic_handler(self) -> None:
+        lookup = AsyncMock(return_value=(self.rows, True))
+        with patch(
+            "pluribus.security._authenticate_agent",
+            new=AsyncMock(return_value=self.agent),
+        ), patch("pluribus.semantic_async.semantic_lookup", new=lookup), patch(
+            "pluribus.semantic_async._audit_search", new=AsyncMock()
+        ):
+            response = await self.client.post(
+                "/v1/memory/search/semantic",
+                json={"query": "alpha", "scope": "shared", "category": "events", "top_k": 3},
+            )
+        self.assertEqual(response.status_code, 200)
+        self.assertTrue(response.json()["semantic_fallback"])
+        self.assertEqual(response.json()["results"][0]["content"], "async-result")
+        lookup.assert_awaited_once()
+
+    async def test_async_mcp_post_shadows_legacy_mcp_handler(self) -> None:
+        lookup = AsyncMock(return_value=(self.rows, True))
+        with patch(
+            "pluribus.security._authenticate_agent",
+            new=AsyncMock(return_value=self.agent),
+        ), patch("pluribus.mcp_async.semantic_lookup", new=lookup), patch(
+            "pluribus.mcp_async._audit_search", new=AsyncMock()
+        ):
+            response = await self.client.post(
+                "/mcp/",
+                json={
+                    "method": "tools/call",
+                    "params": {
+                        "name": "memory_search_semantic",
+                        "arguments": {"query": "alpha", "scope": "shared", "top_k": 3},
+                    },
+                    "id": 9,
+                },
+            )
+        self.assertEqual(response.status_code, 200)
+        payload = response.json()
+        self.assertEqual(payload["id"], 9)
+        self.assertTrue(payload["result"]["fallback"])
+        lookup.assert_awaited_once()
 
 
 class McpSemanticTests(unittest.IsolatedAsyncioTestCase):
