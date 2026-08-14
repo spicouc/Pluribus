@@ -25,40 +25,34 @@ async def get_db() -> aiosqlite.Connection:
 
 
 async def _migrate_db() -> None:
-    """Aplica migracions idempotents a l'esquema existent.
-
-    Qualsevol error inesperat es propaga perquè el servei no arrenqui amb un
-    esquema parcial o inconsistent.
-    """
+    """Aplica migracions idempotents; qualsevol error inesperat es propaga."""
     async with get_db() as db:
         cursor = await db.execute("PRAGMA table_info(facts)")
         fact_columns = {row["name"] for row in await cursor.fetchall()}
 
-        # Migració 1: category a facts
         if "category" not in fact_columns:
             await db.execute(
                 "ALTER TABLE facts ADD COLUMN category TEXT NOT NULL DEFAULT 'events'"
             )
-            print("Columna category afegida a facts")
-
-        # Migració 2: ttl_days a facts
         if "ttl_days" not in fact_columns:
             await db.execute("ALTER TABLE facts ADD COLUMN ttl_days INTEGER DEFAULT NULL")
-            print("Columna ttl_days afegida a facts")
-
-        # Migració 3: expires_at a facts
         if "expires_at" not in fact_columns:
             await db.execute("ALTER TABLE facts ADD COLUMN expires_at TEXT DEFAULT NULL")
-            print("Columna expires_at afegida a facts")
 
-        # L'índex s'ha de crear després de migrar category, perquè una BD antiga
-        # encara no té aquesta columna quan s'executa init_db.sql.
+        await db.execute("CREATE INDEX IF NOT EXISTS idx_facts_category ON facts(category)")
+
+        # API-key lookup migration. Existing agents remain NULL until they
+        # authenticate once with their legacy key or are rotated/recreated.
+        cursor = await db.execute("PRAGMA table_info(agents)")
+        agent_columns = {row["name"] for row in await cursor.fetchall()}
+        if "api_key_fingerprint" not in agent_columns:
+            await db.execute("ALTER TABLE agents ADD COLUMN api_key_fingerprint TEXT")
         await db.execute(
-            "CREATE INDEX IF NOT EXISTS idx_facts_category ON facts(category)"
+            """CREATE UNIQUE INDEX IF NOT EXISTS idx_agents_api_key_fingerprint
+               ON agents(api_key_fingerprint)
+               WHERE api_key_fingerprint IS NOT NULL"""
         )
 
-        # Repara definicions antigues dels triggers FTS5. facts_fts és una taula
-        # FTS5 normal, així que les baixes s'han de fer amb DELETE FROM.
         await db.executescript("""
             DROP TRIGGER IF EXISTS facts_ai;
             DROP TRIGGER IF EXISTS facts_ad;
@@ -81,9 +75,6 @@ async def _migrate_db() -> None:
             END;
         """)
 
-        # Recupera índexs FTS incomplets d'una inicialització antiga. Com que
-        # fact_id és UNINDEXED a FTS5, evitem un NOT EXISTS per cada fact (O(n²)):
-        # només reconstruïm l'índex quan els recomptes no coincideixen.
         cursor = await db.execute(
             "SELECT COUNT(*) AS total FROM facts WHERE deleted_at IS NULL"
         )
@@ -99,12 +90,7 @@ async def _migrate_db() -> None:
                 FROM facts
                 WHERE deleted_at IS NULL
             """)
-            print(
-                "Índex FTS reconstruït "
-                f"({fts_fact_count} → {active_fact_count} fets actius)"
-            )
 
-        # Migració 4: entities table for graph traversal
         await db.execute("""
             CREATE TABLE IF NOT EXISTS entities (
                 id TEXT PRIMARY KEY DEFAULT (lower(hex(randomblob(16)))),
@@ -121,7 +107,6 @@ async def _migrate_db() -> None:
         await db.execute("CREATE INDEX IF NOT EXISTS idx_entities_name ON entities(name)")
         await db.execute("CREATE INDEX IF NOT EXISTS idx_entities_type ON entities(type)")
 
-        # Migració 5: triples table for graph traversal
         await db.execute("""
             CREATE TABLE IF NOT EXISTS triples (
                 id TEXT PRIMARY KEY DEFAULT (lower(hex(randomblob(16)))),
@@ -153,10 +138,7 @@ async def init_db() -> None:
 
     sql = sql_path.read_text(encoding="utf-8")
     async with get_db() as db:
-        # executescript preserva blocs BEGIN ... END dels triggers. Fer split(';')
-        # corromp aquests blocs i pot deixar la base de dades a mig inicialitzar.
         await db.executescript(sql)
         await db.commit()
 
-    # Aplica migracions addicionals. Els errors es propaguen (fail-fast).
     await _migrate_db()
