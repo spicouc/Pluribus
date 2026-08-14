@@ -3,16 +3,18 @@
 from __future__ import annotations
 
 import asyncio
+from dataclasses import dataclass
 import hashlib
 import hmac
 import ipaddress
 import json
 import secrets
 import socket
+import ssl
+from contextlib import suppress
 from typing import Any, Optional
 from urllib.parse import urlsplit
 
-import httpx
 from fastapi import APIRouter, BackgroundTasks, HTTPException, Request
 from pydantic import BaseModel, Field
 
@@ -27,6 +29,17 @@ _BLOCKED_HOSTNAMES = {
     "metadata.google.internal",
     "metadata.aws.internal",
 }
+
+
+@dataclass(frozen=True)
+class ResolvedWebhookTarget:
+    url: str
+    scheme: str
+    hostname: str
+    port: int
+    address: str
+    request_target: str
+    host_header: str
 
 
 class WebhookCreateRequest(BaseModel):
@@ -67,7 +80,7 @@ def _check_admin(agent: dict[str, Any]) -> None:
 
 
 async def _ensure_webhook_schema(db) -> None:
-    """Migrate legacy webhook rows lazily without blocking service startup."""
+    """Migrate legacy webhook rows if startup migration has not done so yet."""
     cursor = await db.execute("PRAGMA table_info(webhooks)")
     columns = {row["name"] for row in await cursor.fetchall()}
     migrations = {
@@ -100,12 +113,24 @@ def _address_is_allowed(address: str) -> bool:
     return bool(settings.WEBHOOK_ALLOW_PRIVATE)
 
 
-async def _validate_webhook_url(url: str) -> str:
-    """Validate scheme, credentials and every currently resolved destination IP."""
+def _format_host_header(hostname: str, port: int, scheme: str) -> str:
+    try:
+        ip = ipaddress.ip_address(hostname)
+        host = f"[{hostname}]" if ip.version == 6 else hostname
+    except ValueError:
+        host = hostname
+    default_port = 443 if scheme == "https" else 80
+    return host if port == default_port else f"{host}:{port}"
+
+
+async def _resolve_webhook_target(url: str) -> ResolvedWebhookTarget:
+    """Resolve once, validate every address, and return a pinned peer address."""
     candidate = url.strip()
+    if any(ch in candidate for ch in ("\r", "\n", "\x00")):
+        raise HTTPException(status_code=400, detail="URL de webhook invàlida")
     try:
         parsed = urlsplit(candidate)
-        port = parsed.port
+        explicit_port = parsed.port
     except ValueError as exc:
         raise HTTPException(status_code=400, detail="URL de webhook invàlida") from exc
 
@@ -121,29 +146,47 @@ async def _validate_webhook_url(url: str) -> str:
     hostname = parsed.hostname.lower().rstrip(".")
     if hostname in _BLOCKED_HOSTNAMES or hostname.endswith(".localhost"):
         raise HTTPException(status_code=400, detail="Destinació de webhook bloquejada")
-
-    effective_port = port or (443 if parsed.scheme == "https" else 80)
     try:
-        # Literal IPs do not need DNS. Hostnames are resolved in a worker thread.
+        hostname_ascii = hostname.encode("idna").decode("ascii")
+    except UnicodeError as exc:
+        raise HTTPException(status_code=400, detail="Hostname de webhook invàlid") from exc
+
+    port = explicit_port or (443 if parsed.scheme == "https" else 80)
+    try:
         try:
-            addresses = [str(ipaddress.ip_address(hostname))]
+            addresses = [str(ipaddress.ip_address(hostname_ascii))]
         except ValueError:
             infos = await asyncio.to_thread(
                 socket.getaddrinfo,
-                hostname,
-                effective_port,
+                hostname_ascii,
+                port,
                 0,
                 socket.SOCK_STREAM,
             )
-            addresses = list({info[4][0] for info in infos})
-    except (OSError, socket.gaierror) as exc:
+            addresses = list(dict.fromkeys(info[4][0] for info in infos))
+    except OSError as exc:
         raise HTTPException(status_code=400, detail="No es pot resoldre el webhook") from exc
 
     if not addresses:
         raise HTTPException(status_code=400, detail="El webhook no resol cap adreça")
     if any(not _address_is_allowed(address) for address in addresses):
         raise HTTPException(status_code=400, detail="La destinació del webhook no està permesa")
-    return candidate
+
+    path = parsed.path or "/"
+    request_target = path + (f"?{parsed.query}" if parsed.query else "")
+    return ResolvedWebhookTarget(
+        url=candidate,
+        scheme=parsed.scheme,
+        hostname=hostname_ascii,
+        port=port,
+        address=addresses[0],
+        request_target=request_target,
+        host_header=_format_host_header(hostname_ascii, port, parsed.scheme),
+    )
+
+
+async def _validate_webhook_url(url: str) -> str:
+    return (await _resolve_webhook_target(url)).url
 
 
 def _serialize_payload(payload: dict[str, Any]) -> bytes:
@@ -158,6 +201,71 @@ def _serialize_payload(payload: dict[str, Any]) -> bytes:
 def _signature(secret: str, body: bytes) -> str:
     digest = hmac.new(secret.encode("utf-8"), body, hashlib.sha256).hexdigest()
     return f"sha256={digest}"
+
+
+async def _post_pinned(
+    target: ResolvedWebhookTarget,
+    body: bytes,
+    headers: dict[str, str],
+) -> int:
+    """Send HTTP/1.1 directly to the validated peer IP, preserving Host/SNI.
+
+    This avoids the DNS-validation/connection TOCTOU that would exist if an HTTP
+    client resolved the hostname again after our SSRF check.
+    """
+    ssl_context = None
+    server_hostname = None
+    if target.scheme == "https":
+        ssl_context = ssl.create_default_context()
+        with suppress(NotImplementedError):
+            ssl_context.set_alpn_protocols(["http/1.1"])
+        server_hostname = target.hostname
+
+    connect = asyncio.open_connection(
+        host=target.address,
+        port=target.port,
+        ssl=ssl_context,
+        server_hostname=server_hostname,
+    )
+    reader, writer = await asyncio.wait_for(connect, timeout=10.0)
+    try:
+        wire_headers = {
+            "Host": target.host_header,
+            "Content-Length": str(len(body)),
+            "Connection": "close",
+            "User-Agent": "Pluribus-Webhook/2",
+            **headers,
+        }
+        request = [f"POST {target.request_target} HTTP/1.1\r\n"]
+        request.extend(f"{name}: {value}\r\n" for name, value in wire_headers.items())
+        request.append("\r\n")
+        writer.write("".join(request).encode("ascii") + body)
+        await asyncio.wait_for(writer.drain(), timeout=10.0)
+
+        status_line = await asyncio.wait_for(reader.readline(), timeout=10.0)
+        if len(status_line) > 4096:
+            raise RuntimeError("Webhook response status line too large")
+        parts = status_line.decode("latin-1").strip().split(" ", 2)
+        if len(parts) < 2 or not parts[0].startswith("HTTP/"):
+            raise RuntimeError("Invalid webhook HTTP response")
+        try:
+            status = int(parts[1])
+        except ValueError as exc:
+            raise RuntimeError("Invalid webhook HTTP status") from exc
+
+        total_headers = 0
+        for _ in range(100):
+            line = await asyncio.wait_for(reader.readline(), timeout=10.0)
+            total_headers += len(line)
+            if total_headers > 65536:
+                raise RuntimeError("Webhook response headers too large")
+            if line in {b"\r\n", b"\n", b""}:
+                break
+        return status
+    finally:
+        writer.close()
+        with suppress(Exception):
+            await writer.wait_closed()
 
 
 async def _record_delivery(
@@ -189,7 +297,7 @@ async def _dispatch_webhook(
     secret: str | None,
     payload: dict[str, Any],
 ) -> None:
-    """Deliver one signed webhook. Failure is recorded but never crashes writes."""
+    """Deliver one signed webhook without ever re-resolving a validated hostname."""
     if not secret:
         await _record_delivery(
             webhook_id,
@@ -200,27 +308,20 @@ async def _dispatch_webhook(
         return
 
     try:
-        validated_url = await _validate_webhook_url(url)
+        target = await _resolve_webhook_target(url)
         body = _serialize_payload(payload)
-        delivery_id = secrets.token_hex(16)
         headers = {
             "Content-Type": "application/json",
             "X-Pluribus-Event": str(payload.get("event", "")),
-            "X-Pluribus-Delivery": delivery_id,
+            "X-Pluribus-Delivery": secrets.token_hex(16),
             "X-Pluribus-Signature": _signature(secret, body),
         }
-        async with httpx.AsyncClient(
-            timeout=10.0,
-            follow_redirects=False,
-            trust_env=False,
-        ) as client:
-            response = await client.post(validated_url, content=body, headers=headers)
-
-        success = 200 <= response.status_code < 300
+        status = await _post_pinned(target, body, headers)
+        success = 200 <= status < 300
         await _record_delivery(
             webhook_id,
-            response.status_code,
-            None if success else f"HTTP {response.status_code}",
+            status,
+            None if success else f"HTTP {status}",
             success,
         )
     except Exception as exc:
@@ -241,7 +342,6 @@ async def trigger_fact_created_webhooks(
     agent_id: str,
     timestamp: str,
 ) -> None:
-    """Schedule matching webhook deliveries without marking success early."""
     async with get_db() as db:
         await _ensure_webhook_schema(db)
         cursor = await db.execute(
