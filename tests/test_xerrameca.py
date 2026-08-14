@@ -5,18 +5,26 @@ from __future__ import annotations
 import asyncio
 import json
 from pathlib import Path
+from types import SimpleNamespace
 import tempfile
 import unittest
 from unittest.mock import AsyncMock, patch
 
 from fastapi import HTTPException
 
+from pluribus.agents import delete_agent
 from pluribus.config import settings
 from pluribus.db import get_db, init_db
+from pluribus.xerrameca.claim import claim_turn
+from pluribus.xerrameca.control import (
+    update_participant_safe,
+    update_system_state_safe,
+)
 from pluribus.xerrameca.models import (
     AssignTurnRequest,
     ConversationCreateRequest,
     ConversationSettingsUpdate,
+    ParticipantUpdate,
     ReplyRequest,
     ResumeRequest,
     XerramecaSystemUpdate,
@@ -24,7 +32,6 @@ from pluribus.xerrameca.models import (
 from pluribus.xerrameca.schema import init_xerrameca_db
 from pluribus.xerrameca.service import (
     assign_turn,
-    claim_turn,
     create_conversation,
     get_conversation,
     inbox,
@@ -33,7 +40,6 @@ from pluribus.xerrameca.service import (
     resume_conversation,
     start_conversation,
     update_conversation_settings,
-    update_system_state,
 )
 
 
@@ -113,8 +119,9 @@ class XerramecaTests(unittest.IsolatedAsyncioTestCase):
         first_turn = a_inbox["turns"][0]["turn_id"]
 
         first_claim = await claim_turn(self.agent_a, first_turn)
-        again = await claim_turn(self.agent_a, first_turn)
-        self.assertEqual(again["lease_token"], first_claim["lease_token"])
+        with self.assertRaises(HTTPException) as duplicate:
+            await claim_turn(self.agent_a, first_turn)
+        self.assertEqual(duplicate.exception.status_code, 409)
 
         conv = await reply_turn(
             self.agent_a,
@@ -157,19 +164,66 @@ class XerramecaTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(fact["category"], "x-xerrameca")
         self.assertIn("Validat. Tasca completada.", fact["content"])
 
-    async def test_global_disable_blocks_claim_without_destroying_turn(self) -> None:
+    async def test_concurrent_claim_allows_exactly_one_lease(self) -> None:
         conv = await self._conversation()
         conv = await start_conversation(self.admin, conv["id"])
         turn_id = conv["current_turn_id"]
+        results = await asyncio.gather(
+            claim_turn(self.agent_a, turn_id),
+            claim_turn(self.agent_a, turn_id),
+            return_exceptions=True,
+        )
+        successes = [item for item in results if isinstance(item, dict)]
+        conflicts = [
+            item
+            for item in results
+            if isinstance(item, HTTPException) and item.status_code == 409
+        ]
+        self.assertEqual(len(successes), 1)
+        self.assertEqual(len(conflicts), 1)
 
-        await update_system_state(self.admin, XerramecaSystemUpdate(enabled=False))
+    async def test_expired_lease_can_be_reclaimed(self) -> None:
+        conv = await self._conversation()
+        conv = await start_conversation(self.admin, conv["id"])
+        turn_id = conv["current_turn_id"]
+        first = await claim_turn(self.agent_a, turn_id)
+        async with get_db() as db:
+            await db.execute(
+                "UPDATE xerrameca_turns SET lease_until = '2000-01-01T00:00:00.000000Z' WHERE id = ?",
+                (turn_id,),
+            )
+            await db.commit()
+        second = await claim_turn(self.agent_a, turn_id)
+        self.assertNotEqual(first["lease_token"], second["lease_token"])
+
+    async def test_global_disable_revokes_claim_and_blocks_new_claims(self) -> None:
+        conv = await self._conversation()
+        conv = await start_conversation(self.admin, conv["id"])
+        turn_id = conv["current_turn_id"]
+        old_claim = await claim_turn(self.agent_a, turn_id)
+
+        await update_system_state_safe(
+            self.admin, XerramecaSystemUpdate(enabled=False)
+        )
+        async with get_db() as db:
+            cursor = await db.execute(
+                "SELECT status, claimed_by, lease_token FROM xerrameca_turns WHERE id = ?",
+                (turn_id,),
+            )
+            turn = await cursor.fetchone()
+        self.assertEqual(turn["status"], "ready")
+        self.assertIsNone(turn["claimed_by"])
+        self.assertIsNone(turn["lease_token"])
+
         with self.assertRaises(HTTPException) as ctx:
             await claim_turn(self.agent_a, turn_id)
         self.assertEqual(ctx.exception.status_code, 423)
 
-        await update_system_state(self.admin, XerramecaSystemUpdate(enabled=True))
-        claim = await claim_turn(self.agent_a, turn_id)
-        self.assertEqual(claim["turn_id"], turn_id)
+        await update_system_state_safe(
+            self.admin, XerramecaSystemUpdate(enabled=True)
+        )
+        new_claim = await claim_turn(self.agent_a, turn_id)
+        self.assertNotEqual(old_claim["lease_token"], new_claim["lease_token"])
 
     async def test_pause_revokes_claim_and_manual_assign_changes_owner(self) -> None:
         conv = await self._conversation()
@@ -192,6 +246,54 @@ class XerramecaTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(conv["status"], "active")
         claim = await claim_turn(self.agent_b, turn_id)
         self.assertEqual(claim["conversation_id"], conv["id"])
+
+    async def test_disabling_non_current_participant_pauses_conversation(self) -> None:
+        conv = await self._conversation()
+        conv = await start_conversation(self.admin, conv["id"])
+        self.assertEqual(conv["current_turn"]["assigned_agent_id"], "agent-a")
+        conv = await update_participant_safe(
+            self.admin,
+            conv["id"],
+            "agent-b",
+            ParticipantUpdate(enabled=False),
+        )
+        self.assertEqual(conv["status"], "paused")
+        self.assertEqual(conv["block_reason"], "participant_disabled")
+        await update_participant_safe(
+            self.admin,
+            conv["id"],
+            "agent-b",
+            ParticipantUpdate(enabled=True),
+        )
+        conv = await resume_conversation(self.admin, conv["id"], ResumeRequest())
+        self.assertEqual(conv["status"], "active")
+
+    async def test_global_agent_deactivation_pauses_related_conversation(self) -> None:
+        conv = await self._conversation()
+        conv = await start_conversation(self.admin, conv["id"])
+        await claim_turn(self.agent_a, conv["current_turn_id"])
+        async with get_db() as db:
+            await db.execute("UPDATE agents SET is_active = 0 WHERE id = 'agent-b'")
+            await db.commit()
+        conv = await get_conversation(self.admin, conv["id"])
+        self.assertEqual(conv["status"], "paused")
+        self.assertEqual(conv["block_reason"], "agent_deactivated")
+        self.assertEqual(conv["current_turn"]["status"], "ready")
+        self.assertIsNone(conv["current_turn"]["claimed_by"])
+
+    async def test_agent_with_xerrameca_history_must_be_deactivated_not_deleted(self) -> None:
+        await self._conversation()
+        request = SimpleNamespace(state=SimpleNamespace(agent=self.admin))
+        with self.assertRaises(HTTPException) as ctx:
+            await delete_agent(request, "agent-b")
+        self.assertEqual(ctx.exception.status_code, 409)
+        async with get_db() as db:
+            cursor = await db.execute(
+                "SELECT is_active FROM agents WHERE id = 'agent-b'"
+            )
+            row = await cursor.fetchone()
+        self.assertIsNotNone(row)
+        self.assertEqual(row["is_active"], 1)
 
     async def test_max_rounds_blocks_then_can_be_extended_and_resumed(self) -> None:
         conv = await self._conversation(max_rounds=1)
