@@ -8,7 +8,7 @@ from typing import Any
 
 _SCOPE_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:-]{0,63}$")
 _EXTENSION_CATEGORY_RE = re.compile(r"^x-[a-z0-9][a-z0-9._-]{0,47}$")
-_SAFE_IDENTIFIER_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:@+\-/]{0,127}$")
+_SAFE_IDENTIFIER_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:@+\-]{0,127}$")
 
 VALID_CATEGORIES = {
     "",
@@ -28,8 +28,11 @@ MAX_QUERY_LENGTH = 4_096
 MAX_METADATA_BYTES = 65_536
 
 
-def _reject_controls(value: str, field: str) -> str:
-    if any(ord(ch) < 32 and ch not in {"\t", "\n", "\r"} for ch in value):
+def _reject_controls(value: str, field: str, allow_layout: bool = False) -> str:
+    allowed = {"\t", "\n", "\r"} if allow_layout else set()
+    if any(ord(ch) < 32 and ch not in allowed for ch in value):
+        raise ValueError(f"{field} conté caràcters de control no permesos")
+    if not allow_layout and any(ch in value for ch in ("\t", "\n", "\r")):
         raise ValueError(f"{field} conté caràcters de control no permesos")
     if "\x00" in value:
         raise ValueError(f"{field} conté NUL")
@@ -57,7 +60,7 @@ def validate_category(value: str) -> str:
 def validate_content(value: str) -> str:
     if not isinstance(value, str):
         raise ValueError("content ha de ser text")
-    _reject_controls(value, "content")
+    _reject_controls(value, "content", allow_layout=True)
     if not value.strip():
         raise ValueError("content no pot ser buit")
     if len(value) > MAX_CONTENT_LENGTH:
@@ -74,8 +77,6 @@ def validate_query(value: str) -> str:
         raise ValueError("query no pot ser buida")
     if len(value) > MAX_QUERY_LENGTH:
         raise ValueError(f"query supera {MAX_QUERY_LENGTH} caràcters")
-    # Several legacy FTS call sites quote individual terms but do not escape a
-    # literal quote. Until all call sites use the shared FTS builder, fail closed.
     if '"' in value:
         raise ValueError('query no pot contenir el caràcter "')
     return value
