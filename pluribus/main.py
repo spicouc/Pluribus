@@ -36,6 +36,9 @@ from pluribus.security import register_security_middleware
 from pluribus.semantic_async import router as semantic_router
 from pluribus.webhooks import router as webhooks_router
 from pluribus.xerrameca import router as xerrameca_router
+from pluribus.xerrameca.runner import runner_loop
+from pluribus.xerrameca.runner_router import router as xerrameca_runner_router
+from pluribus.xerrameca.runner_schema import init_xerrameca_runner_db
 from pluribus.xerrameca.schema import init_xerrameca_db
 
 
@@ -44,7 +47,8 @@ async def lifespan(app: FastAPI):
     """Inicialitza DB abans de servir trànsit i gestiona workers interns."""
     await init_db()
     await init_xerrameca_db()
-    print("✓ Base de dades i Xerrameca inicialitzades correctament")
+    await init_xerrameca_runner_db()
+    print("✓ Base de dades, Xerrameca i Runner inicialitzats correctament")
 
     task_handles: list[asyncio.Task] = []
 
@@ -76,6 +80,18 @@ async def lifespan(app: FastAPI):
     task_handles.append(compact_task)
     print("✓ Worker de compactació (VACUUM) iniciat cada 24h")
 
+    async def _run_xerrameca_runner() -> None:
+        try:
+            await runner_loop()
+        except asyncio.CancelledError:
+            pass
+        except Exception as exc:
+            print(f"⚠ Xerrameca Runner aturat: {exc}")
+
+    runner_task = asyncio.create_task(_run_xerrameca_runner())
+    task_handles.append(runner_task)
+    print("✓ Xerrameca Runner iniciat (desactivat per defecte fins habilitació admin)")
+
     yield
 
     for task in task_handles:
@@ -88,7 +104,7 @@ async def lifespan(app: FastAPI):
 app = FastAPI(
     title="Pluribus - Multi-agent shared memory service",
     description="Servei de memòria compartida multi-agent — Pluribus",
-    version="2.1.0",
+    version="2.2.0",
     lifespan=lifespan,
 )
 
@@ -109,6 +125,7 @@ app.include_router(mcp_async_router, dependencies=[Depends(mcp_authorize)])
 app.include_router(mcp_router, dependencies=[Depends(mcp_authorize)])
 app.include_router(agents_router, dependencies=[Depends(agents_authorize)])
 app.include_router(xerrameca_router)
+app.include_router(xerrameca_runner_router)
 app.include_router(webhooks_router)
 # Current graph model is global, so fail closed to admin until it becomes scope-aware.
 app.include_router(knowledge_router, dependencies=[Depends(knowledge_authorize)])
@@ -150,7 +167,7 @@ async def health() -> JSONResponse:
             "status": status,
             "sqlite": sqlite_ok,
             "embedding_ready": embedding_ready,
-            "version": "2.1.0",
+            "version": "2.2.0",
         },
     )
 
