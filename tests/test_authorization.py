@@ -8,7 +8,13 @@ import unittest
 from fastapi import HTTPException
 from starlette.requests import Request
 
-from pluribus.authorization import _require, dashboard_authorize, mcp_authorize, memory_authorize
+from pluribus.authorization import (
+    _require,
+    dashboard_authorize,
+    knowledge_authorize,
+    mcp_authorize,
+    memory_authorize,
+)
 
 
 def make_request(path: str, method: str = "GET", query: bytes = b"", body: dict | None = None) -> Request:
@@ -86,6 +92,22 @@ class GuardTests(unittest.IsolatedAsyncioTestCase):
         with self.assertRaises(HTTPException) as ctx:
             await dashboard_authorize(request)
         self.assertEqual(ctx.exception.status_code, 403)
+
+    async def test_knowledge_graph_is_admin_only_until_scope_aware(self) -> None:
+        request = make_request("/v1/knowledge/graph", "GET")
+        request.state.agent = {
+            "permissions": {"read": True, "admin": False},
+            "allowed_scopes": ["shared"],
+        }
+        with self.assertRaises(HTTPException) as ctx:
+            await knowledge_authorize(request)
+        self.assertEqual(ctx.exception.status_code, 403)
+
+        request.state.agent = {
+            "permissions": {"admin": True},
+            "allowed_scopes": [],
+        }
+        await knowledge_authorize(request)
 
 
 if __name__ == "__main__":
