@@ -5,6 +5,7 @@ from pydantic_settings import BaseSettings
 
 class Settings(BaseSettings):
     """Paràmetres de configuració del servei Pluribus."""
+
     DB_PATH: str = "/opt/pluribus/data/pluribus.db"
     # Mutable dashboard-managed configuration lives in the state directory so
     # the application code tree can remain read-only under systemd sandboxing.
@@ -25,6 +26,10 @@ class Settings(BaseSettings):
     NOTION_API_VERSION: str = "2022-06-28"
 
     CONSOLIDATION_MODEL: str = "qwen2.5:3b"
+
+    # Private/CGNAT webhook destinations, including Tailscale, require an
+    # explicit opt-in. Loopback/link-local/reserved destinations remain blocked.
+    WEBHOOK_ALLOW_PRIVATE: bool = False
 
     class Config:
         env_prefix = "PLURIBUS_"
