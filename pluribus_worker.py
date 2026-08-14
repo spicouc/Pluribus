@@ -34,7 +34,8 @@ logger = logging.getLogger("pluribus_worker")
 DB_PATH = "/opt/pluribus/data/pluribus.db"
 OLLAMA_BASE_URL = "http://100.85.57.11:11434"
 OLLAMA_MODEL = "nomic-embed-text-v2-moe:latest"
-CONSOLIDATION_MODEL = "qwen2.5:3b"
+CONSOLIDATION_MODEL = "qwen3.5-2b:latest"  # Generatiu ràpid, ja carregat a Ollama-nou (granite4 amb idioma parat 2026-08-07)
+CONSOLIDATION_FALLBACK_MODEL = "hf.co/bartowski/gemma-2-2b-it-abliterated-GGUF:Q4_K_M"  # 2a opció (2026-08-08): gemma-2-2b, català + 15s fred
 EMBED_DIM = 768
 BATCH_SIZE = 10
 SEMANTIC_THRESHOLD = 0.55  # Cosine similarity threshold for relation discovery
@@ -272,15 +273,34 @@ async def consolidate_facts(db: aiosqlite.Connection) -> dict[str, Any]:
                     "model": CONSOLIDATION_MODEL,
                     "messages": [{"role": "user", "content": prompt}],
                     "stream": False,
+                    "think": False,  # qwen3.5-2b: desactiva thinking (sinó content='')
                     "options": {"temperature": 0.3, "num_predict": 512},
                 },
-                timeout=120,
+                timeout=60,
             )
             resp.raise_for_status()
             data = resp.json()
-            summary = data.get("message", {}).get("content", "")
-            if not summary:
-                raise RuntimeError("Ollama no ha retornat cap resum")
+            summary = data.get("message", {}).get("content", "") or ""
+
+            # ── FALLBACK (2026-08-08): si el model principal retorna buit,
+            # reintenta amb gemma-2-2b-it-abliterated (segona opció)
+            if not summary.strip():
+                logger.warning("Consolidació buida, provant model fallback...")
+                resp2 = requests.post(
+                    f"{OLLAMA_BASE_URL}/api/chat",
+                    json={
+                        "model": CONSOLIDATION_FALLBACK_MODEL,
+                        "messages": [{"role": "user", "content": prompt}],
+                        "stream": False,
+                        "think": False,
+                        "options": {"temperature": 0.3, "num_predict": 512},
+                    },
+                    timeout=90,
+                )
+                resp2.raise_for_status()
+                summary = resp2.json().get("message", {}).get("content", "") or ""
+                if not summary.strip():
+                    raise RuntimeError("Fallback tampoc no ha retornat resum")
 
             cursor2 = await db.execute(
                 "SELECT id FROM consolidated WHERE source_facts LIKE ?",
@@ -408,6 +428,19 @@ async def run() -> dict[str, Any]:
         rel_result = await compute_semantic_relations(db)
         results["semantic_relations"] = rel_result
         logger.info(f"Relacions: {rel_result['relations_created']} creades, {rel_result['facts_checked']} facts analitzats.")
+
+        # 2.5. Galeria de persones (L3) per agent
+        logger.info("--- Persona L3 ---")
+        try:
+            from pluribus.persona import ensure_personas_table, generate_all_personas
+            await ensure_personas_table(db)
+            p_result = await generate_all_personas(db)
+            results["persona_l3"] = p_result
+            ok = [r for r in p_result.get("results", []) if r.get("status") == "updated"]
+            logger.info(f"Persona L3: {len(ok)} generades/actualitzades de {p_result.get('agents_processed', 0)} agents.")
+        except Exception as exc:
+            logger.warning(f"Persona L3 no va poder executar: {exc}")
+            results["persona_l3"] = {"error": str(exc)}
 
         # 3. Manteniment
         logger.info("--- Manteniment ---")

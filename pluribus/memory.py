@@ -19,6 +19,12 @@ from pluribus.db import get_db
 from pluribus.webhooks import trigger_fact_created_webhooks
 from pluribus.embedding import embedding_service
 from pluribus.expiry_worker import expire_old_facts
+
+# ── Categories persistents de la flota ─────────────────────────────────
+# Els fets d'infraestructura (system/config/entities) no es poden esborrar
+# per agents sense permís admin, perquè constitueixen la memòria persistent.
+_PROTECTED_CATEGORIES = {"system", "config", "entities"}
+
 from pluribus.models import (
     AuditEntry,
     FactResponse,
@@ -764,12 +770,24 @@ async def delete_memory(
 
     async with get_db() as db:
         cursor = await db.execute(
-            "SELECT id FROM facts WHERE id = ? AND deleted_at IS NULL",
+            "SELECT id, category FROM facts WHERE id = ? AND deleted_at IS NULL",
             (fact_id,),
         )
         existing = await cursor.fetchone()
         if not existing:
             raise HTTPException(status_code=404, detail="Fet no trobat")
+
+        # ── Protecció de categories persistents ──
+        # system/config/entities requereixen permís 'admin' per esborrar-se,
+        # perquè conformen la memòria d'infraestructura de la flota.
+        cat = existing["category"] or ""
+        if cat in _PROTECTED_CATEGORIES:
+            perms = agent.get("permissions", {})
+            if not perms.get("admin", False):
+                raise HTTPException(
+                    status_code=403,
+                    detail="Fet de categoria persistent (system/config); requereix permís admin",
+                )
 
         # Soft delete
         await db.execute(

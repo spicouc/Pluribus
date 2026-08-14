@@ -21,6 +21,11 @@ from pluribus.config import settings
 from pluribus.db import get_db
 from pluribus.embedding import embedding_service
 
+# ── Categories persistents de la flota ─────────────────────────────────
+# Els fets d'infraestructura no es poden esborrar via MCP (el camí que usa
+# el procés de purga de les 06:00, que actua sense agent autenticat).
+_PROTECTED_CATEGORIES = {"system", "config", "entities"}
+
 router = APIRouter(prefix="/mcp", tags=["mcp"])
 
 # ── Definició d'eines ────────────────────────────────────────────────
@@ -397,11 +402,20 @@ async def _tool_delete(args: dict[str, Any], id_: Any) -> JSONResponse:
     try:
         async with get_db() as db:
             cursor = await db.execute(
-                "SELECT id FROM facts WHERE id = ? AND deleted_at IS NULL", (fact_id,)
+                "SELECT id, category FROM facts WHERE id = ? AND deleted_at IS NULL", (fact_id,)
             )
             existing = await cursor.fetchone()
             if not existing:
                 return _error(-32602, "Fact not found: {fact_id}", id_)
+
+            # ── Protecció de categories persistents ──
+            # Els fets d'infraestructura (system/config/entities) només es poden
+            # esborrar per un agent autenticat amb permís 'admin'. Així, el procés
+            # de purga de les 06:00 (que corre sense agent autenticat) no pot
+            # destruir la memòria persistent de la flota.
+            cat = existing["category"] or ""
+            if cat in _PROTECTED_CATEGORIES:
+                return _error(-32602, "Insufficient perms: fact protegit (system/config/entities)", id_)
 
             await db.execute("UPDATE facts SET deleted_at = datetime('now') WHERE id = ?", (fact_id,))
             await db.execute("DELETE FROM chunks WHERE fact_id = ?", (fact_id,))
@@ -467,9 +481,10 @@ async def _tool_stats(id_: Any) -> JSONResponse:
 
 
 async def _tool_ls(args: dict[str, Any], id_: Any) -> JSONResponse:
-    """Llista fets amb filtre per scope, categoria i límit."""
+    """Llista fets amb filtre per scope, categoria, key i límit."""
     scope = args.get("scope", "shared")
     category = args.get("category", "")
+    key = args.get("key", "")
     limit = min(args.get("limit", 20), 100)
     offset = args.get("offset", 0)
 
@@ -480,6 +495,9 @@ async def _tool_ls(args: dict[str, Any], id_: Any) -> JSONResponse:
             if category:
                 where.append("f.category = ?")
                 bind.append(category)
+            if key:
+                where.append("f.key = ?")
+                bind.append(key)
 
             where_clause = " AND ".join(where)
             cursor = await db.execute(
