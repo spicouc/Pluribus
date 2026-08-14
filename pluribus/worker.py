@@ -45,7 +45,6 @@ async def ensure_worker_tables(db) -> None:
         "ON consolidated_facts(consolidated_id)"
     )
 
-    # Backfill exact fact->summary mappings from legacy JSON source_facts.
     cursor = await db.execute(
         "SELECT id, source_facts FROM consolidated WHERE source_facts IS NOT NULL"
     )
@@ -147,10 +146,10 @@ async def consolidate_facts(db) -> dict[str, Any]:
 
 
 async def compute_semantic_relations(db) -> dict[str, Any]:
-    """Create missing semantic fact relations using valid, non-zero embeddings."""
+    """Create semantic relations only between facts that share the same scope."""
     stats = {"relations_created": 0, "facts_checked": 0, "errors": 0}
     cursor = await db.execute(
-        """SELECT c.fact_id, c.embedding_blob
+        """SELECT c.fact_id, f.scope, c.embedding_blob
            FROM chunks c
            JOIN facts f ON f.id = c.fact_id
            WHERE f.deleted_at IS NULL
@@ -159,19 +158,22 @@ async def compute_semantic_relations(db) -> dict[str, Any]:
         (settings.EMBED_DIM * 4,),
     )
 
-    vectors_by_fact: dict[str, list[np.ndarray]] = {}
+    vectors_by_scope: dict[str, dict[str, list[np.ndarray]]] = {}
     for row in await cursor.fetchall():
         vec = np.frombuffer(row["embedding_blob"], dtype=np.float32)
-        if vec.size != settings.EMBED_DIM:
+        if vec.size != settings.EMBED_DIM or not np.all(np.isfinite(vec)):
             continue
         norm = float(np.linalg.norm(vec))
         if norm <= 0:
             continue
-        vectors_by_fact.setdefault(row["fact_id"], []).append(vec / norm)
+        vectors_by_scope.setdefault(row["scope"], {}).setdefault(
+            row["fact_id"], []
+        ).append(vec / norm)
 
-    fact_ids = sorted(vectors_by_fact)
-    stats["facts_checked"] = len(fact_ids)
-    if len(fact_ids) < 2:
+    stats["facts_checked"] = sum(
+        len(vectors_by_fact) for vectors_by_fact in vectors_by_scope.values()
+    )
+    if stats["facts_checked"] < 2:
         return stats
 
     cursor = await db.execute(
@@ -182,29 +184,39 @@ async def compute_semantic_relations(db) -> dict[str, Any]:
         for row in await cursor.fetchall()
     }
 
-    for i, source_id in enumerate(fact_ids):
-        source = np.stack(vectors_by_fact[source_id])
-        for target_id in fact_ids[i + 1:]:
-            pair = (source_id, target_id)
-            if pair in existing:
-                continue
-            target = np.stack(vectors_by_fact[target_id])
-            similarity = float(np.max(source @ target.T))
-            if similarity < SEMANTIC_THRESHOLD:
-                continue
-            try:
-                await db.execute(
-                    """INSERT INTO fact_relations
-                       (source_fact_id, target_fact_id, relation_type,
-                        relation_strength, discovered_by)
-                       VALUES (?, ?, 'related_to', ?, 'semantic')""",
-                    (source_id, target_id, round(similarity, 4)),
-                )
-                existing.add(pair)
-                stats["relations_created"] += 1
-            except Exception as exc:
-                logger.warning("Error creant relació %s/%s: %s", source_id, target_id, exc)
-                stats["errors"] += 1
+    for scope, vectors_by_fact in sorted(vectors_by_scope.items()):
+        fact_ids = sorted(vectors_by_fact)
+        if len(fact_ids) < 2:
+            continue
+        for i, source_id in enumerate(fact_ids):
+            source = np.stack(vectors_by_fact[source_id])
+            for target_id in fact_ids[i + 1:]:
+                pair = tuple(sorted((source_id, target_id)))
+                if pair in existing:
+                    continue
+                target = np.stack(vectors_by_fact[target_id])
+                similarity = float(np.max(source @ target.T))
+                if similarity < SEMANTIC_THRESHOLD:
+                    continue
+                try:
+                    await db.execute(
+                        """INSERT INTO fact_relations
+                           (source_fact_id, target_fact_id, relation_type,
+                            relation_strength, discovered_by)
+                           VALUES (?, ?, 'related_to', ?, 'semantic')""",
+                        (source_id, target_id, round(similarity, 4)),
+                    )
+                    existing.add(pair)
+                    stats["relations_created"] += 1
+                except Exception as exc:
+                    logger.warning(
+                        "Error creant relació %s/%s a scope %s: %s",
+                        source_id,
+                        target_id,
+                        scope,
+                        exc,
+                    )
+                    stats["errors"] += 1
     await db.commit()
     return stats
 
@@ -254,7 +266,6 @@ async def run() -> dict[str, Any]:
     start = time.time()
     results: dict[str, Any] = {"started_at": datetime.now(timezone.utc).isoformat()}
     try:
-        # Keep worker bootstrap identical to the API service.
         await init_db()
         async with get_db() as db:
             await ensure_worker_tables(db)
