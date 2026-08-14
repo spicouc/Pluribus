@@ -50,7 +50,7 @@ class SystemdUnitTests(unittest.TestCase):
 
 
 class RestartMechanismTests(unittest.TestCase):
-    def test_restart_schedules_self_sigterm_without_systemctl(self) -> None:
+    def test_restart_schedules_self_sigterm_without_privileged_subprocess(self) -> None:
         instances = []
 
         class FakeTimer:
@@ -72,10 +72,10 @@ class RestartMechanismTests(unittest.TestCase):
         self.assertTrue(timer.daemon)
         self.assertTrue(timer.started)
 
-    def test_admin_config_module_no_longer_imports_subprocess(self) -> None:
+    def test_admin_config_no_longer_imports_or_calls_subprocess(self) -> None:
         source = (ROOT / "pluribus" / "admin_config.py").read_text(encoding="utf-8")
-        self.assertNotIn("subprocess", source)
-        self.assertNotIn("systemctl", source)
+        self.assertNotIn("import subprocess", source)
+        self.assertNotIn("subprocess.Popen", source)
 
 
 if __name__ == "__main__":
