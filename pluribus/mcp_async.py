@@ -1,21 +1,39 @@
-"""MCP POST wrapper that replaces only semantic search with async-safe logic."""
+"""Async-safe MCP wrapper for semantic search and Xerrameca tools."""
 
 from __future__ import annotations
 
 from typing import Any
 
-from fastapi import APIRouter, Request
+from fastapi import APIRouter, HTTPException, Request
 from fastapi.responses import JSONResponse
 
 from pluribus.mcp import TOOLS, _error, _handle_tool_call, _success
 from pluribus.semantic_async import _audit_search, semantic_lookup
+from pluribus.xerrameca.mcp import (
+    TOOL_NAMES as XERRAMECA_TOOL_NAMES,
+    TOOLS as XERRAMECA_TOOLS,
+    handle_tool as handle_xerrameca_tool,
+)
 
 router = APIRouter(prefix="/mcp", tags=["mcp"])
+ALL_TOOLS = [*TOOLS, *XERRAMECA_TOOLS]
+
+
+@router.get("/")
+async def mcp_list_async_tools() -> JSONResponse:
+    """Expose the complete tool catalogue, including Xerrameca."""
+    return _success(
+        {
+            "tools": ALL_TOOLS,
+            "protocol": "model-context-protocol",
+            "version": "1.1.0",
+        }
+    )
 
 
 @router.post("/")
 async def mcp_handle_async(request: Request) -> JSONResponse:
-    """Preserve legacy MCP behavior while intercepting memory_search_semantic."""
+    """Preserve legacy MCP behavior while intercepting async/Xerrameca tools."""
     try:
         body = await request.json()
     except Exception:
@@ -26,12 +44,24 @@ async def mcp_handle_async(request: Request) -> JSONResponse:
     id_: Any = body.get("id")
 
     if method == "tools/list":
-        return _success({"tools": TOOLS}, id_)
+        return _success({"tools": ALL_TOOLS}, id_)
     if method != "tools/call":
         return _error(-32601, f"Method not found: {method}", id_)
 
     tool_name = params.get("name", "")
     arguments = params.get("arguments", {}) or {}
+
+    if tool_name in XERRAMECA_TOOL_NAMES:
+        try:
+            result = await handle_xerrameca_tool(
+                request, tool_name, arguments
+            )
+            return _success(result, id_)
+        except HTTPException as exc:
+            return _error(exc.status_code, str(exc.detail), id_)
+        except Exception:
+            return _error(-32603, "Xerrameca tool failed", id_)
+
     if tool_name != "memory_search_semantic":
         return await _handle_tool_call(request, tool_name, arguments, id_)
 
@@ -79,6 +109,4 @@ async def mcp_handle_async(request: Request) -> JSONResponse:
             id_,
         )
     except Exception:
-        # Keep transport error generic; internal exception text may expose DB or
-        # network details and is already observable through server logs/audit.
         return _error(-32603, "Semantic search failed", id_)

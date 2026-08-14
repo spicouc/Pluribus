@@ -35,13 +35,16 @@ from pluribus.query_save import router as query_save_router
 from pluribus.security import register_security_middleware
 from pluribus.semantic_async import router as semantic_router
 from pluribus.webhooks import router as webhooks_router
+from pluribus.xerrameca import router as xerrameca_router
+from pluribus.xerrameca.schema import init_xerrameca_db
 
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     """Inicialitza DB abans de servir trànsit i gestiona workers interns."""
     await init_db()
-    print("✓ Base de dades inicialitzada correctament")
+    await init_xerrameca_db()
+    print("✓ Base de dades i Xerrameca inicialitzades correctament")
 
     task_handles: list[asyncio.Task] = []
 
@@ -85,7 +88,7 @@ async def lifespan(app: FastAPI):
 app = FastAPI(
     title="Pluribus - Multi-agent shared memory service",
     description="Servei de memòria compartida multi-agent — Pluribus",
-    version="2.0.0",
+    version="2.1.0",
     lifespan=lifespan,
 )
 
@@ -105,6 +108,7 @@ app.include_router(dashboard_router, dependencies=[Depends(dashboard_authorize)]
 app.include_router(mcp_async_router, dependencies=[Depends(mcp_authorize)])
 app.include_router(mcp_router, dependencies=[Depends(mcp_authorize)])
 app.include_router(agents_router, dependencies=[Depends(agents_authorize)])
+app.include_router(xerrameca_router)
 app.include_router(webhooks_router)
 # Current graph model is global, so fail closed to admin until it becomes scope-aware.
 app.include_router(knowledge_router, dependencies=[Depends(knowledge_authorize)])
@@ -146,7 +150,7 @@ async def health() -> JSONResponse:
             "status": status,
             "sqlite": sqlite_ok,
             "embedding_ready": embedding_ready,
-            "version": "2.0.0",
+            "version": "2.1.0",
         },
     )
 
