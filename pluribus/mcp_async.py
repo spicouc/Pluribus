@@ -1,4 +1,4 @@
-"""Async-safe MCP wrapper for semantic search and Xerrameca tools."""
+"""Async-safe MCP wrapper for recall, semantic search and Xerrameca tools."""
 
 from __future__ import annotations
 
@@ -6,8 +6,10 @@ from typing import Any
 
 from fastapi import APIRouter, HTTPException, Request
 from fastapi.responses import JSONResponse
+from pydantic import ValidationError
 
 from pluribus.mcp import TOOLS, _error, _handle_tool_call, _success
+from pluribus.recall import RecallRequest, recall_service
 from pluribus.semantic_async import _audit_search, semantic_lookup
 from pluribus.xerrameca.mcp import (
     TOOL_NAMES as XERRAMECA_TOOL_NAMES,
@@ -16,24 +18,50 @@ from pluribus.xerrameca.mcp import (
 )
 
 router = APIRouter(prefix="/mcp", tags=["mcp"])
-ALL_TOOLS = [*TOOLS, *XERRAMECA_TOOLS]
+
+MEMORY_RECALL_TOOL = {
+    "name": "memory_recall",
+    "description": (
+        "Recupera records complets amb ranking híbrid FTS5 + semàntic. "
+        "Sense scope explícit consulta automàticament tots els scopes autoritzats "
+        "de l'agent; sense categoria explícita busca totes les categories."
+    ),
+    "input_schema": {
+        "type": "object",
+        "properties": {
+            "query": {"type": "string", "description": "Consulta de record"},
+            "scope": {
+                "type": "string",
+                "description": "Scope opcional; si s'omet usa tots els scopes autoritzats",
+            },
+            "category": {
+                "type": "string",
+                "description": "Categoria opcional; si s'omet busca totes les categories",
+            },
+            "limit": {"type": "integer", "default": 10, "minimum": 1, "maximum": 50},
+        },
+        "required": ["query"],
+    },
+}
+
+ALL_TOOLS = [*TOOLS, MEMORY_RECALL_TOOL, *XERRAMECA_TOOLS]
 
 
 @router.get("/")
 async def mcp_list_async_tools() -> JSONResponse:
-    """Expose the complete tool catalogue, including Xerrameca."""
+    """Expose the complete tool catalogue, including Recall v2 and Xerrameca."""
     return _success(
         {
             "tools": ALL_TOOLS,
             "protocol": "model-context-protocol",
-            "version": "1.1.0",
+            "version": "1.2.0",
         }
     )
 
 
 @router.post("/")
 async def mcp_handle_async(request: Request) -> JSONResponse:
-    """Preserve legacy MCP behavior while intercepting async/Xerrameca tools."""
+    """Preserve legacy MCP behavior while intercepting async/recall tools."""
     try:
         body = await request.json()
     except Exception:
@@ -50,6 +78,20 @@ async def mcp_handle_async(request: Request) -> JSONResponse:
 
     tool_name = params.get("name", "")
     arguments = params.get("arguments", {}) or {}
+
+    if tool_name == "memory_recall":
+        try:
+            recall_request = RecallRequest.model_validate(arguments)
+        except ValidationError:
+            return _error(-32602, "Invalid memory_recall arguments", id_)
+        try:
+            agent = getattr(request.state, "agent", None) or {}
+            result = await recall_service(agent, recall_request)
+            return _success(result.model_dump(), id_)
+        except HTTPException as exc:
+            return _error(exc.status_code, str(exc.detail), id_)
+        except Exception:
+            return _error(-32603, "Memory recall failed", id_)
 
     if tool_name in XERRAMECA_TOOL_NAMES:
         try:
