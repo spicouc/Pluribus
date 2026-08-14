@@ -1,8 +1,4 @@
-"""Punt d'entrada principal de l'aplicació Pluribus.
-
-Crea l'instància FastAPI, registra el middleware de seguretat,
-els routers i el lifespan per inicialitzar la base de dades.
-"""
+"""Punt d'entrada principal de l'aplicació Pluribus."""
 
 from __future__ import annotations
 
@@ -13,35 +9,29 @@ import json
 from fastapi import Depends, FastAPI, Request
 from fastapi.responses import JSONResponse
 
+from pluribus.agents import router as agents_router
+from pluribus.authorization import agents_authorize, dashboard_authorize, mcp_authorize, memory_authorize
+from pluribus.compact import compact_database
 from pluribus.config import settings
 from pluribus.dashboard import router as dashboard_router
 from pluribus.db import init_db
 from pluribus.embedding import embedding_service
-from pluribus.mcp import router as mcp_router
-from pluribus.agents import router as agents_router
-from pluribus.webhooks import router as webhooks_router
-from pluribus.memory import router as memory_router
-from pluribus.security import register_security_middleware
-from pluribus.knowledge import router as knowledge_router
 from pluribus.expiry_worker import expiry_worker_loop
-from pluribus.db import get_db
-from pluribus.compact import compact_database
-from pluribus.authorization import (
-    agents_authorize,
-    dashboard_authorize,
-    mcp_authorize,
-    memory_authorize,
-)
+from pluribus.knowledge import router as knowledge_router
+from pluribus.lint import router as lint_router
+from pluribus.mcp import router as mcp_router
+from pluribus.memory import router as memory_router
+from pluribus.query_save import router as query_save_router
+from pluribus.security import register_security_middleware
+from pluribus.webhooks import router as webhooks_router
 
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    """Gestor del cicle de vida de l'aplicació."""
-    try:
-        await init_db()
-        print("✓ Base de dades inicialitzada correctament")
-    except Exception as exc:
-        print(f"⚠ Error inicialitzant la base de dades: {exc}")
+    """Inicialitza DB abans de servir trànsit i gestiona workers interns."""
+    # Fail-fast: no servir trànsit amb un esquema parcial.
+    await init_db()
+    print("✓ Base de dades inicialitzada correctament")
 
     task_handles = []
 
@@ -85,13 +75,16 @@ async def lifespan(app: FastAPI):
 app = FastAPI(
     title="Pluribus - Multi-agent shared memory service",
     description="Servei de memòria compartida multi-agent — Pluribus",
-    version="1.0.0",
+    version="2.0.0",
     lifespan=lifespan,
 )
 
 register_security_middleware(app)
 
-app.include_router(memory_router, dependencies=[Depends(memory_authorize)])
+memory_dependencies = [Depends(memory_authorize)]
+app.include_router(memory_router, dependencies=memory_dependencies)
+app.include_router(query_save_router, dependencies=memory_dependencies)
+app.include_router(lint_router, dependencies=memory_dependencies)
 app.include_router(dashboard_router, dependencies=[Depends(dashboard_authorize)])
 app.include_router(mcp_router, dependencies=[Depends(mcp_authorize)])
 app.include_router(agents_router, dependencies=[Depends(agents_authorize)])
@@ -101,22 +94,19 @@ app.include_router(knowledge_router)
 
 @app.get("/health")
 async def health() -> JSONResponse:
-    """Endpoint de salut del servei."""
     embedding_ready = embedding_service.is_ready
     return JSONResponse({
         "status": "ok",
         "sqlite": True,
         "embedding_ready": embedding_ready,
-        "version": "1.0.0",
+        "version": "2.0.0",
     })
 
 
 @app.post("/v1/admin/compact", status_code=200)
 async def admin_compact(request: Request) -> dict:
-    """Executa compactació de la base de dades. Admin només."""
     agent: dict = request.state.agent
-    perms = agent.get("permissions", {})
-    if not perms.get("admin", False):
+    if not agent.get("permissions", {}).get("admin", False):
         from fastapi import HTTPException
         raise HTTPException(status_code=403, detail="Permís admin requerit")
 
