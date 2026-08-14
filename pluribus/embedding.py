@@ -1,7 +1,8 @@
-"""Servei d'embeddings amb Ollama API, async-friendly amb cache."""
+"""Servei d'embeddings amb Ollama API, cache i checks async-friendly."""
 
 from __future__ import annotations
 
+import asyncio
 import hashlib
 import time
 from threading import Lock
@@ -14,23 +15,23 @@ from pluribus.config import settings
 
 
 class EmbeddingService:
-    """Servei que genera embeddings via Ollama API, amb cache en memòria.
-
-    Fa servir /api/embed d'Ollama amb el model configurat.
-    Si Ollama no està disponible, retorna vectors buits i is_ready=False.
-    """
+    """Servei que genera embeddings via Ollama API, amb cache en memòria."""
 
     def __init__(self) -> None:
         self._cache: dict[str, np.ndarray] = {}
         self._cache_lock: Lock = Lock()
         self._ready: Optional[bool] = None
         self._last_check: float = 0
-        self._check_interval: float = 60.0  # segons entre checks
+        self._check_interval: float = 60.0
 
-    def _check_ollama(self) -> bool:
-        """Verifica que Ollama respongui i tingui el model."""
+    def _check_ollama(self, force: bool = False) -> bool:
+        """Comprovació síncrona d'Ollama; cridar en thread des de codi async."""
         now = time.time()
-        if self._ready is not None and (now - self._last_check) < self._check_interval:
+        if (
+            not force
+            and self._ready is not None
+            and (now - self._last_check) < self._check_interval
+        ):
             return self._ready
 
         try:
@@ -40,20 +41,27 @@ class EmbeddingService:
             )
             if resp.status_code != 200:
                 self._ready = False
-                return False
-
-            models = resp.json().get("models", [])
-            available = any(m["name"].startswith(settings.OLLAMA_MODEL.rsplit(":", 1)[0]) for m in models)
-            self._ready = available
+            else:
+                models = resp.json().get("models", [])
+                expected = settings.OLLAMA_MODEL.rsplit(":", 1)[0]
+                self._ready = any(
+                    isinstance(m, dict)
+                    and isinstance(m.get("name"), str)
+                    and m["name"].startswith(expected)
+                    for m in models
+                )
         except Exception:
             self._ready = False
 
         self._last_check = time.time()
-        return self._ready
+        return bool(self._ready)
+
+    async def check_ready(self, force: bool = False) -> bool:
+        """Comprova Ollama sense bloquejar l'event loop."""
+        return await asyncio.to_thread(self._check_ollama, force)
 
     @staticmethod
     def _normalize(v: np.ndarray) -> np.ndarray:
-        """Normalitza L2 un vector."""
         norm = np.linalg.norm(v)
         if norm > 0:
             v = v / norm
@@ -61,12 +69,10 @@ class EmbeddingService:
 
     @staticmethod
     def _sha256(text: str) -> str:
-        """Calcula el hash SHA256 d'un text normalitzat."""
         normalized = text.lower().strip()
         return hashlib.sha256(normalized.encode("utf-8")).hexdigest()
 
     def split_into_chunks(self, text: str) -> list[str]:
-        """Divideix un text en fragments de mida màxima MAX_CHUNK_SIZE amb solapament."""
         if len(text) <= settings.MAX_CHUNK_SIZE:
             return [text]
 
@@ -77,7 +83,11 @@ class EmbeddingService:
             if end >= len(text):
                 chunks.append(text[start:])
                 break
-            split_pos = text.rfind(" ", start + settings.MAX_CHUNK_SIZE - settings.CHUNK_OVERLAP, end)
+            split_pos = text.rfind(
+                " ",
+                start + settings.MAX_CHUNK_SIZE - settings.CHUNK_OVERLAP,
+                end,
+            )
             if split_pos > start:
                 end = split_pos
             chunk = text[start:end]
@@ -89,20 +99,15 @@ class EmbeddingService:
         return chunks
 
     def get_embedding(self, text: str, prefix: str = "") -> np.ndarray:
-        """Obté l'embedding per a un text, usant cache en memòria.
-
-        Ollama no requereix prefix 'query:' o 'passage:' com E5.
-        """
+        """Obté un embedding. Aquesta API és síncrona per compatibilitat legacy."""
         full_text = f"{prefix}{text}" if prefix else text
         text_hash = self._sha256(full_text)
 
-        # Comprova cache
         with self._cache_lock:
             cached = self._cache.get(text_hash)
             if cached is not None:
                 return cached
 
-        # Comprova disponibilitat d'Ollama
         if not self._check_ollama():
             return np.zeros(settings.EMBED_DIM, dtype=np.float32)
 
@@ -118,26 +123,24 @@ class EmbeddingService:
             if len(vec.shape) > 1:
                 vec = vec.flatten()
             vec = self._normalize(vec)
-
-            # Desa a cache
             with self._cache_lock:
                 self._cache[text_hash] = vec
-
             return vec
         except Exception:
             return np.zeros(settings.EMBED_DIM, dtype=np.float32)
 
+    async def get_embedding_async(self, text: str, prefix: str = "") -> np.ndarray:
+        """Obté un embedding sense bloquejar l'event loop."""
+        return await asyncio.to_thread(self.get_embedding, text, prefix)
+
     def get_embedding_batch(self, texts: list[str]) -> list[tuple[str, np.ndarray]]:
-        """Obté embeddings per a múltiples textos en un sol call d'Ollama."""
         if not texts:
             return []
-
         if not self._check_ollama():
             return [(t, np.zeros(settings.EMBED_DIM, dtype=np.float32)) for t in texts]
 
         uncached: list[str] = []
         result: list[tuple[str, np.ndarray]] = []
-
         with self._cache_lock:
             for t in texts:
                 h = self._sha256(t)
@@ -165,7 +168,6 @@ class EmbeddingService:
             except Exception:
                 for t in uncached:
                     result.append((t, np.zeros(settings.EMBED_DIM, dtype=np.float32)))
-
         return result
 
     def semantic_search(
@@ -174,13 +176,6 @@ class EmbeddingService:
         chunks_with_ids: list[tuple[str, np.ndarray]],
         top_k: int = 5,
     ) -> list[tuple[str, float]]:
-        """Cerca semàntica síncrona sobre vectors ja carregats.
-
-        Aquest és el contracte que fan servir actualment els endpoints REST i
-        MCP: ells ja han filtrat i carregat els chunks des de SQLite i esperen
-        una llista iterable immediata de ``(chunk_id, score)``. Mantenir aquest
-        mètode síncron evita retornar una coroutine no esperada.
-        """
         return self.semantic_search_numpy(query_vec, chunks_with_ids, top_k)
 
     async def semantic_search_index(
@@ -191,14 +186,9 @@ class EmbeddingService:
         agent_id_filter: Optional[str] = None,
         top_k: int = 5,
     ) -> list[tuple[str, float]]:
-        """Cerca asíncrona accelerada via TurboVec.
-
-        És una API separada i explícita per evitar confondre-la amb el contracte
-        síncron dels callers legacy. Els nous callers que vulguin TurboVec han
-        de fer ``await semantic_search_index(...)``.
-        """
         try:
             from pluribus.vector_index import vector_index
+
             return await vector_index.search(
                 query_vec,
                 scope_filter=scope_filter,
@@ -208,9 +198,8 @@ class EmbeddingService:
             )
         except Exception as exc:
             import logging
-            logging.getLogger(__name__).warning(
-                "TurboVec search failed: %s", exc
-            )
+
+            logging.getLogger(__name__).warning("TurboVec search failed: %s", exc)
             return []
 
     def semantic_search_numpy(
@@ -219,32 +208,39 @@ class EmbeddingService:
         chunks_with_ids: list[tuple[str, np.ndarray]],
         top_k: int = 5,
     ) -> list[tuple[str, float]]:
-        """Cerca NumPy per producte escalar sobre vectors normalitzats L2."""
         if not chunks_with_ids:
             return []
+        if query_vec.ndim != 1 or not np.all(np.isfinite(query_vec)):
+            return []
+        query_norm = float(np.linalg.norm(query_vec))
+        if query_norm <= 0:
+            return []
 
-        chunk_ids = [c[0] for c in chunks_with_ids]
-        vectors = np.array([c[1] for c in chunks_with_ids], dtype=np.float32)
+        valid_chunks = [
+            (chunk_id, vec)
+            for chunk_id, vec in chunks_with_ids
+            if vec.ndim == 1
+            and len(vec) == len(query_vec)
+            and np.all(np.isfinite(vec))
+            and float(np.linalg.norm(vec)) > 0
+        ]
+        if not valid_chunks:
+            return []
 
+        chunk_ids = [c[0] for c in valid_chunks]
+        vectors = np.array([c[1] for c in valid_chunks], dtype=np.float32)
         scores = np.dot(vectors, query_vec)
-
         k = min(top_k, len(scores))
         if k == 0:
             return []
-
         top_indices = np.argpartition(scores, -k)[-k:]
         top_indices = top_indices[np.argsort(-scores[top_indices])]
-
-        results = []
-        for idx in top_indices:
-            results.append((chunk_ids[idx], float(scores[idx])))
-
-        return results
+        return [(chunk_ids[idx], float(scores[idx])) for idx in top_indices]
 
     @property
     def is_ready(self) -> bool:
-        """Indica si Ollama està disponible i el model existeix."""
-        return self._check_ollama()
+        """Retorna només l'últim estat conegut; mai fa I/O de xarxa."""
+        return bool(self._ready)
 
 
 embedding_service = EmbeddingService()

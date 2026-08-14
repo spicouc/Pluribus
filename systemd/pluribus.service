@@ -5,12 +5,36 @@ After=network-online.target
 
 [Service]
 Type=simple
-User=root
+User=pluribus
+Group=pluribus
+UMask=0077
 WorkingDirectory=/opt/pluribus
-EnvironmentFile=-/opt/pluribus/.env
+EnvironmentFile=-/opt/pluribus/data/pluribus.env
 ExecStart=/opt/pluribus/venv/bin/python -m pluribus.main
-Restart=on-failure
+Restart=always
 RestartSec=5
+KillSignal=SIGTERM
+TimeoutStopSec=20
+
+# Least privilege / sandboxing
+NoNewPrivileges=yes
+PrivateTmp=yes
+PrivateDevices=yes
+ProtectSystem=strict
+ProtectHome=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectKernelLogs=yes
+ProtectControlGroups=yes
+ProtectClock=yes
+RestrictSUIDSGID=yes
+LockPersonality=yes
+RestrictRealtime=yes
+CapabilityBoundingSet=
+AmbientCapabilities=
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+SystemCallArchitectures=native
+ReadWritePaths=/opt/pluribus/data
 
 [Install]
 WantedBy=multi-user.target

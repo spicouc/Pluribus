@@ -5,6 +5,7 @@ CREATE TABLE IF NOT EXISTS agents (
     id TEXT PRIMARY KEY,
     name TEXT NOT NULL,
     api_key_hash TEXT NOT NULL,
+    api_key_fingerprint TEXT,
     permissions TEXT DEFAULT '{}',
     allowed_scopes TEXT DEFAULT '["shared"]',
     capabilities TEXT DEFAULT '{}',
@@ -14,6 +15,9 @@ CREATE TABLE IF NOT EXISTS agents (
     is_active INTEGER DEFAULT 1,
     created_at TEXT DEFAULT (datetime('now'))
 );
+
+-- idx_agents_api_key_fingerprint is created by _migrate_db() only after
+-- verifying that legacy agents tables have the new column.
 
 CREATE TABLE IF NOT EXISTS facts (
     id TEXT PRIMARY KEY DEFAULT (lower(hex(randomblob(16)))),
@@ -64,6 +68,32 @@ CREATE TABLE IF NOT EXISTS chunks (
 );
 
 CREATE INDEX IF NOT EXISTS idx_chunks_fact_id ON chunks(fact_id);
+
+-- Generation counter for the derived TurboVec index. Every DB mutation that can
+-- change indexed vectors or their filtering metadata increments this value.
+CREATE TABLE IF NOT EXISTS vector_index_state (
+    singleton INTEGER PRIMARY KEY CHECK (singleton = 1),
+    generation INTEGER NOT NULL DEFAULT 0
+);
+INSERT OR IGNORE INTO vector_index_state(singleton, generation) VALUES (1, 0);
+
+CREATE TRIGGER IF NOT EXISTS vector_chunks_ai AFTER INSERT ON chunks BEGIN
+    UPDATE vector_index_state SET generation = generation + 1 WHERE singleton = 1;
+END;
+CREATE TRIGGER IF NOT EXISTS vector_chunks_au
+AFTER UPDATE OF embedding_blob, fact_id, chunk_text ON chunks BEGIN
+    UPDATE vector_index_state SET generation = generation + 1 WHERE singleton = 1;
+END;
+CREATE TRIGGER IF NOT EXISTS vector_chunks_ad AFTER DELETE ON chunks BEGIN
+    UPDATE vector_index_state SET generation = generation + 1 WHERE singleton = 1;
+END;
+CREATE TRIGGER IF NOT EXISTS vector_facts_au
+AFTER UPDATE OF scope, category, agent_id, key, deleted_at ON facts BEGIN
+    UPDATE vector_index_state SET generation = generation + 1 WHERE singleton = 1;
+END;
+CREATE TRIGGER IF NOT EXISTS vector_facts_ad AFTER DELETE ON facts BEGIN
+    UPDATE vector_index_state SET generation = generation + 1 WHERE singleton = 1;
+END;
 
 CREATE TABLE IF NOT EXISTS embedding_cache (
     hash TEXT PRIMARY KEY,
