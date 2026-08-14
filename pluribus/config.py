@@ -11,7 +11,7 @@ class Settings(BaseSettings):
     # Ollama embeddings
     OLLAMA_BASE_URL: str = "http://localhost:11434"
     OLLAMA_MODEL: str = "nomic-embed-text-v2-moe:latest"
-    EMBED_DIM: int = 768  # nomic-embed-text-v2-moe: 768 dims
+    EMBED_DIM: int = 768
 
     # Chunking
     MAX_CHUNK_SIZE: int = 500
@@ -27,6 +27,10 @@ class Settings(BaseSettings):
 
     # Consolidation
     CONSOLIDATION_MODEL: str = "qwen2.5:3b"
+
+    # Webhooks. Private/CGNAT destinations (including Tailscale) require an
+    # explicit opt-in; dangerous local/link-local destinations stay blocked.
+    WEBHOOK_ALLOW_PRIVATE: bool = False
 
     class Config:
         env_prefix = "PLURIBUS_"
