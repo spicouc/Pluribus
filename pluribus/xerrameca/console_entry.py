@@ -41,15 +41,27 @@ def _console_html() -> str:
     return html
 
 
+def _legacy_html(value: object) -> tuple[str, int]:
+    """Normalize the legacy dashboard's historical str/Response contracts."""
+    if isinstance(value, str):
+        return value, 200
+    body = getattr(value, "body", b"")
+    if isinstance(body, bytes):
+        text = body.decode("utf-8", errors="replace")
+    else:
+        text = str(body)
+    return text, int(getattr(value, "status_code", 200))
+
+
 @router.get("/dashboard", response_class=HTMLResponse)
 async def dashboard_entry(view: str = Query(default="", max_length=32)) -> HTMLResponse:
     if view.strip().lower() == "xerrameca":
         return HTMLResponse(_console_html())
 
     legacy = await legacy_dashboard()
-    body = legacy.body.decode("utf-8", errors="replace")
+    body, status_code = _legacy_html(legacy)
     if "</body>" in body:
         body = body.replace("</body>", _DASHBOARD_LINK + "</body>", 1)
     else:
         body += _DASHBOARD_LINK
-    return HTMLResponse(body, status_code=legacy.status_code)
+    return HTMLResponse(body, status_code=status_code)
