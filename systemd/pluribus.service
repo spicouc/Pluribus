@@ -1,0 +1,16 @@
+[Unit]
+Description=Pluribus multi-agent shared memory service
+Wants=network-online.target
+After=network-online.target
+
+[Service]
+Type=simple
+User=root
+WorkingDirectory=/opt/pluribus
+EnvironmentFile=-/opt/pluribus/.env
+ExecStart=/opt/pluribus/venv/bin/python -m pluribus.main
+Restart=on-failure
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target

@@ -81,16 +81,17 @@ async def _generate_embeddings_background(
     fact_id: str,
     chunks: list[str],
 ) -> None:
-    """Tasca de fons per generar embeddings per als fragments d'un fet.
+    """Genera embeddings i actualitza els placeholders dels chunks existents.
 
-    S'executa en un threadpool per no bloquejar el loop d'events.
+    Els chunks es creen abans de programar aquesta tasca amb un BLOB de zeros.
+    La tasca només substitueix aquest placeholder; no insereix files noves. Això
+    evita duplicats i també fa que una tasca antiga no pugui recrear chunks que
+    ja hagin estat eliminats per una actualització posterior del fact.
     """
     import asyncio
-    import aiosqlite
 
     try:
         for chunk_text in chunks:
-            # Genera l'embedding amb prefix "passage: "
             vec = await asyncio.to_thread(
                 embedding_service.get_embedding,
                 chunk_text,
@@ -98,16 +99,21 @@ async def _generate_embeddings_background(
             )
             blob = vec.astype(np.float32).tobytes()
 
-            db_path = settings.DB_PATH
-            async with aiosqlite.connect(str(db_path)) as db:
+            async with get_db() as db:
                 await db.execute(
-                    "INSERT INTO chunks (fact_id, chunk_text, embedding_blob) VALUES (?, ?, ?)",
-                    (fact_id, chunk_text, blob),
+                    """
+                    UPDATE chunks
+                    SET embedding_blob = ?
+                    WHERE fact_id = ?
+                      AND chunk_text = ?
+                      AND embedding_blob = zeroblob(length(embedding_blob))
+                    """,
+                    (blob, fact_id, chunk_text),
                 )
                 await db.commit()
     except Exception:
-        # Si falla l'embedding, simplement no guardem els vectors
-        # El fet s'ha creat correctament, només perdem la cerca semàntica
+        # El fact continua sent vàlid encara que l'embedding no es pugui generar.
+        # Els placeholders es mantenen i es poden regenerar posteriorment.
         pass
 
 

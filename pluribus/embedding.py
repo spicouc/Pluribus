@@ -168,39 +168,50 @@ class EmbeddingService:
 
         return result
 
-    async def semantic_search(
+    def semantic_search(
+        self,
+        query_vec: np.ndarray,
+        chunks_with_ids: list[tuple[str, np.ndarray]],
+        top_k: int = 5,
+    ) -> list[tuple[str, float]]:
+        """Cerca semàntica síncrona sobre vectors ja carregats.
+
+        Aquest és el contracte que fan servir actualment els endpoints REST i
+        MCP: ells ja han filtrat i carregat els chunks des de SQLite i esperen
+        una llista iterable immediata de ``(chunk_id, score)``. Mantenir aquest
+        mètode síncron evita retornar una coroutine no esperada.
+        """
+        return self.semantic_search_numpy(query_vec, chunks_with_ids, top_k)
+
+    async def semantic_search_index(
         self,
         query_vec: np.ndarray,
         scope_filter: Optional[str] = None,
+        category_filter: Optional[str] = None,
         agent_id_filter: Optional[str] = None,
         top_k: int = 5,
     ) -> list[tuple[str, float]]:
-        """Cerca semàntica usant TurboVec index.
+        """Cerca asíncrona accelerada via TurboVec.
 
-        Returns list of (chunk_id, score) tuples.
-        Falls back to numpy dot products if TurboVec fails.
+        És una API separada i explícita per evitar confondre-la amb el contracte
+        síncron dels callers legacy. Els nous callers que vulguin TurboVec han
+        de fer ``await semantic_search_index(...)``.
         """
         try:
             from pluribus.vector_index import vector_index
-            results = await vector_index.search(
+            return await vector_index.search(
                 query_vec,
                 scope_filter=scope_filter,
+                category_filter=category_filter,
                 agent_id_filter=agent_id_filter,
                 top_k=top_k,
             )
-            if results:
-                return results
         except Exception as exc:
-            # Log and fall through to numpy fallback
             import logging
             logging.getLogger(__name__).warning(
-                "TurboVec search failed, falling back to numpy: %s", exc
+                "TurboVec search failed: %s", exc
             )
-
-        # Numpy fallback (legacy behavior) - requires chunks_with_ids parameter
-        # This path is kept for backward compatibility but should not be used
-        # when TurboVec is available
-        return []
+            return []
 
     def semantic_search_numpy(
         self,
@@ -208,10 +219,7 @@ class EmbeddingService:
         chunks_with_ids: list[tuple[str, np.ndarray]],
         top_k: int = 5,
     ) -> list[tuple[str, float]]:
-        """Legacy numpy dot product search (kept as fallback).
-
-        Tots els vectors han d'estar normalitzats L2.
-        """
+        """Cerca NumPy per producte escalar sobre vectors normalitzats L2."""
         if not chunks_with_ids:
             return []
 
