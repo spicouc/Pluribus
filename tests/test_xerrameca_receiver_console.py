@@ -34,8 +34,36 @@ class ReceiverTests(unittest.TestCase):
     def tearDown(self) -> None:
         self.tmp.cleanup()
 
+    @staticmethod
+    def _payload() -> dict:
+        return {
+            "event": "xerrameca.turn.claimed",
+            "delivery_id": "delivery-1",
+            "idempotency_key": "turn-123",
+            "agent": {"id": "agent-b", "name": "Agent B"},
+            "conversation": {
+                "id": "conv-1",
+                "name": "Prova",
+                "objective": "Resoldre la tasca",
+                "scope": "shared",
+                "turn_policy": "alternating",
+                "max_rounds": 10,
+            },
+            "turn": {
+                "id": "turn-123",
+                "round": 2,
+                "lease_token": "lease-token-1234567890",
+                "lease_until": "2099-01-01T00:00:00Z",
+            },
+            "input_message": {"content": "fes la feina"},
+            "reply": {
+                "rest_path": "/v1/xerrameca/turns/turn-123/reply",
+                "mcp_tool": "xerrameca_reply",
+            },
+        }
+
     def test_signature_contract_matches_runner_hmac(self) -> None:
-        body = _serialize_payload({"turn_id": "turn-1", "lease_token": "x" * 24})
+        body = _serialize_payload(self._payload())
         signature = _signature(self.settings.runner_secret, body)
         self.assertTrue(verify_signature(self.settings.runner_secret, body, signature))
         self.assertFalse(verify_signature(self.settings.runner_secret, body + b"x", signature))
@@ -44,21 +72,13 @@ class ReceiverTests(unittest.TestCase):
     def test_valid_delivery_is_processed_once_and_duplicate_is_safe(self) -> None:
         async def handler(payload):
             return {
-                "content": f"processat {payload['turn_id']}",
+                "content": f"processat {payload['turn']['id']}",
                 "result": "continue",
                 "metadata": {"test": True},
             }
 
         app = create_receiver_app(self.settings, handler)
-        payload = {
-            "event": "xerrameca.turn.ready",
-            "turn_id": "turn-123",
-            "conversation_id": "conv-1",
-            "lease_token": "lease-token-1234567890",
-            "lease_until": "2099-01-01T00:00:00Z",
-            "idempotency_key": "turn-123",
-            "input_message": {"content": "fes la feina"},
-        }
+        payload = self._payload()
         body = _serialize_payload(payload)
         headers = {
             "Content-Type": "application/json",
@@ -83,12 +103,27 @@ class ReceiverTests(unittest.TestCase):
         self.assertEqual(result["content"], "processat turn-123")
         self.assertEqual(result["result"], "continue")
 
+    def test_mismatched_idempotency_key_is_rejected(self) -> None:
+        app = create_receiver_app(self.settings, AsyncMock())
+        payload = self._payload()
+        body = _serialize_payload(payload)
+        with TestClient(app) as client:
+            response = client.post(
+                "/xerrameca/turn",
+                content=body,
+                headers={
+                    "X-Pluribus-Signature": _signature(self.settings.runner_secret, body),
+                    "X-Pluribus-Idempotency-Key": "other-turn",
+                },
+            )
+        self.assertEqual(response.status_code, 422)
+
     def test_bad_signature_fails_before_processing(self) -> None:
         app = create_receiver_app(self.settings, AsyncMock())
         with TestClient(app) as client:
             response = client.post(
                 "/xerrameca/turn",
-                content=b'{"turn_id":"x","lease_token":"1234567890123456"}',
+                content=b'{"turn":{"id":"x","lease_token":"1234567890123456"}}',
                 headers={"X-Pluribus-Signature": "sha256=bad"},
             )
         self.assertEqual(response.status_code, 401)
