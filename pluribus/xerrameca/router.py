@@ -6,6 +6,8 @@ from typing import Any
 
 from fastapi import APIRouter, Request
 
+from .claim import claim_turn
+from .control import update_participant_safe, update_system_state_safe
 from .models import (
     AssignTurnRequest,
     ConversationCreateRequest,
@@ -21,7 +23,6 @@ from .models import (
 from .service import (
     assign_turn,
     cancel_conversation,
-    claim_turn,
     create_conversation,
     finish_conversation,
     get_conversation,
@@ -35,8 +36,6 @@ from .service import (
     skip_turn,
     start_conversation,
     update_conversation_settings,
-    update_participant,
-    update_system_state,
 )
 
 
@@ -56,7 +55,7 @@ async def system_state(request: Request) -> dict[str, Any]:
 async def system_update(
     request: Request, body: XerramecaSystemUpdate
 ) -> dict[str, Any]:
-    return await update_system_state(_agent(request), body)
+    return await update_system_state_safe(_agent(request), body)
 
 
 @router.get("/inbox")
@@ -139,7 +138,7 @@ async def participant_settings(
     agent_id: str,
     body: ParticipantUpdate,
 ) -> dict[str, Any]:
-    return await update_participant(
+    return await update_participant_safe(
         _agent(request), conversation_id, agent_id, body
     )
 
