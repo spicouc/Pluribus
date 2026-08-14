@@ -10,7 +10,7 @@ from contextlib import asynccontextmanager
 
 import asyncio
 import json
-from fastapi import FastAPI, Request
+from fastapi import Depends, FastAPI, Request
 from fastapi.responses import JSONResponse
 
 from pluribus.config import settings
@@ -26,26 +26,25 @@ from pluribus.knowledge import router as knowledge_router
 from pluribus.expiry_worker import expiry_worker_loop
 from pluribus.db import get_db
 from pluribus.compact import compact_database
+from pluribus.authorization import (
+    agents_authorize,
+    dashboard_authorize,
+    mcp_authorize,
+    memory_authorize,
+)
 
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    """Gestor del cicle de vida de l'aplicació.
-
-    En iniciar: inicialitza l'esquema de la base de dades.
-    En tancar: neteja recursos.
-    """
+    """Gestor del cicle de vida de l'aplicació."""
     try:
         await init_db()
         print("✓ Base de dades inicialitzada correctament")
     except Exception as exc:
         print(f"⚠ Error inicialitzant la base de dades: {exc}")
 
-    # Inicia workers en segon pla
-    import asyncio
     task_handles = []
 
-    # Worker d'expiració cada 5 minuts
     async def _run_expiry():
         try:
             await expiry_worker_loop()
@@ -56,13 +55,12 @@ async def lifespan(app: FastAPI):
 
     expiry_task = asyncio.create_task(_run_expiry())
     task_handles.append(expiry_task)
-    print(f"✓ Worker d'expiració (TTL) iniciat cada 5 minuts")
+    print("✓ Worker d'expiració (TTL) iniciat cada 5 minuts")
 
-    # Worker de compactació cada 24h
     async def _run_compact():
         while True:
             try:
-                await asyncio.sleep(86400)  # 24 hores
+                await asyncio.sleep(86400)
                 print("🗜 Iniciant compactació programada...")
                 result = await asyncio.to_thread(compact_database)
                 print(f"🗜 Compactació completada: {json.dumps(result)}")
@@ -73,11 +71,10 @@ async def lifespan(app: FastAPI):
 
     compact_task = asyncio.create_task(_run_compact())
     task_handles.append(compact_task)
-    print(f"✓ Worker de compactació (VACUUM) iniciat cada 24h")
+    print("✓ Worker de compactació (VACUUM) iniciat cada 24h")
 
     yield
 
-    # Neteja en shutdown
     for task in task_handles:
         task.cancel()
     await asyncio.gather(*task_handles, return_exceptions=True)
@@ -85,7 +82,6 @@ async def lifespan(app: FastAPI):
     print("✓ Servei Pluribus aturat")
 
 
-# Creació de l'aplicació FastAPI
 app = FastAPI(
     title="Pluribus - Multi-agent shared memory service",
     description="Servei de memòria compartida multi-agent — Pluribus",
@@ -93,14 +89,12 @@ app = FastAPI(
     lifespan=lifespan,
 )
 
-# Registra el middleware de seguretat (API Key auth)
 register_security_middleware(app)
 
-# Inclou els routers
-app.include_router(memory_router)
-app.include_router(dashboard_router)
-app.include_router(mcp_router)
-app.include_router(agents_router)
+app.include_router(memory_router, dependencies=[Depends(memory_authorize)])
+app.include_router(dashboard_router, dependencies=[Depends(dashboard_authorize)])
+app.include_router(mcp_router, dependencies=[Depends(mcp_authorize)])
+app.include_router(agents_router, dependencies=[Depends(agents_authorize)])
 app.include_router(webhooks_router)
 app.include_router(knowledge_router)
 
