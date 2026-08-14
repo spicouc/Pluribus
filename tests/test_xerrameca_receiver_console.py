@@ -2,12 +2,12 @@
 
 from __future__ import annotations
 
-import json
 from pathlib import Path
 import tempfile
 import unittest
 from unittest.mock import AsyncMock, patch
 
+from fastapi import FastAPI
 from fastapi.testclient import TestClient
 
 from pluribus.xerrameca.receiver import (
@@ -118,15 +118,26 @@ class ConsoleStaticTests(unittest.TestCase):
         self.assertIn("rotate-secret", _HTML)
         self.assertNotIn("XERRAMECA_RUNNER_SECRET=", _HTML)
 
-    def test_dashboard_switch_serves_xerrameca_view(self) -> None:
-        # Importing main validates router precedence as deployed.
-        from pluribus.main import app
+    def test_dashboard_switch_serves_xerrameca_view_without_starting_workers(self) -> None:
+        from pluribus.xerrameca.console_entry import router
 
+        app = FastAPI()
+        app.include_router(router)
         with TestClient(app) as client:
             response = client.get("/dashboard?view=xerrameca")
         self.assertEqual(response.status_code, 200)
         self.assertIn("Xerrameca Console", response.text)
         self.assertIn("API key admin", response.text)
+
+    def test_main_registers_console_before_legacy_dashboard(self) -> None:
+        import inspect
+        import pluribus.main as main
+
+        source = inspect.getsource(main)
+        console_pos = source.index("app.include_router(xerrameca_console_entry_router)")
+        legacy_pos = source.index("app.include_router(dashboard_router")
+        self.assertLess(console_pos, legacy_pos)
+        self.assertIn('version="2.3.0"', source)
 
 
 if __name__ == "__main__":
