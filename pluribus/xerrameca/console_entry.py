@@ -24,10 +24,27 @@ _DASHBOARD_LINK = """
 """
 
 
+def _console_html() -> str:
+    """Add small operational controls without forking the whole console template."""
+    html = _HTML
+    cancel_button = "<button class=\"btn danger\" onclick=\"cancelConv('${esc(c.id)}')\">Cancel·la</button>"
+    finish_button = (
+        "<button class=\"btn good\" onclick=\"finishConv('${esc(c.id)}')\">Finalitza</button>"
+        + cancel_button
+    )
+    html = html.replace(cancel_button, finish_button, 1)
+
+    marker = "async function cancelConv(id){"
+    finish_js = """async function finishConv(id){const summary=prompt('Resum final (opcional)','');if(summary===null)return;try{await api(`/v1/xerrameca/conversations/${id}/finish`,{method:'POST',body:JSON.stringify({summary:summary||null})});toast('Xerrameca finalitzada');await refreshAll()}catch(e){toast(e.message,true)}}
+"""
+    html = html.replace(marker, finish_js + marker, 1)
+    return html
+
+
 @router.get("/dashboard", response_class=HTMLResponse)
 async def dashboard_entry(view: str = Query(default="", max_length=32)) -> HTMLResponse:
     if view.strip().lower() == "xerrameca":
-        return HTMLResponse(_HTML)
+        return HTMLResponse(_console_html())
 
     legacy = await legacy_dashboard()
     body = legacy.body.decode("utf-8", errors="replace")
