@@ -1,0 +1,11 @@
+[Unit]
+Description=Pluribus periodic maintenance worker
+Wants=network-online.target
+After=network-online.target pluribus.service
+
+[Service]
+Type=oneshot
+User=root
+WorkingDirectory=/opt/pluribus
+EnvironmentFile=-/opt/pluribus/.env
+ExecStart=/opt/pluribus/venv/bin/python /opt/pluribus/pluribus_worker.py
