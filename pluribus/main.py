@@ -24,6 +24,8 @@ from pluribus.compact import compact_database
 from pluribus.config import settings
 from pluribus.dashboard import router as dashboard_router
 from pluribus.db import get_db, init_db
+from pluribus.directives import router as directives_router
+from pluribus.directives_schema import init_directives_db
 from pluribus.embedding import embedding_service
 from pluribus.expiry_worker import expiry_worker_loop
 from pluribus.knowledge import router as knowledge_router
@@ -48,9 +50,10 @@ from pluribus.xerrameca.schema import init_xerrameca_db
 async def lifespan(app: FastAPI):
     """Inicialitza DB abans de servir trànsit i gestiona workers interns."""
     await init_db()
+    await init_directives_db()
     await init_xerrameca_db()
     await init_xerrameca_runner_db()
-    print("✓ Base de dades, Xerrameca i Runner inicialitzats correctament")
+    print("✓ Base de dades, Directives, Xerrameca i Runner inicialitzats correctament")
 
     task_handles: list[asyncio.Task] = []
 
@@ -116,6 +119,8 @@ memory_dependencies = [Depends(memory_authorize)]
 # Recall performs defense-in-depth authorization inside its own service so it is
 # safe for REST and non-HTTP callers such as MCP.
 app.include_router(recall_router)
+# Directives are a separate control plane: facts remain passive memory.
+app.include_router(directives_router)
 # Async semantic routes must precede the legacy duplicates in memory.py.
 app.include_router(semantic_router, dependencies=memory_dependencies)
 app.include_router(memory_router, dependencies=memory_dependencies)
