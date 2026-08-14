@@ -10,7 +10,13 @@ from fastapi import Depends, FastAPI, Request
 from fastapi.responses import JSONResponse
 
 from pluribus.agents import router as agents_router
-from pluribus.authorization import agents_authorize, dashboard_authorize, mcp_authorize, memory_authorize
+from pluribus.authorization import (
+    agents_authorize,
+    dashboard_authorize,
+    knowledge_authorize,
+    mcp_authorize,
+    memory_authorize,
+)
 from pluribus.compact import compact_database
 from pluribus.config import settings
 from pluribus.dashboard import router as dashboard_router
@@ -29,7 +35,6 @@ from pluribus.webhooks import router as webhooks_router
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     """Inicialitza DB abans de servir trànsit i gestiona workers interns."""
-    # Fail-fast: no servir trànsit amb un esquema parcial.
     await init_db()
     print("✓ Base de dades inicialitzada correctament")
 
@@ -89,7 +94,7 @@ app.include_router(dashboard_router, dependencies=[Depends(dashboard_authorize)]
 app.include_router(mcp_router, dependencies=[Depends(mcp_authorize)])
 app.include_router(agents_router, dependencies=[Depends(agents_authorize)])
 app.include_router(webhooks_router)
-app.include_router(knowledge_router)
+app.include_router(knowledge_router, dependencies=[Depends(knowledge_authorize)])
 
 
 @app.get("/health")
