@@ -18,26 +18,66 @@ Pluribus és un servei lleuger de memòria compartida per a múltiples agents d'
 
 ## Instal·lació
 
+El procés de servei **no s'ha d'executar com root**. Crea primer un usuari de sistema dedicat i un directori d'estat writable separat del codi:
+
 ```bash
 sudo apt update
 sudo apt install -y python3-venv python3-pip sqlite3 git
-sudo mkdir -p /opt/pluribus/data
-sudo cp -r pluribus/ scripts/ systemd/ requirements.txt README.md .env.example pluribus_worker.py /opt/pluribus/
-python3 -m venv /opt/pluribus/venv
-/opt/pluribus/venv/bin/pip install -r /opt/pluribus/requirements.txt
-sudo cp /opt/pluribus/.env.example /opt/pluribus/.env
+sudo useradd --system --home /nonexistent --shell /usr/sbin/nologin pluribus 2>/dev/null || true
+sudo mkdir -p /opt/pluribus
+sudo install -d -o pluribus -g pluribus -m 0750 /opt/pluribus/data
 ```
 
-Edita `/opt/pluribus/.env` abans d'arrencar el servei.
+Copia el codi com a root i mantén-lo no modificable per l'usuari del servei:
 
-La inicialització de l'esquema es fa automàticament durant la startup. Si el bootstrap o una migració fallen, el servei ha de fallar abans de servir trànsit.
+```bash
+sudo cp -r pluribus/ scripts/ systemd/ requirements.txt README.md .env.example pluribus_worker.py /opt/pluribus/
+sudo chown -R root:root /opt/pluribus/pluribus /opt/pluribus/scripts /opt/pluribus/systemd
+sudo chown root:root /opt/pluribus/requirements.txt /opt/pluribus/pluribus_worker.py /opt/pluribus/.env.example
+sudo chmod -R u=rwX,go=rX /opt/pluribus/pluribus /opt/pluribus/scripts /opt/pluribus/systemd
+```
+
+Crea el virtualenv com a part del desplegament, no des del procés web:
+
+```bash
+sudo python3 -m venv /opt/pluribus/venv
+sudo /opt/pluribus/venv/bin/pip install -r /opt/pluribus/requirements.txt
+sudo chown -R root:root /opt/pluribus/venv
+```
+
+La configuració mutable del dashboard viu dins del directori d'estat, no al costat del codi:
+
+```bash
+sudo install -o pluribus -g pluribus -m 0600 \
+  /opt/pluribus/.env.example /opt/pluribus/data/pluribus.env
+sudoedit /opt/pluribus/data/pluribus.env
+```
+
+La inicialització de l'esquema es fa automàticament durant la startup. Si el bootstrap o una migració fallen, el servei falla abans de servir trànsit.
+
+### Migració d'una instal·lació existent
+
+Si ja existia `/opt/pluribus/.env`, mou-ne el contingut al nou EnvironmentFile abans d'activar les unitats hardened:
+
+```bash
+sudo cp /opt/pluribus/.env /opt/pluribus/data/pluribus.env
+sudo chown pluribus:pluribus /opt/pluribus/data/pluribus.env /opt/pluribus/data
+sudo chmod 0600 /opt/pluribus/data/pluribus.env
+sudo chmod 0750 /opt/pluribus/data
+```
+
+La BD i els seus fitxers WAL/SHM també han de pertànyer a `pluribus`:
+
+```bash
+sudo chown -R pluribus:pluribus /opt/pluribus/data
+```
 
 ### Crear el primer agent
 
-El bootstrap inicial d'agents es fa amb l'script local:
+El bootstrap inicial d'agents es fa amb l'script local **com el mateix usuari del servei**, perquè no deixi la BD propietat de root:
 
 ```bash
-/opt/pluribus/venv/bin/python /opt/pluribus/scripts/create_agent.py
+sudo -u pluribus /opt/pluribus/venv/bin/python /opt/pluribus/scripts/create_agent.py
 ```
 
 Després, l'endpoint `/v1/agents/register` només és accessible per agents administradors.
@@ -59,7 +99,7 @@ Totes les variables utilitzen el prefix `PLURIBUS_`:
 | `PLURIBUS_RATE_LIMIT` | `100` | Requests per finestra |
 | `PLURIBUS_RATE_LIMIT_WINDOW` | `60` | Finestra en segons |
 
-Consulta `.env.example` per a totes les opcions, inclosos fallback del worker i Notion.
+En desplegament systemd, les variables es carreguen de `/opt/pluribus/data/pluribus.env`. `settings.ENV_PATH` apunta al mateix fitxer perquè les modificacions admin del dashboard siguin atòmiques dins d'un directori writable sense donar escriptura sobre el codi.
 
 ## Systemd
 
@@ -74,6 +114,8 @@ sudo systemctl enable --now pluribus.service
 sudo systemctl enable --now pluribus-worker.timer
 ```
 
+Les unitats s'executen com `pluribus:pluribus`, sense capabilities, amb `NoNewPrivileges`, `ProtectSystem=strict`, `ProtectHome`, proteccions de kernel/control groups i només `/opt/pluribus/data` writable. La xarxa queda limitada a `AF_UNIX`, `AF_INET` i `AF_INET6`.
+
 Comprovacions:
 
 ```bash
@@ -81,7 +123,10 @@ systemctl status pluribus.service
 systemctl status pluribus-worker.timer
 journalctl -u pluribus.service -f
 journalctl -u pluribus-worker.service -f
+systemd-analyze security pluribus.service
 ```
+
+El restart administratiu de l'API **no executa `systemctl`**. Després d'escriure i fsync el nou `pluribus.env`, programa un `SIGTERM` al mateix procés; `Restart=always` fa que systemd iniciï una instància nova que rellegeix l'EnvironmentFile. Un `systemctl stop pluribus` explícit continua aturant la unitat normalment.
 
 ## API
 
@@ -153,6 +198,8 @@ El timer inclòs executa el worker cada 15 minuts. Un error fatal o errors de co
 - Categories persistents `system`, `config` i `entities`: eliminació admin-only.
 - Configuració, restart i dades globals del dashboard: admin-only.
 - JSON de permisos corrupte falla tancat, sense concedir accessos per defecte.
+- Servei i worker sense privilegis root i amb sandboxing systemd.
+- El directori de codi és read-only per al procés; només el directori d'estat és writable.
 
 ## Arquitectura resumida
 
