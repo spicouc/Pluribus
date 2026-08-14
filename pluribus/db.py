@@ -53,6 +53,21 @@ async def _migrate_db() -> None:
                WHERE api_key_fingerprint IS NOT NULL"""
         )
 
+        # Webhook security/delivery columns are migrated before the app starts,
+        # avoiding concurrent first-request ALTER TABLE races. Legacy helper
+        # migration in webhooks.py remains as a defensive compatibility layer.
+        cursor = await db.execute("PRAGMA table_info(webhooks)")
+        webhook_columns = {row["name"] for row in await cursor.fetchall()}
+        webhook_migrations = {
+            "secret": "ALTER TABLE webhooks ADD COLUMN secret TEXT",
+            "last_attempted_at": "ALTER TABLE webhooks ADD COLUMN last_attempted_at TEXT",
+            "last_status": "ALTER TABLE webhooks ADD COLUMN last_status INTEGER",
+            "last_error": "ALTER TABLE webhooks ADD COLUMN last_error TEXT",
+        }
+        for name, sql in webhook_migrations.items():
+            if name not in webhook_columns:
+                await db.execute(sql)
+
         await db.executescript("""
             DROP TRIGGER IF EXISTS facts_ai;
             DROP TRIGGER IF EXISTS facts_ad;
