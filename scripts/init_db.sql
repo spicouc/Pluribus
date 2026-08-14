@@ -65,6 +65,32 @@ CREATE TABLE IF NOT EXISTS chunks (
 
 CREATE INDEX IF NOT EXISTS idx_chunks_fact_id ON chunks(fact_id);
 
+-- Generation counter for the derived TurboVec index. Every DB mutation that can
+-- change indexed vectors or their filtering metadata increments this value.
+CREATE TABLE IF NOT EXISTS vector_index_state (
+    singleton INTEGER PRIMARY KEY CHECK (singleton = 1),
+    generation INTEGER NOT NULL DEFAULT 0
+);
+INSERT OR IGNORE INTO vector_index_state(singleton, generation) VALUES (1, 0);
+
+CREATE TRIGGER IF NOT EXISTS vector_chunks_ai AFTER INSERT ON chunks BEGIN
+    UPDATE vector_index_state SET generation = generation + 1 WHERE singleton = 1;
+END;
+CREATE TRIGGER IF NOT EXISTS vector_chunks_au
+AFTER UPDATE OF embedding_blob, fact_id, chunk_text ON chunks BEGIN
+    UPDATE vector_index_state SET generation = generation + 1 WHERE singleton = 1;
+END;
+CREATE TRIGGER IF NOT EXISTS vector_chunks_ad AFTER DELETE ON chunks BEGIN
+    UPDATE vector_index_state SET generation = generation + 1 WHERE singleton = 1;
+END;
+CREATE TRIGGER IF NOT EXISTS vector_facts_au
+AFTER UPDATE OF scope, category, agent_id, key, deleted_at ON facts BEGIN
+    UPDATE vector_index_state SET generation = generation + 1 WHERE singleton = 1;
+END;
+CREATE TRIGGER IF NOT EXISTS vector_facts_ad AFTER DELETE ON facts BEGIN
+    UPDATE vector_index_state SET generation = generation + 1 WHERE singleton = 1;
+END;
+
 CREATE TABLE IF NOT EXISTS embedding_cache (
     hash TEXT PRIMARY KEY,
     embedding_blob BLOB,
