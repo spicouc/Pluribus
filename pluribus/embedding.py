@@ -168,7 +168,22 @@ class EmbeddingService:
 
         return result
 
-    async def semantic_search(
+    def semantic_search(
+        self,
+        query_vec: np.ndarray,
+        chunks_with_ids: list[tuple[str, np.ndarray]],
+        top_k: int = 5,
+    ) -> list[tuple[str, float]]:
+        """Cerca semàntica síncrona sobre vectors ja carregats.
+
+        Aquest és el contracte que fan servir actualment els endpoints REST i
+        MCP: ells ja han filtrat i carregat els chunks des de SQLite i esperen
+        una llista iterable immediata de ``(chunk_id, score)``. Mantenir aquest
+        mètode síncron evita retornar una coroutine no esperada.
+        """
+        return self.semantic_search_numpy(query_vec, chunks_with_ids, top_k)
+
+    async def semantic_search_index(
         self,
         query_vec: np.ndarray,
         scope_filter: Optional[str] = None,
@@ -176,10 +191,11 @@ class EmbeddingService:
         agent_id_filter: Optional[str] = None,
         top_k: int = 5,
     ) -> list[tuple[str, float]]:
-        """Cerca semàntica usant TurboVec index.
+        """Cerca asíncrona accelerada via TurboVec.
 
-        Returns list of (chunk_id, score) tuples.
-        Falls back to an empty result if TurboVec is unavailable.
+        És una API separada i explícita per evitar confondre-la amb el contracte
+        síncron dels callers legacy. Els nous callers que vulguin TurboVec han
+        de fer ``await semantic_search_index(...)``.
         """
         try:
             from pluribus.vector_index import vector_index
@@ -203,10 +219,7 @@ class EmbeddingService:
         chunks_with_ids: list[tuple[str, np.ndarray]],
         top_k: int = 5,
     ) -> list[tuple[str, float]]:
-        """Legacy numpy dot product search.
-
-        Tots els vectors han d'estar normalitzats L2.
-        """
+        """Cerca NumPy per producte escalar sobre vectors normalitzats L2."""
         if not chunks_with_ids:
             return []
 
