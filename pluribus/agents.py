@@ -54,11 +54,19 @@ def _agent_to_response(row: dict[str, Any], fact_count: int = 0) -> AgentRespons
     )
 
 
+def _is_admin(agent: dict[str, Any]) -> bool:
+    return bool((agent.get("permissions") or {}).get("admin", False))
+
+
 @router.get("", response_model=list[AgentResponse])
 async def list_agents(request: Request) -> list[AgentResponse]:
+    """Retorna l'inventari global només a administradors."""
     agent: dict[str, Any] = request.state.agent
-    if not agent.get("permissions", {}).get("read", False):
-        raise HTTPException(status_code=403, detail="Sense permís per llistar agents")
+    if not _is_admin(agent):
+        raise HTTPException(
+            status_code=403,
+            detail="L'inventari global d'agents requereix permís admin",
+        )
 
     async with get_db() as db:
         cursor = await db.execute("""
@@ -74,9 +82,13 @@ async def list_agents(request: Request) -> list[AgentResponse]:
 
 @router.get("/{agent_id}", response_model=AgentResponse)
 async def get_agent(request: Request, agent_id: str) -> AgentResponse:
+    """Permet a un agent consultar-se a si mateix; admin pot consultar qualsevol agent."""
     agent: dict[str, Any] = request.state.agent
-    if not agent.get("permissions", {}).get("read", False):
-        raise HTTPException(status_code=403, detail="Sense permís")
+    if agent.get("id") != agent_id and not _is_admin(agent):
+        raise HTTPException(
+            status_code=403,
+            detail="Només pots consultar el teu propi agent",
+        )
 
     async with get_db() as db:
         cursor = await db.execute(
@@ -107,7 +119,7 @@ async def agent_heartbeat(request: Request, agent_id: str) -> None:
 @router.put("/{agent_id}", response_model=AgentResponse)
 async def update_agent(request: Request, agent_id: str, body: AgentUpdateRequest) -> AgentResponse:
     agent: dict[str, Any] = request.state.agent
-    if agent["id"] != agent_id and not agent.get("permissions", {}).get("admin", False):
+    if agent["id"] != agent_id and not _is_admin(agent):
         raise HTTPException(status_code=403, detail="No tens permís per modificar aquest agent")
 
     updates: list[str] = []
@@ -119,7 +131,7 @@ async def update_agent(request: Request, agent_id: str, body: AgentUpdateRequest
         updates.append("metadata = ?")
         params.append(json.dumps(body.metadata))
     if body.is_active is not None:
-        if not agent.get("permissions", {}).get("admin", False):
+        if not _is_admin(agent):
             raise HTTPException(status_code=403, detail="Només un admin pot canviar is_active")
         updates.append("is_active = ?")
         params.append(1 if body.is_active else 0)
@@ -147,7 +159,7 @@ async def update_agent(request: Request, agent_id: str, body: AgentUpdateRequest
 async def register_agent(request: Request, body: AgentRegisterRequest) -> AgentRegisterResponse:
     """Registra un agent. Només un administrador autenticat ho pot fer."""
     caller: dict[str, Any] = request.state.agent
-    if not caller.get("permissions", {}).get("admin", False):
+    if not _is_admin(caller):
         raise HTTPException(status_code=403, detail="Permís admin requerit per registrar agents")
 
     api_key = generate_api_key()
@@ -178,7 +190,7 @@ async def register_agent(request: Request, body: AgentRegisterRequest) -> AgentR
 async def delete_agent(request: Request, agent_id: str) -> None:
     """Elimina un agent sense violar foreign keys ni perdre els seus fets."""
     agent: dict[str, Any] = request.state.agent
-    if not agent.get("permissions", {}).get("admin", False):
+    if not _is_admin(agent):
         raise HTTPException(status_code=403, detail="Es requereixen permisos admin per eliminar agents")
 
     async with get_db() as db:
