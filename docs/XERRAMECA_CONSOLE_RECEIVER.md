@@ -2,7 +2,7 @@
 
 ## Consola
 
-Obre:
+Obre el dashboard normal i prem **Xerrameca**, o entra directament a:
 
 ```text
 /dashboard?view=xerrameca
@@ -74,11 +74,17 @@ Abans de processar un torn, el receptor:
 1. limita el payload a 1 MiB;
 2. verifica `X-Pluribus-Signature` amb HMAC-SHA256 sobre els bytes exactes del body;
 3. valida l'event `xerrameca.turn.claimed`;
-4. valida `turn.id` i `turn.lease_token`;
+4. valida `turn.id`, `turn.lease_token` i el format de `turn.lease_until`;
 5. exigeix que `X-Pluribus-Idempotency-Key` coincideixi amb `turn.id`;
-6. registra la delivery en una SQLite local abans d'acceptar-la.
+6. registra la delivery i la lease en una SQLite local abans d'acceptar-la.
 
-Una delivery repetida no torna a executar el handler.
+La deduplicació és **conscient de la lease**:
+
+- mateix `turn.id` + mateixa `lease_token` → duplicat, no es torna a executar;
+- torn ja `completed` → no es torna a executar;
+- mateix `turn.id` + **nova** `lease_token` → nou intent legítim després que Pluribus hagi recuperat una lease caducada.
+
+A més, un worker antic només pot actualitzar l'estat local si continua tenint la mateixa `lease_token`, de manera que no pot marcar com a completat un intent posterior.
 
 ## Contracte del handler
 
@@ -134,15 +140,17 @@ amb la `lease_token` rebuda del Runner.
 
 El receptor respon `202 Accepted` després de validar i persistir la delivery. El handler s'executa en background.
 
-Això és important perquè el Runner no mantingui una connexió HTTP oberta mentre el model pensa.
+Això evita que el Runner mantingui una connexió HTTP oberta mentre el model pensa.
 
 Si el procés cau després de l'ACK:
 
 - la lease queda activa fins al seu venciment;
 - Xerrameca torna a fer el torn reclamable quan caduca;
-- la SQLite local impedeix reexecutar accidentalment una delivery que ja s'havia processat amb la mateixa clau.
+- el Runner obté una nova lease;
+- el receptor veu una `lease_token` diferent i accepta el nou intent;
+- una repetició de la mateixa delivery/lease continua sent idempotent.
 
-Si es necessita política de retry més sofisticada del costat receptor, es pot substituir el `BackgroundTasks` per una cua persistent mantenint el mateix contracte HMAC/idempotència.
+Si es necessita una política de recovery encara més forta davant d'un crash entre l'ACK i l'execució, es pot substituir `BackgroundTasks` per una cua persistent mantenint el mateix contracte HMAC + turn id + lease token.
 
 ## Handler per defecte
 
