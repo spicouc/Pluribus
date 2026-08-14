@@ -6,24 +6,33 @@ from contextlib import asynccontextmanager
 
 import asyncio
 import json
+
 from fastapi import Depends, FastAPI, Request
 from fastapi.responses import JSONResponse
 
 from pluribus.admin_config import router as admin_config_router
 from pluribus.agents import router as agents_router
-from pluribus.authorization import agents_authorize, dashboard_authorize, mcp_authorize, memory_authorize
+from pluribus.authorization import (
+    agents_authorize,
+    dashboard_authorize,
+    knowledge_authorize,
+    mcp_authorize,
+    memory_authorize,
+)
 from pluribus.compact import compact_database
 from pluribus.config import settings
 from pluribus.dashboard import router as dashboard_router
-from pluribus.db import init_db
+from pluribus.db import get_db, init_db
 from pluribus.embedding import embedding_service
 from pluribus.expiry_worker import expiry_worker_loop
 from pluribus.knowledge import router as knowledge_router
 from pluribus.lint import router as lint_router
 from pluribus.mcp import router as mcp_router
+from pluribus.mcp_async import router as mcp_async_router
 from pluribus.memory import router as memory_router
 from pluribus.query_save import router as query_save_router
 from pluribus.security import register_security_middleware
+from pluribus.semantic_async import router as semantic_router
 from pluribus.webhooks import router as webhooks_router
 
 
@@ -33,9 +42,9 @@ async def lifespan(app: FastAPI):
     await init_db()
     print("✓ Base de dades inicialitzada correctament")
 
-    task_handles = []
+    task_handles: list[asyncio.Task] = []
 
-    async def _run_expiry():
+    async def _run_expiry() -> None:
         try:
             await expiry_worker_loop()
         except asyncio.CancelledError:
@@ -47,7 +56,7 @@ async def lifespan(app: FastAPI):
     task_handles.append(expiry_task)
     print("✓ Worker d'expiració (TTL) iniciat cada 5 minuts")
 
-    async def _run_compact():
+    async def _run_compact() -> None:
         while True:
             try:
                 await asyncio.sleep(86400)
@@ -82,27 +91,62 @@ app = FastAPI(
 register_security_middleware(app)
 
 memory_dependencies = [Depends(memory_authorize)]
+# Async semantic routes must precede the legacy duplicates in memory.py.
+app.include_router(semantic_router, dependencies=memory_dependencies)
 app.include_router(memory_router, dependencies=memory_dependencies)
 app.include_router(query_save_router, dependencies=memory_dependencies)
 app.include_router(lint_router, dependencies=memory_dependencies)
-# Register hardened mutation routes before dashboard.py's legacy duplicates.
+# Hardened mutation routes must precede dashboard.py's legacy duplicates.
 app.include_router(admin_config_router, dependencies=[Depends(dashboard_authorize)])
 app.include_router(dashboard_router, dependencies=[Depends(dashboard_authorize)])
+# Intercept MCP semantic calls while delegating other tools to legacy handlers.
+app.include_router(mcp_async_router, dependencies=[Depends(mcp_authorize)])
 app.include_router(mcp_router, dependencies=[Depends(mcp_authorize)])
 app.include_router(agents_router, dependencies=[Depends(agents_authorize)])
 app.include_router(webhooks_router)
-app.include_router(knowledge_router)
+# Current graph model is global, so fail closed to admin until it becomes scope-aware.
+app.include_router(knowledge_router, dependencies=[Depends(knowledge_authorize)])
+
+
+async def _sqlite_is_healthy() -> bool:
+    """Execute a real bounded DB query instead of reporting a constant."""
+    try:
+        async with asyncio.timeout(2.0):
+            async with get_db() as db:
+                cursor = await db.execute("SELECT 1 AS ok")
+                row = await cursor.fetchone()
+                return bool(row and row["ok"] == 1)
+    except Exception:
+        return False
 
 
 @app.get("/health")
 async def health() -> JSONResponse:
-    embedding_ready = embedding_service.is_ready
-    return JSONResponse({
-        "status": "ok",
-        "sqlite": True,
-        "embedding_ready": embedding_ready,
-        "version": "2.0.0",
-    })
+    sqlite_ok = await _sqlite_is_healthy()
+    try:
+        embedding_ready = await embedding_service.check_ready()
+    except Exception:
+        embedding_ready = False
+
+    if not sqlite_ok:
+        status = "error"
+        status_code = 503
+    elif not embedding_ready:
+        status = "degraded"
+        status_code = 200
+    else:
+        status = "ok"
+        status_code = 200
+
+    return JSONResponse(
+        status_code=status_code,
+        content={
+            "status": status,
+            "sqlite": sqlite_ok,
+            "embedding_ready": embedding_ready,
+            "version": "2.0.0",
+        },
+    )
 
 
 @app.post("/v1/admin/compact", status_code=200)
@@ -110,6 +154,7 @@ async def admin_compact(request: Request) -> dict:
     agent: dict = request.state.agent
     if not agent.get("permissions", {}).get("admin", False):
         from fastapi import HTTPException
+
         raise HTTPException(status_code=403, detail="Permís admin requerit")
 
     result = await asyncio.to_thread(compact_database)
@@ -125,6 +170,7 @@ async def admin_compact(request: Request) -> dict:
 
 if __name__ == "__main__":
     import uvicorn
+
     uvicorn.run(
         "pluribus.main:app",
         host="0.0.0.0",
