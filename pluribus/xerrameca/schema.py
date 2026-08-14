@@ -100,6 +100,43 @@ CREATE INDEX IF NOT EXISTS idx_xerrameca_messages_conversation
     ON xerrameca_messages(conversation_id, created_at);
 CREATE INDEX IF NOT EXISTS idx_xerrameca_messages_recipient
     ON xerrameca_messages(to_agent_id, created_at);
+
+-- Un agent globalment desactivat no ha de deixar una conversa aparentment activa.
+-- La conversa queda pausada i qualsevol lease actual es revoca. Reactivar
+-- l'agent no reprèn automàticament la conversa: un admin ha de fer resume.
+CREATE TRIGGER IF NOT EXISTS xerrameca_agent_deactivated
+AFTER UPDATE OF is_active ON agents
+WHEN old.is_active != 0 AND new.is_active = 0
+BEGIN
+    UPDATE xerrameca_turns
+       SET status = 'ready',
+           claimed_by = NULL,
+           lease_token = NULL,
+           claimed_at = NULL,
+           lease_until = NULL
+     WHERE status = 'claimed'
+       AND id IN (
+           SELECT c.current_turn_id
+             FROM xerrameca_conversations c
+             JOIN xerrameca_participants p
+               ON p.conversation_id = c.id
+            WHERE p.agent_id = new.id
+              AND c.status = 'active'
+              AND c.current_turn_id IS NOT NULL
+       );
+
+    UPDATE xerrameca_conversations
+       SET status = 'paused',
+           block_reason = 'agent_deactivated',
+           updated_at = datetime('now')
+     WHERE status = 'active'
+       AND EXISTS (
+           SELECT 1
+             FROM xerrameca_participants p
+            WHERE p.conversation_id = xerrameca_conversations.id
+              AND p.agent_id = new.id
+       );
+END;
 """
 
 
