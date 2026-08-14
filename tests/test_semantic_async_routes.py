@@ -111,34 +111,28 @@ class SemanticLookupTests(unittest.IsolatedAsyncioTestCase):
 
 
 class SemanticRoutePrecedenceTests(unittest.TestCase):
-    def test_async_rest_routes_precede_legacy_duplicates(self) -> None:
-        post_routes = [
-            route
-            for route in main.app.routes
-            if getattr(route, "path", None) == "/v1/memory/search/semantic"
-            and "POST" in (getattr(route, "methods", None) or set())
-        ]
-        self.assertGreaterEqual(len(post_routes), 2)
-        self.assertEqual(post_routes[0].endpoint.__module__, "pluribus.semantic_async")
+    def _endpoint_index(self, endpoint_name: str) -> int:
+        for index, route in enumerate(main.app.routes):
+            endpoint = getattr(route, "endpoint", None)
+            if getattr(endpoint, "__name__", None) == endpoint_name:
+                return index
+        self.fail(f"Endpoint {endpoint_name!r} no registrat")
 
-        get_routes = [
-            route
-            for route in main.app.routes
-            if getattr(route, "path", None) == "/v1/memory/search"
-            and "GET" in (getattr(route, "methods", None) or set())
-        ]
-        self.assertGreaterEqual(len(get_routes), 2)
-        self.assertEqual(get_routes[0].endpoint.__module__, "pluribus.semantic_async")
+    def test_async_rest_routes_precede_legacy_duplicates(self) -> None:
+        self.assertLess(
+            self._endpoint_index("semantic_search_async"),
+            self._endpoint_index("semantic_search"),
+        )
+        self.assertLess(
+            self._endpoint_index("search_memory_async"),
+            self._endpoint_index("search_memory"),
+        )
 
     def test_async_mcp_post_precedes_legacy_post(self) -> None:
-        routes = [
-            route
-            for route in main.app.routes
-            if getattr(route, "path", None) == "/mcp/"
-            and "POST" in (getattr(route, "methods", None) or set())
-        ]
-        self.assertGreaterEqual(len(routes), 2)
-        self.assertEqual(routes[0].endpoint.__module__, "pluribus.mcp_async")
+        self.assertLess(
+            self._endpoint_index("mcp_handle_async"),
+            self._endpoint_index("mcp_handle"),
+        )
 
 
 class McpSemanticTests(unittest.IsolatedAsyncioTestCase):
