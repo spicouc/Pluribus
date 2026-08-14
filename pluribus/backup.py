@@ -34,6 +34,25 @@ def _quick_check(path: Path) -> None:
         raise RuntimeError("SQLite backup quick_check failed")
 
 
+def _verify_gzip_archive(archive_path: Path, target_dir: Path) -> None:
+    """Restore the compressed artifact to a temp DB and validate that DB."""
+    restore_fd, restore_name = tempfile.mkstemp(
+        prefix=".pluribus-restore-check-",
+        suffix=".db.tmp",
+        dir=target_dir,
+    )
+    os.close(restore_fd)
+    restore_path = Path(restore_name)
+    try:
+        with gzip.open(archive_path, "rb") as compressed, restore_path.open("wb") as restored:
+            shutil.copyfileobj(compressed, restored, length=1024 * 1024)
+        _quick_check(restore_path)
+    except (OSError, EOFError) as exc:
+        raise RuntimeError("Compressed backup verification failed") from exc
+    finally:
+        restore_path.unlink(missing_ok=True)
+
+
 def _prune_old_backups(backup_dir: Path, retention_days: int, now_ts: float) -> int:
     cutoff = now_ts - retention_days * 86400
     removed = 0
@@ -52,11 +71,12 @@ def backup_database(
     backup_dir: str | None = None,
     retention_days: int = 14,
 ) -> BackupResult:
-    """Create an atomic gzip-compressed snapshot using SQLite's backup API.
+    """Create and verify an atomic gzip-compressed SQLite snapshot.
 
-    The SQLite backup API copies a transactionally consistent view even when the
-    source database is in WAL mode and remains online. The source database is
-    never VACUUMed, copied with `cp`, or mutated by this function.
+    SQLite's backup API copies a transactionally consistent view even when the
+    source database is in WAL mode and remains online. The generated compressed
+    artifact is restored into a temporary database and quick-checked before it
+    is atomically published as the final backup.
     """
     retention_days = _validate_retention_days(retention_days)
     source = Path(db_path or settings.DB_PATH).expanduser().resolve()
@@ -95,6 +115,9 @@ def backup_database(
         with raw_path.open("rb") as source_file, gzip.open(gzip_path, "wb", compresslevel=6) as out:
             shutil.copyfileobj(source_file, out, length=1024 * 1024)
         os.chmod(gzip_path, 0o600)
+
+        # Validate the exact compressed artifact that will be retained.
+        _verify_gzip_archive(gzip_path, target_dir)
         os.replace(gzip_path, final_path)
 
         removed = _prune_old_backups(

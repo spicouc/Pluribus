@@ -11,7 +11,7 @@ Pluribus és un servei lleuger de memòria compartida per a múltiples agents d'
 ## Requisits
 
 - Ubuntu 24.04 o equivalent
-- Python 3.12+
+- Python 3.12.13 per reproduir exactament el lock verificat
 - SQLite amb FTS5
 - Ollama accessible des del servidor per a embeddings i consolidació
 - Tailscale o una xarxa privada recomanada
@@ -31,17 +31,18 @@ sudo install -d -o pluribus -g pluribus -m 0750 /opt/pluribus/data
 Copia el codi com a root i mantén-lo no modificable per l'usuari del servei:
 
 ```bash
-sudo cp -r pluribus/ scripts/ systemd/ requirements.txt README.md .env.example pluribus_worker.py /opt/pluribus/
+sudo cp -r pluribus/ scripts/ systemd/ requirements.txt requirements.lock README.md .env.example pluribus_worker.py /opt/pluribus/
 sudo chown -R root:root /opt/pluribus/pluribus /opt/pluribus/scripts /opt/pluribus/systemd
-sudo chown root:root /opt/pluribus/requirements.txt /opt/pluribus/pluribus_worker.py /opt/pluribus/.env.example
+sudo chown root:root /opt/pluribus/requirements.txt /opt/pluribus/requirements.lock /opt/pluribus/pluribus_worker.py /opt/pluribus/.env.example
 sudo chmod -R u=rwX,go=rX /opt/pluribus/pluribus /opt/pluribus/scripts /opt/pluribus/systemd
 ```
 
-Crea el virtualenv com a part del desplegament, no des del procés web:
+`requirements.txt` descriu les dependències directes compatibles. **Producció i CI instal·len `requirements.lock`**, que fixa també les transitives a la combinació validada per la suite.
 
 ```bash
 sudo python3 -m venv /opt/pluribus/venv
-sudo /opt/pluribus/venv/bin/pip install -r /opt/pluribus/requirements.txt
+sudo /opt/pluribus/venv/bin/pip install --disable-pip-version-check -r /opt/pluribus/requirements.lock
+sudo /opt/pluribus/venv/bin/pip check
 sudo chown -R root:root /opt/pluribus/venv
 ```
 
@@ -98,35 +99,75 @@ Totes les variables utilitzen el prefix `PLURIBUS_`:
 | `PLURIBUS_CHUNK_OVERLAP` | `50` | Solapament |
 | `PLURIBUS_RATE_LIMIT` | `100` | Requests per finestra |
 | `PLURIBUS_RATE_LIMIT_WINDOW` | `60` | Finestra en segons |
+| `PLURIBUS_BACKUP_DIR` | `/opt/pluribus/data/backups` | Destí dels backups verificats |
+| `PLURIBUS_BACKUP_RETENTION_DAYS` | `14` | Retenció de snapshots |
 
 En desplegament systemd, les variables es carreguen de `/opt/pluribus/data/pluribus.env`. `settings.ENV_PATH` apunta al mateix fitxer perquè les modificacions admin del dashboard siguin atòmiques dins d'un directori writable sense donar escriptura sobre el codi.
 
 ## Systemd
 
-Instal·la el servei principal i el worker periòdic:
+Instal·la el servei principal, el worker periòdic i el backup verificat:
 
 ```bash
 sudo cp /opt/pluribus/systemd/pluribus.service /etc/systemd/system/
 sudo cp /opt/pluribus/systemd/pluribus-worker.service /etc/systemd/system/
 sudo cp /opt/pluribus/systemd/pluribus-worker.timer /etc/systemd/system/
+sudo cp /opt/pluribus/systemd/pluribus-backup.service /etc/systemd/system/
+sudo cp /opt/pluribus/systemd/pluribus-backup.timer /etc/systemd/system/
 sudo systemctl daemon-reload
 sudo systemctl enable --now pluribus.service
 sudo systemctl enable --now pluribus-worker.timer
+sudo systemctl enable --now pluribus-backup.timer
 ```
 
-Les unitats s'executen com `pluribus:pluribus`, sense capabilities, amb `NoNewPrivileges`, `ProtectSystem=strict`, `ProtectHome`, proteccions de kernel/control groups i només `/opt/pluribus/data` writable. La xarxa queda limitada a `AF_UNIX`, `AF_INET` i `AF_INET6`.
+Les unitats s'executen com `pluribus:pluribus`, sense capabilities, amb `NoNewPrivileges`, `ProtectSystem=strict`, `ProtectHome`, proteccions de kernel/control groups i només `/opt/pluribus/data` writable. El servei de backup és local-only (`AF_UNIX`); API i worker poden usar `AF_UNIX`, `AF_INET` i `AF_INET6`.
 
 Comprovacions:
 
 ```bash
 systemctl status pluribus.service
 systemctl status pluribus-worker.timer
+systemctl status pluribus-backup.timer
+systemctl list-timers 'pluribus-*'
 journalctl -u pluribus.service -f
 journalctl -u pluribus-worker.service -f
+journalctl -u pluribus-backup.service -f
 systemd-analyze security pluribus.service
+systemd-analyze security pluribus-backup.service
 ```
 
 El restart administratiu de l'API **no executa `systemctl`**. Després d'escriure i fsync el nou `pluribus.env`, programa un `SIGTERM` al mateix procés; `Restart=always` fa que systemd iniciï una instància nova que rellegeix l'EnvironmentFile. Un `systemctl stop pluribus` explícit continua aturant la unitat normalment.
+
+## Backups i recuperació
+
+`pluribus-backup.timer` executa una còpia diària aproximadament a les 03:30, amb un retard aleatori de fins a 30 minuts. És `Persistent=true`, de manera que una execució perduda durant una aturada es recupera després de tornar a arrencar.
+
+Cada backup:
+
+1. usa `sqlite3.Connection.backup()` i obté una snapshot coherent encara que la BD estigui en WAL;
+2. executa `PRAGMA quick_check` sobre la snapshot;
+3. comprimeix a gzip amb permisos `0600`;
+4. **descomprimeix l'artefacte temporal i torna a executar `quick_check`**;
+5. només llavors publica el `.db.gz` amb `os.replace()` atòmic;
+6. elimina backups més antics que la retenció configurada.
+
+Execució manual:
+
+```bash
+sudo -u pluribus /opt/pluribus/venv/bin/python -m pluribus.backup
+```
+
+Restauració controlada d'un backup (amb el servei aturat):
+
+```bash
+sudo systemctl stop pluribus.service pluribus-worker.timer
+sudo -u pluribus gzip -cd /opt/pluribus/data/backups/pluribus_YYYYMMDD_HHMMSS_xxxxxx.db.gz \
+  > /opt/pluribus/data/pluribus.restore.db
+sudo -u pluribus sqlite3 /opt/pluribus/data/pluribus.restore.db 'PRAGMA quick_check;'
+# Després de verificar "ok", substitueix la BD segons el teu procediment operatiu.
+```
+
+No cal restaurar cap fitxer TurboVec: l'índex és derivat de SQLite i es reconstrueix automàticament.
 
 ## API
 
@@ -180,7 +221,7 @@ Cada ronda:
 
 1. inicialitza/migra la DB;
 2. consolida facts encara no processats;
-3. crea relacions semàntiques noves;
+3. crea relacions semàntiques noves **només dins del mateix scope**;
 4. elimina chunks orfes i cache antiga;
 5. sincronitza Notion si està configurat.
 
@@ -193,13 +234,16 @@ El timer inclòs executa el worker cada 15 minuts. Un error fatal o errors de co
 - API keys hasheades amb bcrypt.
 - Agents amb `is_active=0` no poden autenticar-se.
 - Permisos `read/write/delete/admin`.
-- `allowed_scopes` aplicat a REST i MCP.
+- `allowed_scopes` aplicat a REST, MCP i generació automàtica de relacions.
+- Inventari global d'agents: admin-only; un agent estàndard només pot consultar-se a si mateix.
 - Registre i eliminació d'agents: admin-only.
 - Categories persistents `system`, `config` i `entities`: eliminació admin-only.
 - Configuració, restart i dades globals del dashboard: admin-only.
 - JSON de permisos corrupte falla tancat, sense concedir accessos per defecte.
-- Servei i worker sense privilegis root i amb sandboxing systemd.
-- El directori de codi és read-only per al procés; només el directori d'estat és writable.
+- Webhooks signats i amb destinació/IP validada i fixada per entrega.
+- Servei, worker i backup sense privilegis root i amb sandboxing systemd.
+- El directori de codi és read-only per als processos; només el directori d'estat és writable.
+- CI amb `GITHUB_TOKEN` read-only, Actions pinnejades per SHA i dependències instal·lades des de `requirements.lock`.
 
 ## Arquitectura resumida
 
@@ -213,7 +257,12 @@ FastAPI ── authorization guards ── SQLite + FTS5
   └── TurboVec
 
 systemd timer ──> pluribus.worker ──> consolidació + relacions + manteniment
+systemd timer ──> pluribus.backup ──> snapshot + restore-check + retention
 ```
+
+## Dependències
+
+`requirements.txt` és la declaració de dependències directes. `requirements.lock` és el conjunt exacte validat per CI per a Python 3.12.13/Ubuntu 24.04. Dependabot obre PRs setmanals per canvis de pip i GitHub Actions; qualsevol actualització ha de passar la mateixa suite abans d'entrar a `main`.
 
 ## Llicència
 
