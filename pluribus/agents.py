@@ -3,13 +3,13 @@
 from __future__ import annotations
 
 import json
-import secrets
 import uuid
 from typing import Any
 
 import bcrypt
 from fastapi import APIRouter, HTTPException, Request
 
+from pluribus.api_keys import fingerprint_api_key, generate_api_key
 from pluribus.db import get_db
 from pluribus.models import (
     AgentRegisterRequest,
@@ -119,7 +119,6 @@ async def update_agent(request: Request, agent_id: str, body: AgentUpdateRequest
         updates.append("metadata = ?")
         params.append(json.dumps(body.metadata))
     if body.is_active is not None:
-        # Only admins may change activation state; prevents self-reactivation.
         if not agent.get("permissions", {}).get("admin", False):
             raise HTTPException(status_code=403, detail="Només un admin pot canviar is_active")
         updates.append("is_active = ?")
@@ -151,14 +150,24 @@ async def register_agent(request: Request, body: AgentRegisterRequest) -> AgentR
     if not caller.get("permissions", {}).get("admin", False):
         raise HTTPException(status_code=403, detail="Permís admin requerit per registrar agents")
 
-    api_key = secrets.token_urlsafe(32)
+    api_key = generate_api_key()
     api_key_hash = bcrypt.hashpw(api_key.encode(), bcrypt.gensalt()).decode()
+    api_key_fingerprint = fingerprint_api_key(api_key)
     agent_id = str(uuid.uuid4())
 
     async with get_db() as db:
         await db.execute(
-            "INSERT INTO agents (id, name, api_key_hash, permissions, allowed_scopes) VALUES (?, ?, ?, ?, ?)",
-            (agent_id, body.name, api_key_hash, json.dumps(body.permissions), json.dumps(body.allowed_scopes)),
+            """INSERT INTO agents
+               (id, name, api_key_hash, api_key_fingerprint, permissions, allowed_scopes)
+               VALUES (?, ?, ?, ?, ?, ?)""",
+            (
+                agent_id,
+                body.name,
+                api_key_hash,
+                api_key_fingerprint,
+                json.dumps(body.permissions),
+                json.dumps(body.allowed_scopes),
+            ),
         )
         await db.commit()
 
@@ -180,7 +189,6 @@ async def delete_agent(request: Request, agent_id: str) -> None:
         if row["id"] == agent.get("id"):
             raise HTTPException(status_code=400, detail="No pots eliminar el teu propi agent")
 
-        # agent_id is nullable. NULL preserves facts/audit while satisfying FKs.
         await db.execute("UPDATE facts SET agent_id = NULL WHERE agent_id = ?", (agent_id,))
         await db.execute("UPDATE audit_log SET agent_id = NULL WHERE agent_id = ?", (agent_id,))
         await db.execute("DELETE FROM agents WHERE id = ?", (agent_id,))
