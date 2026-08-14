@@ -1,9 +1,8 @@
 """Reference receiver for Xerrameca Runner callbacks.
 
-The receiver is intentionally generic: it verifies the Runner HMAC, deduplicates
-turn deliveries durably, acknowledges quickly, invokes a configured Python
-handler in the background and completes the turn through Pluribus REST using the
-agent's own API key.
+The receiver verifies Runner HMAC signatures, deduplicates the same live lease,
+allows a legitimate retry when Pluribus issues a new lease for the same turn,
+and completes the turn through Pluribus REST using the agent's own API key.
 """
 
 from __future__ import annotations
@@ -66,25 +65,24 @@ def verify_signature(secret: str, body: bytes, provided: str | None) -> bool:
     return hmac.compare_digest(_signature(secret, body), provided.strip())
 
 
-def _turn_fields(payload: dict[str, Any]) -> tuple[str, str]:
-    """Extract the canonical Runner v1 nested turn envelope.
-
-    A small top-level compatibility path is retained for early development
-    payloads, but the production Runner sends payload['turn']['id'] and
-    payload['turn']['lease_token'].
-    """
+def _turn_fields(payload: dict[str, Any]) -> tuple[str, str, str | None]:
+    """Extract canonical Runner v1 turn id, lease token and lease expiry."""
     turn = payload.get("turn")
     if isinstance(turn, dict):
         turn_id = turn.get("id")
         lease_token = turn.get("lease_token")
+        lease_until = turn.get("lease_until")
     else:
         turn_id = payload.get("turn_id")
         lease_token = payload.get("lease_token")
+        lease_until = payload.get("lease_until")
     if not isinstance(turn_id, str) or not turn_id:
         raise ValueError("turn.id obligatori")
     if not isinstance(lease_token, str) or len(lease_token) < 16:
         raise ValueError("turn.lease_token obligatori")
-    return turn_id, lease_token
+    if lease_until is not None and not isinstance(lease_until, str):
+        raise ValueError("turn.lease_until invàlid")
+    return turn_id, lease_token, lease_until
 
 
 def _init_state_db(path: str) -> None:
@@ -96,48 +94,89 @@ def _init_state_db(path: str) -> None:
             """CREATE TABLE IF NOT EXISTS deliveries (
                    idempotency_key TEXT PRIMARY KEY,
                    turn_id TEXT NOT NULL,
+                   lease_token TEXT,
+                   lease_until TEXT,
                    status TEXT NOT NULL,
                    last_error TEXT,
                    received_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
                    updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
                )"""
         )
+        columns = {row[1] for row in db.execute("PRAGMA table_info(deliveries)").fetchall()}
+        if "lease_token" not in columns:
+            db.execute("ALTER TABLE deliveries ADD COLUMN lease_token TEXT")
+        if "lease_until" not in columns:
+            db.execute("ALTER TABLE deliveries ADD COLUMN lease_until TEXT")
         db.commit()
 
 
-def _claim_delivery(path: str, key: str, turn_id: str) -> bool:
-    """Return True only for the first durable observation of a delivery key."""
+def _claim_delivery(
+    path: str,
+    key: str,
+    turn_id: str,
+    lease_token: str,
+    lease_until: str | None,
+) -> bool:
+    """Claim a delivery attempt.
+
+    Same turn + same lease is a duplicate. The same turn with a new lease token is
+    a legitimate recovery attempt after Pluribus reclaims an expired lease.
+    """
     with sqlite3.connect(path, timeout=5) as db:
         db.execute("BEGIN IMMEDIATE")
         row = db.execute(
-            "SELECT status FROM deliveries WHERE idempotency_key = ?", (key,)
+            "SELECT status, lease_token FROM deliveries WHERE idempotency_key = ?",
+            (key,),
         ).fetchone()
-        if row:
+        if not row:
+            db.execute(
+                """INSERT INTO deliveries
+                   (idempotency_key, turn_id, lease_token, lease_until, status)
+                   VALUES (?, ?, ?, ?, 'accepted')""",
+                (key, turn_id, lease_token, lease_until),
+            )
+            db.commit()
+            return True
+
+        status, previous_lease = row
+        if status == "completed" or previous_lease == lease_token:
             db.rollback()
             return False
+
+        # A new lease supersedes any stale accepted/processing/error attempt.
         db.execute(
-            "INSERT INTO deliveries (idempotency_key, turn_id, status) VALUES (?, ?, 'accepted')",
-            (key, turn_id),
+            """UPDATE deliveries
+               SET turn_id = ?, lease_token = ?, lease_until = ?, status = 'accepted',
+                   last_error = NULL, updated_at = CURRENT_TIMESTAMP
+               WHERE idempotency_key = ?""",
+            (turn_id, lease_token, lease_until, key),
         )
         db.commit()
         return True
 
 
-def _set_delivery(path: str, key: str, status: str, error: str | None = None) -> None:
+def _set_delivery(
+    path: str,
+    key: str,
+    lease_token: str,
+    status: str,
+    error: str | None = None,
+) -> None:
+    """Update only the currently active local lease attempt."""
     with sqlite3.connect(path, timeout=5) as db:
         db.execute(
             """UPDATE deliveries
                SET status = ?, last_error = ?, updated_at = CURRENT_TIMESTAMP
-               WHERE idempotency_key = ?""",
-            (status, error[:1000] if error else None, key),
+               WHERE idempotency_key = ? AND lease_token = ?""",
+            (status, error[:1000] if error else None, key, lease_token),
         )
         db.commit()
 
 
 async def default_handler(payload: dict[str, Any]) -> dict[str, Any]:
-    """Safe default: acknowledge the turn but require an operator/real handler."""
+    """Safe default: require an operator/real handler instead of inventing work."""
     try:
-        turn_id, _ = _turn_fields(payload)
+        turn_id, _, _ = _turn_fields(payload)
     except ValueError:
         turn_id = "unknown"
     return {
@@ -184,7 +223,7 @@ async def _call_handler(handler: Callable[[dict[str, Any]], Any], payload: dict[
 
 
 async def _reply_to_pluribus(settings: ReceiverSettings, payload: dict[str, Any], result: dict[str, Any]) -> None:
-    turn_id, lease_token = _turn_fields(payload)
+    turn_id, lease_token, _ = _turn_fields(payload)
     body = {
         "content": result["content"],
         "result": result["result"],
@@ -212,15 +251,14 @@ async def _process_delivery(
     key: str,
     payload: dict[str, Any],
 ) -> None:
+    _, lease_token, _ = _turn_fields(payload)
     try:
-        _set_delivery(settings.state_db, key, "processing")
+        _set_delivery(settings.state_db, key, lease_token, "processing")
         result = await _call_handler(handler, payload)
         await _reply_to_pluribus(settings, payload, result)
-        _set_delivery(settings.state_db, key, "completed")
+        _set_delivery(settings.state_db, key, lease_token, "completed")
     except Exception as exc:
-        # Best effort: tell Pluribus that the turn errored while the lease is
-        # still valid. If that also fails, normal lease expiry recovers it.
-        _set_delivery(settings.state_db, key, "error", str(exc))
+        _set_delivery(settings.state_db, key, lease_token, "error", str(exc))
         try:
             await _reply_to_pluribus(
                 settings,
@@ -232,6 +270,8 @@ async def _process_delivery(
                 },
             )
         except Exception:
+            # If the lease is already stale or Pluribus is unavailable, Runner
+            # recovery will issue a new lease and this receiver will accept it.
             pass
 
 
@@ -243,11 +283,11 @@ def create_receiver_app(
     _init_state_db(settings.state_db)
     handler = handler or load_handler(settings.handler_spec)
 
-    app = FastAPI(title="Xerrameca Runner Reference Receiver", version="1.0.0")
+    app = FastAPI(title="Xerrameca Runner Reference Receiver", version="1.1.0")
 
     @app.get("/health")
     async def health() -> dict[str, Any]:
-        return {"status": "ok", "receiver": "xerrameca-reference", "version": "1.0.0"}
+        return {"status": "ok", "receiver": "xerrameca-reference", "version": "1.1.0"}
 
     @app.post("/xerrameca/turn")
     async def receive_turn(request: Request, background_tasks: BackgroundTasks) -> JSONResponse:
@@ -279,7 +319,7 @@ def create_receiver_app(
             raise HTTPException(status_code=422, detail="Event Xerrameca no suportat")
 
         try:
-            turn_id, _lease_token = _turn_fields(payload)
+            turn_id, lease_token, lease_until = _turn_fields(payload)
         except ValueError as exc:
             raise HTTPException(status_code=422, detail=str(exc)) from exc
 
@@ -291,12 +331,16 @@ def create_receiver_app(
         key = str(key)
         if not key or len(key) > 256:
             raise HTTPException(status_code=422, detail="idempotency_key invàlida")
-        # Runner v1 uses turn_id as the stable idempotency key. Reject a
-        # conflicting caller-supplied key rather than deduplicating the wrong turn.
         if key != turn_id:
             raise HTTPException(status_code=422, detail="idempotency_key ha de coincidir amb turn.id")
 
-        first = _claim_delivery(settings.state_db, key, turn_id)
+        first = _claim_delivery(
+            settings.state_db,
+            key,
+            turn_id,
+            lease_token,
+            lease_until,
+        )
         if not first:
             return JSONResponse(
                 status_code=200,
@@ -312,17 +356,16 @@ def create_receiver_app(
     return app
 
 
-# Convenient ASGI entrypoint. Environment is read only when this module is used
-# directly by uvicorn, not when imported by Pluribus/tests.
 def _build_default_app() -> FastAPI:
     try:
         return create_receiver_app()
     except RuntimeError as exc:
+        detail = str(exc)
         app = FastAPI(title="Xerrameca Runner Reference Receiver")
 
         @app.get("/health")
         async def unhealthy() -> JSONResponse:
-            return JSONResponse(status_code=503, content={"status": "error", "detail": str(exc)})
+            return JSONResponse(status_code=503, content={"status": "error", "detail": detail})
 
         return app
 
