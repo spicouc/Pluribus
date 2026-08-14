@@ -35,14 +35,12 @@ async def lifespan(app: FastAPI):
     En iniciar: inicialitza l'esquema de la base de dades.
     En tancar: neteja recursos.
     """
-    try:
-        await init_db()
-        print("✓ Base de dades inicialitzada correctament")
-    except Exception as exc:
-        print(f"⚠ Error inicialitzant la base de dades: {exc}")
+    # Fail-fast: si el bootstrap o una migració falla, la startup de FastAPI
+    # també ha de fallar. No és segur servir trànsit amb un esquema parcial.
+    await init_db()
+    print("✓ Base de dades inicialitzada correctament")
 
     # Inicia workers en segon pla
-    import asyncio
     task_handles = []
 
     # Worker d'expiració cada 5 minuts
