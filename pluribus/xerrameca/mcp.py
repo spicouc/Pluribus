@@ -6,9 +6,9 @@ from typing import Any
 
 from fastapi import HTTPException, Request
 
+from .claim import claim_turn
 from .models import ReplyRequest
 from .service import (
-    claim_turn,
     get_conversation,
     inbox,
     list_conversations,
