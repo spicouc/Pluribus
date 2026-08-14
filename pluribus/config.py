@@ -6,12 +6,13 @@ from pydantic_settings import BaseSettings
 class Settings(BaseSettings):
     """Paràmetres de configuració del servei Pluribus."""
     DB_PATH: str = "/opt/pluribus/data/pluribus.db"
+    ENV_PATH: str = "/opt/pluribus/.env"
     API_PORT: int = 8790
 
     # Ollama embeddings
     OLLAMA_BASE_URL: str = "http://localhost:11434"
     OLLAMA_MODEL: str = "nomic-embed-text-v2-moe:latest"
-    EMBED_DIM: int = 768  # nomic-embed-text-v2-moe: 768 dims
+    EMBED_DIM: int = 768
 
     # Chunking
     MAX_CHUNK_SIZE: int = 500
