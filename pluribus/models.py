@@ -2,25 +2,27 @@
 
 from __future__ import annotations
 
-from datetime import datetime
 from typing import Any, Optional
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, field_validator
 
-# Categories disponibles (estil OpenViking)
-VALID_CATEGORIES = {
-    "",            # legacy / sense categoria
-    "profile",     # informació bàsica de l'usuari
-    "preferences", # preferències de l'usuari per tema
-    "entities",    # entitats (persones, projectes)
-    "events",      # registres d'esdeveniments (decisions, fites)
-    "cases",       # casos apresos per l'agent
-    "patterns",    # patrons apresos per l'agent
-}
+from pluribus.validation import (
+    VALID_CATEGORIES,
+    validate_agent_name,
+    validate_category,
+    validate_content,
+    validate_identifier,
+    validate_key,
+    validate_metadata,
+    validate_permissions,
+    validate_query,
+    validate_scope,
+    validate_scopes,
+    validate_ttl,
+)
 
 
 class WriteRequest(BaseModel):
-    """Cos de la petició per escriure un fet a la memòria."""
     content: str
     scope: str = "shared"
     category: str = "events"
@@ -28,16 +30,21 @@ class WriteRequest(BaseModel):
     metadata: dict[str, Any] = Field(default_factory=dict)
     ttl_days: int | None = None
 
+    _content = field_validator("content")(validate_content)
+    _scope = field_validator("scope")(validate_scope)
+    _category = field_validator("category")(validate_category)
+    _key = field_validator("key")(validate_key)
+    _metadata = field_validator("metadata")(validate_metadata)
+    _ttl = field_validator("ttl_days")(validate_ttl)
+
 
 class WriteResponse(BaseModel):
-    """Resposta després de crear un fet."""
     fact_id: str
     message: str = "Fet creat correctament"
     chunks_generated: int = 0
 
 
 class FactResponse(BaseModel):
-    """Representació d'un fet retornat al client."""
     id: str
     scope: str
     category: str = "events"
@@ -51,16 +58,17 @@ class FactResponse(BaseModel):
 
 
 class LsParams(BaseModel):
-    """Paràmetres per llistar fets (com un ls de directori)."""
     scope: str = "shared"
     category: str = "events"
     agent_id: Optional[str] = None
     limit: int = Field(default=50, ge=1, le=200)
     offset: int = Field(default=0, ge=0)
 
+    _scope = field_validator("scope")(validate_scope)
+    _category = field_validator("category")(validate_category)
+
 
 class LsResponse(BaseModel):
-    """Resposta de l'endpoint ls."""
     items: list[dict[str, Any]]
     total: int
     scope: str
@@ -68,16 +76,18 @@ class LsResponse(BaseModel):
 
 
 class QueryParams(BaseModel):
-    """Paràmetres per a la cerca per text (FTS5)."""
     q: str
     scope: str = "shared"
     category: str = "events"
     agent_id: Optional[str] = None
     limit: int = Field(default=10, ge=1, le=50)
 
+    _query = field_validator("q")(validate_query)
+    _scope = field_validator("scope")(validate_scope)
+    _category = field_validator("category")(validate_category)
+
 
 class SearchRequest(BaseModel):
-    """Paràmetres per a la cerca GET combinada (FTS5 + semàntica)."""
     q: str
     semantic: bool = False
     limit: int = Field(default=5, ge=1, le=50)
@@ -85,9 +95,12 @@ class SearchRequest(BaseModel):
     category: str = "events"
     agent_id: Optional[str] = None
 
+    _query = field_validator("q")(validate_query)
+    _scope = field_validator("scope")(validate_scope)
+    _category = field_validator("category")(validate_category)
+
 
 class SearchResult(BaseModel):
-    """Un resultat individual de la cerca combinada."""
     fact_id: str
     content: str
     scope: str
@@ -96,12 +109,11 @@ class SearchResult(BaseModel):
     key: Optional[str] = None
     metadata: dict[str, Any] = Field(default_factory=dict)
     score: float = 0.0
-    match_type: str = "fts5"  # "fts5" o "semantic"
+    match_type: str = "fts5"
     snippet: Optional[str] = None
 
 
 class SearchResponse(BaseModel):
-    """Resposta completa de la cerca combinada."""
     results: list[SearchResult]
     query: str
     total: int
@@ -109,16 +121,18 @@ class SearchResponse(BaseModel):
 
 
 class SemanticSearchRequest(BaseModel):
-    """Cos de la petició per a la cerca semàntica (POST)."""
     query: str
     top_k: int = Field(default=5, ge=1, le=50)
     scope: str = "shared"
     category: str = "events"
     agent_id: Optional[str] = None
 
+    _query = field_validator("query")(validate_query)
+    _scope = field_validator("scope")(validate_scope)
+    _category = field_validator("category")(validate_category)
+
 
 class SemanticSearchResult(BaseModel):
-    """Un resultat individual de la cerca semàntica."""
     fact_id: str
     content: str
     scope: str
@@ -130,7 +144,6 @@ class SemanticSearchResult(BaseModel):
 
 
 class SemanticSearchResponse(BaseModel):
-    """Resposta completa de la cerca semàntica."""
     results: list[SemanticSearchResult]
     query: str
     top_k: int
@@ -138,14 +151,20 @@ class SemanticSearchResponse(BaseModel):
 
 
 class UpdateRequest(BaseModel):
-    """Cos de la petició per actualitzar un fet."""
     content: str
     metadata: Optional[dict[str, Any]] = None
     category: Optional[str] = None
 
+    _content = field_validator("content")(validate_content)
+    _metadata = field_validator("metadata")(validate_metadata)
+
+    @field_validator("category")
+    @classmethod
+    def validate_optional_category(cls, value: str | None) -> str | None:
+        return None if value is None else validate_category(value)
+
 
 class AuditEntry(BaseModel):
-    """Una entrada del registre d'auditoria."""
     id: int
     agent_id: Optional[str] = None
     action: str
@@ -156,7 +175,6 @@ class AuditEntry(BaseModel):
 
 
 class StatsResponse(BaseModel):
-    """Mètriques per al dashboard."""
     facts_last_7_days: list[dict[str, Any]] = Field(default_factory=list)
     facts_by_agent: list[dict[str, Any]] = Field(default_factory=list)
     facts_by_category: list[dict[str, Any]] = Field(default_factory=list)
@@ -170,22 +188,29 @@ class StatsResponse(BaseModel):
     total_notion_cached: int = 0
     ollama_connected: bool = False
 
-# ─── Memory list / pagination models ──────────────────
 
 class MemoryListRequest(BaseModel):
-    """Parámetres per llistar fets amb paginació i filtres."""
     limit: int = Field(default=50, ge=1, le=500)
     offset: int = Field(default=0, ge=0)
     agent_id: Optional[str] = None
     scope: Optional[str] = None
     category: Optional[str] = None
-    from_date: Optional[str] = None  # created_at >=
-    to_date: Optional[str] = None    # created_at <=
-    sort: str = "created_at:desc"
+    from_date: Optional[str] = Field(default=None, max_length=64)
+    to_date: Optional[str] = Field(default=None, max_length=64)
+    sort: str = Field(default="created_at:desc", pattern=r"^(created_at|updated_at):(asc|desc)$")
+
+    @field_validator("scope")
+    @classmethod
+    def validate_optional_scope(cls, value: str | None) -> str | None:
+        return None if value is None else validate_scope(value)
+
+    @field_validator("category")
+    @classmethod
+    def validate_optional_category(cls, value: str | None) -> str | None:
+        return None if value is None else validate_category(value)
 
 
 class MemoryResponse(BaseModel):
-    """Representació d'un fet per a la llista paginada."""
     id: str
     scope: str
     category: str = "events"
@@ -201,17 +226,13 @@ class MemoryResponse(BaseModel):
 
 
 class MemoryListResponse(BaseModel):
-    """Resposta paginada de la llista de fets."""
     facts: list[MemoryResponse]
     total: int
     limit: int
     offset: int
 
 
-# ─── Agent models ──────────────────────────────────────
-
 class AgentResponse(BaseModel):
-    """Resposta amb dades d'un agent."""
     id: str
     name: str
     permissions: dict[str, Any] = Field(default_factory=lambda: {"read": True, "write": True})
@@ -226,38 +247,55 @@ class AgentResponse(BaseModel):
 
 
 class AgentUpdateRequest(BaseModel):
-    """Cos per actualitzar un agent."""
     capabilities: Optional[dict[str, Any]] = None
     metadata: Optional[dict[str, Any]] = None
     is_active: Optional[bool] = None
 
+    _metadata = field_validator("metadata")(validate_metadata)
+
+    @field_validator("capabilities")
+    @classmethod
+    def validate_capabilities(cls, value: dict[str, Any] | None) -> dict[str, Any] | None:
+        return validate_metadata(value)
+
 
 class AgentRegisterRequest(BaseModel):
-    """Solicitud de registre d'un agent."""
     name: str
-    permissions: dict[str, Any] = Field(default_factory=lambda: {"read": True, "write": True, "delete": False, "admin": False})
+    permissions: dict[str, Any] = Field(
+        default_factory=lambda: {"read": True, "write": True, "delete": False, "admin": False}
+    )
     allowed_scopes: list[str] = Field(default_factory=lambda: ["shared", "local"])
+
+    _name = field_validator("name")(validate_agent_name)
+    _permissions = field_validator("permissions")(validate_permissions)
+    _scopes = field_validator("allowed_scopes")(validate_scopes)
 
 
 class AgentRegisterResponse(BaseModel):
-    """Resposta amb la nova clau API."""
     agent_id: str
     name: str
     api_key: str
-    message: str = "Agent creat correctament. Guarda la clau API, no es podra recuperar despues."
+    message: str = "Agent creat correctament. Guarda la clau API, no es podrà recuperar després."
 
-# ─── Knowledge Graph models ──────────────────────────
 
 class CreateRelationRequest(BaseModel):
-    """Cos per crear una relacio entre dos fets."""
     source_fact_id: str
     target_fact_id: str
-    relation_type: str = "related_to"
-    relation_strength: float = 0.5
+    relation_type: str = Field(default="related_to", min_length=1, max_length=64, pattern=r"^[A-Za-z0-9._:-]+$")
+    relation_strength: float = Field(default=0.5, ge=0.0, le=1.0)
+
+    @field_validator("source_fact_id")
+    @classmethod
+    def validate_source(cls, value: str) -> str:
+        return validate_identifier(value, "source_fact_id")
+
+    @field_validator("target_fact_id")
+    @classmethod
+    def validate_target(cls, value: str) -> str:
+        return validate_identifier(value, "target_fact_id")
 
 
 class GraphNode(BaseModel):
-    """Node del graf de coneixement."""
     id: str
     type: str = "fact"
     label: str = ""
@@ -266,7 +304,6 @@ class GraphNode(BaseModel):
 
 
 class GraphEdge(BaseModel):
-    """Aresta del graf de coneixement."""
     source: str
     target: str
     relation: str = "related_to"
@@ -274,15 +311,13 @@ class GraphEdge(BaseModel):
 
 
 class GraphResponse(BaseModel):
-    """Resposta del graf de coneixement."""
-    nodes: list[GraphNode] = []
-    edges: list[GraphEdge] = []
+    nodes: list[GraphNode] = Field(default_factory=list)
+    edges: list[GraphEdge] = Field(default_factory=list)
     total_facts: int = 0
     total_relations: int = 0
 
 
 class RelationResponse(BaseModel):
-    """Resposta d'una relacio individual."""
     id: str
     source_fact_id: str
     target_fact_id: str
@@ -292,10 +327,7 @@ class RelationResponse(BaseModel):
     created_at: str = ""
 
 
-# ─── Graph Traversal models (triples-based) ──────────
-
 class TraverseNode(BaseModel):
-    """Node del graph traversal basat en triples."""
     id: str
     name: str
     type: str = ""
@@ -303,7 +335,6 @@ class TraverseNode(BaseModel):
 
 
 class TraverseEdge(BaseModel):
-    """Aresta del graph traversal basada en un triple."""
     subject_id: str
     subject_name: str
     predicate: str
@@ -314,10 +345,9 @@ class TraverseEdge(BaseModel):
 
 
 class TraverseResponse(BaseModel):
-    """Resposta completa del graph traversal."""
     entity: str
-    nodes: list[TraverseNode] = []
-    edges: list[TraverseEdge] = []
+    nodes: list[TraverseNode] = Field(default_factory=list)
+    edges: list[TraverseEdge] = Field(default_factory=list)
     hops: int = 0
     total_nodes: int = 0
     total_edges: int = 0
