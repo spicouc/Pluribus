@@ -172,35 +172,30 @@ class EmbeddingService:
         self,
         query_vec: np.ndarray,
         scope_filter: Optional[str] = None,
+        category_filter: Optional[str] = None,
         agent_id_filter: Optional[str] = None,
         top_k: int = 5,
     ) -> list[tuple[str, float]]:
         """Cerca semàntica usant TurboVec index.
 
         Returns list of (chunk_id, score) tuples.
-        Falls back to numpy dot products if TurboVec fails.
+        Falls back to an empty result if TurboVec is unavailable.
         """
         try:
             from pluribus.vector_index import vector_index
-            results = await vector_index.search(
+            return await vector_index.search(
                 query_vec,
                 scope_filter=scope_filter,
+                category_filter=category_filter,
                 agent_id_filter=agent_id_filter,
                 top_k=top_k,
             )
-            if results:
-                return results
         except Exception as exc:
-            # Log and fall through to numpy fallback
             import logging
             logging.getLogger(__name__).warning(
-                "TurboVec search failed, falling back to numpy: %s", exc
+                "TurboVec search failed: %s", exc
             )
-
-        # Numpy fallback (legacy behavior) - requires chunks_with_ids parameter
-        # This path is kept for backward compatibility but should not be used
-        # when TurboVec is available
-        return []
+            return []
 
     def semantic_search_numpy(
         self,
@@ -208,7 +203,7 @@ class EmbeddingService:
         chunks_with_ids: list[tuple[str, np.ndarray]],
         top_k: int = 5,
     ) -> list[tuple[str, float]]:
-        """Legacy numpy dot product search (kept as fallback).
+        """Legacy numpy dot product search.
 
         Tots els vectors han d'estar normalitzats L2.
         """
