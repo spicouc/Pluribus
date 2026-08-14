@@ -3,261 +3,171 @@
 </p>
 
 # Pluribus
-*"e pluribus unum" — del llati «de molts, un»*
 
-**Pluribus** és un servei lleuger de memòria compartida central per a múltiples agents d'IA. Dissenyat per a l'ecosistema Hermes, permet que diversos agents (Hetzner, RPi local, Picoclaw) emmagatzemin i consultin informació compartida de manera eficient.
+*e pluribus unum — «de molts, un»*
 
-## 📋 Requisits del Sistema
+Pluribus és un servei lleuger de memòria compartida per a múltiples agents d'IA. Combina FastAPI, SQLite/FTS5, embeddings via Ollama i un índex vectorial TurboVec.
 
-- **Ubuntu 24.04** minimal (o superior)
-- **Python 3.12**
-- **1 GB RAM** màxim (servei < 400 MB en repòs)
-- **5 GB disc**
-- Accés via **Tailscale** (no exposat públicament)
+## Requisits
 
-## 🔧 Instal·lació Pas a Pas
+- Ubuntu 24.04 o equivalent
+- Python 3.12+
+- SQLite amb FTS5
+- Ollama accessible des del servidor per a embeddings i consolidació
+- Tailscale o una xarxa privada recomanada
 
-### 1. Requisits previs del sistema
+## Instal·lació
 
 ```bash
 sudo apt update
 sudo apt install -y python3-venv python3-pip sqlite3 git
-```
-
-### 2. Crear l'estructura de directoris
-
-```bash
-sudo mkdir -p /opt/pluribus/data /opt/pluribus/cache
-```
-
-Copia tots els fitxers del projecte a `/opt/pluribus/`:
-
-```bash
-# Si tens els fitxers localment
-cp -r pluribus/ scripts/ systemd/ requirements.txt README.md /opt/pluribus/
-```
-
-### 3. Crear l'entorn virtual i instal·lar dependències
-
-```bash
+sudo mkdir -p /opt/pluribus/data
+sudo cp -r pluribus/ scripts/ systemd/ requirements.txt README.md .env.example pluribus_worker.py /opt/pluribus/
 python3 -m venv /opt/pluribus/venv
 /opt/pluribus/venv/bin/pip install -r /opt/pluribus/requirements.txt
+sudo cp /opt/pluribus/.env.example /opt/pluribus/.env
 ```
 
-> ⚠ **Nota**: `fastembed` utilitza ONNX Runtime, **no** PyTorch. Això redueix significativament l'ús de memòria.
-> La primera vegada que es generi un embedding, el model `intfloat/multilingual-e5-small` es descarregarà automàticament (aproximadament 500 MB).
+Edita `/opt/pluribus/.env` abans d'arrencar el servei.
 
-### 4. Inicialitzar la base de dades
+La inicialització de l'esquema es fa automàticament durant la startup. Si el bootstrap o una migració fallen, el servei ha de fallar abans de servir trànsit.
 
-```bash
-mkdir -p /opt/pluribus/data
-sqlite3 /opt/pluribus/data/pluribus.db < /opt/pluribus/scripts/init_db.sql
-```
+### Crear el primer agent
 
-Això crearà totes les taules, índexs i triggers necessaris, incloent:
-- `agents` — Agents amb claus API
-- `facts` — Fets emmagatzemats
-- `facts_fts` — Cerca per text complet (FTS5)
-- `chunks` — Fragments amb embeddings vectorials
-- `embedding_cache` — Cache d'embeddings
-- `audit_log` — Registre d'auditoria
-
-### 5. Crear un agent
+El bootstrap inicial d'agents es fa amb l'script local:
 
 ```bash
 /opt/pluribus/venv/bin/python /opt/pluribus/scripts/create_agent.py
 ```
 
-Segueix les instruccions interactives:
-1. Introdueix un nom per a l'agent
-2. Especifica els àmbits permesos (ex: `shared`, `shared,local`)
-3. Configura els permisos (o prem Enter per als valors per defecte)
+Després, l'endpoint `/v1/agents/register` només és accessible per agents administradors.
 
-**Important**: La clau API es mostra **una sola vegada**. Guarda-la immediatament.
+## Configuració
 
-### 6. Configurar systemd
+Totes les variables utilitzen el prefix `PLURIBUS_`:
+
+| Variable | Default / exemple | Ús |
+|---|---|---|
+| `PLURIBUS_DB_PATH` | `/opt/pluribus/data/pluribus.db` | SQLite |
+| `PLURIBUS_API_PORT` | `8790` | Port HTTP |
+| `PLURIBUS_OLLAMA_BASE_URL` | `http://localhost:11434` | API Ollama |
+| `PLURIBUS_OLLAMA_MODEL` | `nomic-embed-text-v2-moe:latest` | Embeddings |
+| `PLURIBUS_EMBED_DIM` | `768` | Dimensions del vector |
+| `PLURIBUS_CONSOLIDATION_MODEL` | `qwen3.5-2b:latest` | Resums del worker |
+| `PLURIBUS_MAX_CHUNK_SIZE` | `500` | Mida de chunk |
+| `PLURIBUS_CHUNK_OVERLAP` | `50` | Solapament |
+| `PLURIBUS_RATE_LIMIT` | `100` | Requests per finestra |
+| `PLURIBUS_RATE_LIMIT_WINDOW` | `60` | Finestra en segons |
+
+Consulta `.env.example` per a totes les opcions, inclosos fallback del worker i Notion.
+
+## Systemd
+
+Instal·la el servei principal i el worker periòdic:
 
 ```bash
-sudo cp /opt/pluribus/systemd/pluribus.service /etc/systemd/system/pluribus.service
+sudo cp /opt/pluribus/systemd/pluribus.service /etc/systemd/system/
+sudo cp /opt/pluribus/systemd/pluribus-worker.service /etc/systemd/system/
+sudo cp /opt/pluribus/systemd/pluribus-worker.timer /etc/systemd/system/
 sudo systemctl daemon-reload
 sudo systemctl enable --now pluribus.service
+sudo systemctl enable --now pluribus-worker.timer
 ```
 
-### 7. Verificar la instal·lació
+Comprovacions:
 
 ```bash
-# Comprovar que el servei està actiu
-sudo systemctl status pluribus.service
-
-# Test ràpid
-curl -s http://localhost:8790/health | python3 -m json.tool
-
-# Exemple: escriure un fet
-KEY="<la_teva_clau_api>"
-curl -X POST http://localhost:8790/v1/memory/write \
-  -H "X-API-Key: $KEY" \
-  -H "Content-Type: application/json" \
-  -d '{"content": "Hola món des del Pluribus!", "scope": "shared"}'
+systemctl status pluribus.service
+systemctl status pluribus-worker.timer
+journalctl -u pluribus.service -f
+journalctl -u pluribus-worker.service -f
 ```
 
-## 📐 Arquitectura
+## API
 
-```
-┌─────────────────────────────────────────────────────┐
-│                    Pluribus Server                   │
-│  ┌──────────┐  ┌──────────┐  ┌──────────────────┐  │
-│  │  FastAPI  │  │  SQLite  │  │  fastembed (lazy)│  │
-│  │  (Uvicorn)│  │ (aiosql) │  │  ONNX Runtime    │  │
-│  └──────────┘  └──────────┘  └──────────────────┘  │
-│  Port 8790       /opt/pluribus/    intfloat/e5-small   │
-│                  data/pluribus.db                       │
-└─────────────────────────────────────────────────────┘
-         ▲                ▲                ▲
-         │                │                │
-    ┌────┴────┐    ┌──────┴──────┐    ┌───┴────┐
-    │ Hermes  │    │  Hermes     │    │Picoclaw│
-    │ Hetzner │    │  RPi Local  │    │ Agent  │
-    └─────────┘    └─────────────┘    └────────┘
-```
-
-## 🔌 Endpoints de l'API
-
-Tots els endpoints (excepte `/health`, `/dashboard` i `/api/stats`) requereixen la capçalera `X-API-Key`.
+`/health` i el shell HTML `/dashboard` són públics. La resta requereix `X-API-Key`. Les APIs del dashboard (`/api/*`) són admin-only perquè actualment exposen dades agregades globals o configuració del procés.
 
 | Mètode | Endpoint | Descripció |
-|--------|----------|------------|
-| `POST` | `/v1/memory/write` | Crear un fet (amb generació d'embeddings en segon pla) |
-| `GET` | `/v1/memory/query` | Cerca per text (FTS5) |
-| `POST` | `/v1/memory/search/semantic` | Cerca semàntica per similitud cosinus |
-| `PUT` | `/v1/memory/{fact_id}` | Actualitzar un fet |
-| `DELETE` | `/v1/memory/{fact_id}` | Eliminar un fet (soft delete) |
-| `GET` | `/v1/memory/audit` | Consultar registre d'auditoria (cal admin) |
-| `GET` | `/health` | Estat del servei |
-| `GET` | `/dashboard` | Dashboard HTML amb Chart.js |
-| `GET` | `/api/stats` | Mètriques JSON |
+|---|---|---|
+| `POST` | `/v1/memory/write` | Crear un fet |
+| `GET` | `/v1/memory/query` | Cerca FTS5 |
+| `POST` | `/v1/memory/search/semantic` | Cerca semàntica |
+| `GET` | `/v1/memory/search` | Cerca combinada |
+| `GET` | `/v1/memory/ls` | Llista per scope/categoria |
+| `GET` | `/v1/memory` | Llista paginada |
+| `PUT` | `/v1/memory/{fact_id}` | Actualitzar |
+| `DELETE` | `/v1/memory/{fact_id}` | Soft-delete |
+| `POST` | `/v1/memory/query-save` | Guardar un insight i relacions origen |
+| `POST` | `/v1/memory/lint` | Report global de salut; admin-only |
+| `POST` | `/v1/memory/expire` | Forçar expiració TTL; admin-only |
+| `GET` | `/v1/memory/audit` | Auditoria; admin-only |
+| `POST` | `/mcp/` | MCP JSON-RPC |
 
-### Exemples d'ús
+Els `allowed_scopes` s'apliquen abans d'entrar als handlers REST i MCP. Els endpoints globals que encara no poden filtrar per scope queden restringits a admin.
 
-**Escriure un fet:**
+### Exemple
+
 ```bash
+KEY="<api-key>"
 curl -X POST http://localhost:8790/v1/memory/write \
   -H "X-API-Key: $KEY" \
   -H "Content-Type: application/json" \
-  -d '{"content": "El servidor principal està a Frankfurt", "scope": "shared", "key": "ubicacio_servidor", "metadata": {"tipus": "infraestructura"}}'
-```
+  -d '{"content":"El servidor principal és a Frankfurt","scope":"shared","category":"events"}'
 
-**Cercar per text:**
-```bash
-curl "http://localhost:8790/v1/memory/query?q=servidor&scope=shared&limit=5" \
+curl "http://localhost:8790/v1/memory/query?q=servidor&scope=shared" \
   -H "X-API-Key: $KEY"
 ```
 
-**Cerca semàntica:**
-```bash
-curl -X POST http://localhost:8790/v1/memory/search/semantic \
-  -H "X-API-Key: $KEY" \
-  -H "Content-Type: application/json" \
-  -d '{"query": "On estan els servidors?", "top_k": 3, "scope": "shared"}'
+## Embeddings i cerca
+
+- Els embeddings es generen amb Ollama `/api/embed`.
+- Model per defecte: `nomic-embed-text-v2-moe:latest`.
+- Dimensió per defecte: 768.
+- TurboVec proporciona l'índex vectorial ràpid.
+- FTS5 continua disponible sense embeddings i actua com a fallback funcional.
+- Els chunks es creen una sola vegada; el background actualitza el BLOB placeholder quan l'embedding està llest.
+
+## Worker
+
+`pluribus_worker.py` és un wrapper de `pluribus.worker`.
+
+Cada ronda:
+
+1. inicialitza/migra la DB;
+2. consolida facts encara no processats;
+3. crea relacions semàntiques noves;
+4. elimina chunks orfes i cache antiga;
+5. sincronitza Notion si està configurat.
+
+La consolidació no usa `MAX(created_at)` com a checkpoint. La taula `consolidated_facts` guarda el mapping exacte `fact_id → consolidated_id`, de manera que un backlog o un error puntual no pot saltar fets antics.
+
+El timer inclòs executa el worker cada 15 minuts. Un error fatal o errors de consolidació produeixen codi de sortida no-zero.
+
+## Seguretat
+
+- API keys hasheades amb bcrypt.
+- Agents amb `is_active=0` no poden autenticar-se.
+- Permisos `read/write/delete/admin`.
+- `allowed_scopes` aplicat a REST i MCP.
+- Registre i eliminació d'agents: admin-only.
+- Categories persistents `system`, `config` i `entities`: eliminació admin-only.
+- Configuració, restart i dades globals del dashboard: admin-only.
+- JSON de permisos corrupte falla tancat, sense concedir accessos per defecte.
+
+## Arquitectura resumida
+
+```text
+Agents
+  │ X-API-Key
+  ▼
+FastAPI ── authorization guards ── SQLite + FTS5
+  │                                  │
+  ├── Ollama embeddings              └── facts/chunks/audit/graph
+  └── TurboVec
+
+systemd timer ──> pluribus.worker ──> consolidació + relacions + manteniment
 ```
 
-## 🧪 Model d'Emmagatzematge
+## Llicència
 
-### Text amb FTS5
-- Indexació per text complet amb `unicode61 remove_diacritics 2`
-- Ignora accents i majúscules/minúscules
-- Consultes ràpides sense necessitat d'embeddings
-
-### Embeddings amb fastembed
-- Model: `intfloat/multilingual-e5-small` (384 dimensions)
-- ONNX Runtime (sense PyTorch) — consum de RAM molt baix
-- **Lazy loading**: el model només es carrega en el primer embedding
-- Prefixos: `query: ` per a cerques, `passage: ` per a continguts
-- Cache SHA256 per evitar recomputacions
-- Si falla fastembed, fa **fallback automàtic a FTS5**
-
-### Conversió de Text a Fragments (Chunking)
-- Màxim 500 caràcters per fragment
-- Solapament de 50 caràcters entre fragments consecutius
-- Talls intel·ligents per espais
-
-## 🔒 Seguretat
-
-- **Autenticació**: API Key amb bcrypt (l'hash es compara amb `bcrypt.checkpw`)
-- **Rate limiting**: 100 peticions per finestra de 60 segons per agent
-- **Permisos granulars**: read/write/delete/admin per agent
-- **Àmbits**: restricció per scope (shared/local)
-- **Soft delete**: els fets no s'eliminen físicament (només es marquen)
-
-## 📊 Monitoratge
-
-El dashboard HTML a `/dashboard` inclou:
-- Gràfic de barres: fets per dia (últims 7 dies)
-- Gràfic de sectors: distribució per agent
-- Gràfic de línia: mida de la base de dades
-- Comptadors: actius, eliminats, fragments, agents
-- Taula: últimes 10 accions d'auditoria
-
-## ⚙️ Configuració
-
-Variables d'entorn (prefix `PLURIBUS_`) o camps a `pluribus/config.py`:
-
-| Variable | Default | Descripció |
-|----------|---------|------------|
-| `PLURIBUS_DB_PATH` | `/opt/pluribus/data/pluribus.db` | Ruta de la base de dades |
-| `PLURIBUS_API_PORT` | `8790` | Port del servei |
-| `PLURIBUS_EMBED_MODEL` | `intfloat/multilingual-e5-small` | Model d'embeddings |
-| `PLURIBUS_EMBED_DIM` | `384` | Dimensions del vector |
-| `PLURIBUS_MAX_CHUNK_SIZE` | `500` | Màxim de caràcters per fragment |
-| `PLURIBUS_CHUNK_OVERLAP` | `50` | Solapament entre fragments |
-| `PLURIBUS_RATE_LIMIT` | `100` | Peticions per finestra |
-| `PLURIBUS_RATE_LIMIT_WINDOW` | `60` | Finestra de rate limit (segons) |
-
-## 🚀 Desplegament en Producció
-
-### LXC (recomanat)
-```bash
-# Dins del contenidor LXC
-lxc exec pluribus -- bash
-# Segueix la guia d'instal·lació pas a pas
-```
-
-### Tailscale
-```bash
-# Assegura't que Tailscale està configurat
-sudo tailscale up
-# El servei escolta a 0.0.0.0:8790 i és accessible via Tailscale IP
-```
-
-### Systemd
-```bash
-sudo systemctl enable pluribus.service
-sudo systemctl start pluribus.service
-
-# Logs
-sudo journalctl -u pluribus.service -f
-```
-
-## 🛠 Manteniment
-
-### Compactar base de dades
-```bash
-sqlite3 /opt/pluribus/data/pluribus.db "VACUUM;"
-```
-
-### Reiniciar el servei
-```bash
-sudo systemctl restart pluribus.service
-```
-
-### Netejar la cache d'embeddings
-```bash
-sqlite3 /opt/pluribus/data/pluribus.db "DELETE FROM embedding_cache; VACUUM;"
-```
-
-## 📝 Llicència
-
-Ús intern per a l'ecosistema Hermes.
-
----
-
-**Pluribus** — *La memòria compartida que fa intel·ligent el teu ecosistema d'agents.*
+Ús intern per a l'ecosistema Hermes. El repositori no declara actualment una llicència pública de redistribució.
