@@ -35,7 +35,7 @@ class ReceiverTests(unittest.TestCase):
         self.tmp.cleanup()
 
     @staticmethod
-    def _payload() -> dict:
+    def _payload(lease_token: str = "lease-token-1234567890") -> dict:
         return {
             "event": "xerrameca.turn.claimed",
             "delivery_id": "delivery-1",
@@ -52,7 +52,7 @@ class ReceiverTests(unittest.TestCase):
             "turn": {
                 "id": "turn-123",
                 "round": 2,
-                "lease_token": "lease-token-1234567890",
+                "lease_token": lease_token,
                 "lease_until": "2099-01-01T00:00:00Z",
             },
             "input_message": {"content": "fes la feina"},
@@ -62,6 +62,13 @@ class ReceiverTests(unittest.TestCase):
             },
         }
 
+    def _headers(self, body: bytes) -> dict[str, str]:
+        return {
+            "Content-Type": "application/json",
+            "X-Pluribus-Signature": _signature(self.settings.runner_secret, body),
+            "X-Pluribus-Idempotency-Key": "turn-123",
+        }
+
     def test_signature_contract_matches_runner_hmac(self) -> None:
         body = _serialize_payload(self._payload())
         signature = _signature(self.settings.runner_secret, body)
@@ -69,7 +76,7 @@ class ReceiverTests(unittest.TestCase):
         self.assertFalse(verify_signature(self.settings.runner_secret, body + b"x", signature))
         self.assertFalse(verify_signature(self.settings.runner_secret, body, None))
 
-    def test_valid_delivery_is_processed_once_and_duplicate_is_safe(self) -> None:
+    def test_valid_delivery_is_processed_once_and_duplicate_same_lease_is_safe(self) -> None:
         async def handler(payload):
             return {
                 "content": f"processat {payload['turn']['id']}",
@@ -78,21 +85,15 @@ class ReceiverTests(unittest.TestCase):
             }
 
         app = create_receiver_app(self.settings, handler)
-        payload = self._payload()
-        body = _serialize_payload(payload)
-        headers = {
-            "Content-Type": "application/json",
-            "X-Pluribus-Signature": _signature(self.settings.runner_secret, body),
-            "X-Pluribus-Idempotency-Key": "turn-123",
-        }
+        body = _serialize_payload(self._payload())
 
         with patch(
             "pluribus.xerrameca.receiver._reply_to_pluribus",
             new=AsyncMock(),
         ) as reply:
             with TestClient(app) as client:
-                first = client.post("/xerrameca/turn", content=body, headers=headers)
-                duplicate = client.post("/xerrameca/turn", content=body, headers=headers)
+                first = client.post("/xerrameca/turn", content=body, headers=self._headers(body))
+                duplicate = client.post("/xerrameca/turn", content=body, headers=self._headers(body))
 
         self.assertEqual(first.status_code, 202)
         self.assertFalse(first.json()["duplicate"])
@@ -102,6 +103,56 @@ class ReceiverTests(unittest.TestCase):
         result = reply.await_args.args[2]
         self.assertEqual(result["content"], "processat turn-123")
         self.assertEqual(result["result"], "continue")
+
+    def test_same_turn_with_new_lease_is_a_legitimate_recovery_attempt(self) -> None:
+        async def handler(payload):
+            return {"content": "ok", "result": "continue"}
+
+        app = create_receiver_app(self.settings, handler)
+        first_body = _serialize_payload(self._payload("lease-token-first-123456"))
+        second_body = _serialize_payload(self._payload("lease-token-second-12345"))
+
+        # Simulate an accepted attempt whose callback processing did not finish.
+        # Avoid completing the local row so the new Pluribus lease may supersede it.
+        with patch(
+            "pluribus.xerrameca.receiver._process_delivery",
+            new=AsyncMock(),
+        ) as process:
+            with TestClient(app) as client:
+                first = client.post(
+                    "/xerrameca/turn", content=first_body, headers=self._headers(first_body)
+                )
+                second = client.post(
+                    "/xerrameca/turn", content=second_body, headers=self._headers(second_body)
+                )
+
+        self.assertEqual(first.status_code, 202)
+        self.assertEqual(second.status_code, 202)
+        self.assertFalse(second.json()["duplicate"])
+        self.assertEqual(process.await_count, 2)
+
+    def test_completed_turn_stays_deduplicated_even_if_a_new_lease_arrives(self) -> None:
+        async def handler(payload):
+            return {"content": "ok", "result": "continue"}
+
+        app = create_receiver_app(self.settings, handler)
+        first_body = _serialize_payload(self._payload("lease-token-complete-1234"))
+        second_body = _serialize_payload(self._payload("lease-token-new-after-complete"))
+        with patch(
+            "pluribus.xerrameca.receiver._reply_to_pluribus",
+            new=AsyncMock(),
+        ) as reply:
+            with TestClient(app) as client:
+                first = client.post(
+                    "/xerrameca/turn", content=first_body, headers=self._headers(first_body)
+                )
+                second = client.post(
+                    "/xerrameca/turn", content=second_body, headers=self._headers(second_body)
+                )
+        self.assertEqual(first.status_code, 202)
+        self.assertEqual(second.status_code, 200)
+        self.assertTrue(second.json()["duplicate"])
+        self.assertEqual(reply.await_count, 1)
 
     def test_mismatched_idempotency_key_is_rejected(self) -> None:
         app = create_receiver_app(self.settings, AsyncMock())
@@ -130,14 +181,12 @@ class ReceiverTests(unittest.TestCase):
 
     def test_payload_size_is_bounded(self) -> None:
         app = create_receiver_app(self.settings, AsyncMock())
+        oversized = b"x" * (1024 * 1024 + 1)
         with TestClient(app) as client:
             response = client.post(
                 "/xerrameca/turn",
-                content=b"{}",
-                headers={
-                    "Content-Length": str(1024 * 1024 + 1),
-                    "X-Pluribus-Signature": "sha256=anything",
-                },
+                content=oversized,
+                headers={"X-Pluribus-Signature": "sha256=anything"},
             )
         self.assertEqual(response.status_code, 413)
 
