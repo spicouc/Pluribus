@@ -27,9 +27,8 @@ async def get_db() -> aiosqlite.Connection:
 async def _migrate_db() -> None:
     """Aplica migracions idempotents a l'esquema existent.
 
-    Les migracions només ignoren el cas esperat de columnes/taules que ja
-    existeixen. Qualsevol altre error es propaga perquè el servei no arrenqui
-    amb un esquema parcial o inconsistent.
+    Qualsevol error inesperat es propaga perquè el servei no arrenqui amb un
+    esquema parcial o inconsistent.
     """
     async with get_db() as db:
         cursor = await db.execute("PRAGMA table_info(facts)")
@@ -52,9 +51,48 @@ async def _migrate_db() -> None:
             await db.execute("ALTER TABLE facts ADD COLUMN expires_at TEXT DEFAULT NULL")
             print("Columna expires_at afegida a facts")
 
+        # L'índex s'ha de crear després de migrar category, perquè una BD antiga
+        # encara no té aquesta columna quan s'executa init_db.sql.
         await db.execute(
             "CREATE INDEX IF NOT EXISTS idx_facts_category ON facts(category)"
         )
+
+        # Repara definicions antigues dels triggers FTS5. facts_fts és una taula
+        # FTS5 normal, així que les baixes s'han de fer amb DELETE FROM.
+        await db.executescript("""
+            DROP TRIGGER IF EXISTS facts_ai;
+            DROP TRIGGER IF EXISTS facts_ad;
+            DROP TRIGGER IF EXISTS facts_au;
+
+            CREATE TRIGGER facts_ai AFTER INSERT ON facts BEGIN
+                INSERT INTO facts_fts(fact_id, content, scope)
+                VALUES (new.id, new.content, new.scope);
+            END;
+
+            CREATE TRIGGER facts_ad AFTER DELETE ON facts BEGIN
+                DELETE FROM facts_fts WHERE fact_id = old.id;
+            END;
+
+            CREATE TRIGGER facts_au AFTER UPDATE ON facts
+            WHEN old.content != new.content BEGIN
+                DELETE FROM facts_fts WHERE fact_id = old.id;
+                INSERT INTO facts_fts(fact_id, content, scope)
+                VALUES (new.id, new.content, new.scope);
+            END;
+        """)
+
+        # Si una inicialització antiga va quedar a mitges, facts pot contenir
+        # dades anteriors a la creació de facts_fts. Reindexem només les que
+        # encara no hi són, de forma idempotent.
+        await db.execute("""
+            INSERT INTO facts_fts(fact_id, content, scope)
+            SELECT f.id, f.content, f.scope
+            FROM facts AS f
+            WHERE f.deleted_at IS NULL
+              AND NOT EXISTS (
+                  SELECT 1 FROM facts_fts AS ft WHERE ft.fact_id = f.id
+              )
+        """)
 
         # Migració 4: entities table for graph traversal
         await db.execute("""
