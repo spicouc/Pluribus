@@ -188,7 +188,12 @@ async def register_agent(request: Request, body: AgentRegisterRequest) -> AgentR
 
 @router.delete("/{agent_id}", status_code=204)
 async def delete_agent(request: Request, agent_id: str) -> None:
-    """Elimina un agent sense violar foreign keys ni perdre els seus fets."""
+    """Elimina un agent sense violar foreign keys ni perdre els seus fets.
+
+    Els agents que ja formen part de l'historial de Xerrameca es conserven com
+    identitat auditable: s'han de desactivar (`is_active=false`) en lloc
+    d'eliminar-los.
+    """
     agent: dict[str, Any] = request.state.agent
     if not _is_admin(agent):
         raise HTTPException(status_code=403, detail="Es requereixen permisos admin per eliminar agents")
@@ -200,6 +205,25 @@ async def delete_agent(request: Request, agent_id: str) -> None:
             raise HTTPException(status_code=404, detail="Agent no trobat")
         if row["id"] == agent.get("id"):
             raise HTTPException(status_code=400, detail="No pots eliminar el teu propi agent")
+
+        cursor = await db.execute(
+            """SELECT 1 FROM sqlite_master
+               WHERE type = 'table' AND name = 'xerrameca_participants'"""
+        )
+        if await cursor.fetchone():
+            cursor = await db.execute(
+                """SELECT 1 FROM xerrameca_participants
+                   WHERE agent_id = ? LIMIT 1""",
+                (agent_id,),
+            )
+            if await cursor.fetchone():
+                raise HTTPException(
+                    status_code=409,
+                    detail=(
+                        "Agent amb historial Xerrameca: desactiva'l en lloc "
+                        "d'eliminar-lo per preservar l'auditoria"
+                    ),
+                )
 
         await db.execute("UPDATE facts SET agent_id = NULL WHERE agent_id = ?", (agent_id,))
         await db.execute("UPDATE audit_log SET agent_id = NULL WHERE agent_id = ?", (agent_id,))
