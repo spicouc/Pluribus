@@ -1,0 +1,36 @@
+[Unit]
+Description=Pluribus verified SQLite backup
+After=local-fs.target
+
+[Service]
+Type=oneshot
+User=pluribus
+Group=pluribus
+UMask=0077
+WorkingDirectory=/opt/pluribus
+EnvironmentFile=-/opt/pluribus/data/pluribus.env
+ExecStart=/opt/pluribus/venv/bin/python -m pluribus.backup
+
+# Backup is local-only and needs write access only to state/backups.
+NoNewPrivileges=yes
+PrivateTmp=yes
+PrivateDevices=yes
+ProtectSystem=strict
+ProtectHome=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectKernelLogs=yes
+ProtectControlGroups=yes
+ProtectClock=yes
+RestrictSUIDSGID=yes
+LockPersonality=yes
+RestrictRealtime=yes
+CapabilityBoundingSet=
+AmbientCapabilities=
+RestrictAddressFamilies=AF_UNIX
+SystemCallArchitectures=native
+ReadWritePaths=/opt/pluribus/data
+
+Nice=10
+IOSchedulingClass=best-effort
+IOSchedulingPriority=7
