@@ -39,7 +39,7 @@ CREATE VIRTUAL TABLE IF NOT EXISTS facts_fts USING fts5(
     fact_id UNINDEXED,
     content,
     scope UNINDEXED,
-    tokenize='unicode61 categories "L* N*"'
+    tokenize='unicode61 categories ''L* N*'''
 );
 
 CREATE TRIGGER IF NOT EXISTS facts_ai AFTER INSERT ON facts BEGIN
@@ -47,11 +47,11 @@ CREATE TRIGGER IF NOT EXISTS facts_ai AFTER INSERT ON facts BEGIN
 END;
 
 CREATE TRIGGER IF NOT EXISTS facts_ad AFTER DELETE ON facts BEGIN
-    INSERT INTO facts_fts(facts_fts, fact_id, content, scope) VALUES('delete', old.id, old.content, old.scope);
+    DELETE FROM facts_fts WHERE fact_id = old.id;
 END;
 
 CREATE TRIGGER IF NOT EXISTS facts_au AFTER UPDATE ON facts WHEN old.content != new.content BEGIN
-    INSERT INTO facts_fts(facts_fts, fact_id, content, scope) VALUES('delete', old.id, old.content, old.scope);
+    DELETE FROM facts_fts WHERE fact_id = old.id;
     INSERT INTO facts_fts(fact_id, content, scope) VALUES (new.id, new.content, new.scope);
 END;
 
