@@ -1,0 +1,11 @@
+[Unit]
+Description=Run Pluribus maintenance worker every 15 minutes
+
+[Timer]
+OnBootSec=2min
+OnUnitActiveSec=15min
+Persistent=true
+Unit=pluribus-worker.service
+
+[Install]
+WantedBy=timers.target
