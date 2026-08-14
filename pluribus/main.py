@@ -20,9 +20,11 @@ from pluribus.expiry_worker import expiry_worker_loop
 from pluribus.knowledge import router as knowledge_router
 from pluribus.lint import router as lint_router
 from pluribus.mcp import router as mcp_router
+from pluribus.mcp_async import router as mcp_async_router
 from pluribus.memory import router as memory_router
 from pluribus.query_save import router as query_save_router
 from pluribus.security import register_security_middleware
+from pluribus.semantic_async import router as semantic_router
 from pluribus.webhooks import router as webhooks_router
 
 
@@ -81,10 +83,14 @@ app = FastAPI(
 register_security_middleware(app)
 
 memory_dependencies = [Depends(memory_authorize)]
+# Async semantic routes must precede the legacy duplicates in memory.py.
+app.include_router(semantic_router, dependencies=memory_dependencies)
 app.include_router(memory_router, dependencies=memory_dependencies)
 app.include_router(query_save_router, dependencies=memory_dependencies)
 app.include_router(lint_router, dependencies=memory_dependencies)
 app.include_router(dashboard_router, dependencies=[Depends(dashboard_authorize)])
+# Intercept MCP POST semantic calls; delegate all other MCP tools to legacy code.
+app.include_router(mcp_async_router, dependencies=[Depends(mcp_authorize)])
 app.include_router(mcp_router, dependencies=[Depends(mcp_authorize)])
 app.include_router(agents_router, dependencies=[Depends(agents_authorize)])
 app.include_router(webhooks_router)
@@ -92,7 +98,6 @@ app.include_router(knowledge_router)
 
 
 async def _sqlite_is_healthy() -> bool:
-    """Execute a real bounded DB query instead of reporting a constant."""
     try:
         async with asyncio.timeout(2.0):
             async with get_db() as db:
