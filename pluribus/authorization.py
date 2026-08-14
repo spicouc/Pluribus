@@ -51,6 +51,10 @@ async def memory_authorize(request: Request) -> None:
         body = await request.json()
         _require(agent, "write", body.get("scope", "shared"))
         return
+    if path == "/v1/memory/query-save" and method == "POST":
+        body = await request.json()
+        _require(agent, "write", body.get("scope", "shared"))
+        return
     if path == "/v1/memory/query" and method == "GET":
         _require(agent, "read", request.query_params.get("scope", "shared"))
         return
@@ -64,7 +68,7 @@ async def memory_authorize(request: Request) -> None:
     if path == "/v1/memory/ls" and method == "GET":
         _require(agent, "read", request.query_params.get("scope", "shared"))
         return
-    if path in {"/v1/memory/expire", "/v1/memory/audit"}:
+    if path in {"/v1/memory/expire", "/v1/memory/audit", "/v1/memory/lint"}:
         _require(agent, "admin")
         return
     if path == "/v1/memory" and method == "GET":
@@ -129,13 +133,11 @@ async def mcp_authorize(request: Request) -> None:
             raise HTTPException(status_code=403, detail="Fet de categoria persistent; requereix permís admin")
         return
 
-    # These legacy tools expose global non-scope-filtered state.
     if tool in {"memory_stats", "knowledge_traverse"}:
         _require(agent, "admin")
 
 
 async def agents_authorize(request: Request) -> None:
-    """Protect privileged agent-management operations."""
     path = request.url.path.rstrip("/")
     method = request.method.upper()
     if path == "/v1/agents/register" and method == "POST":
@@ -145,7 +147,6 @@ async def agents_authorize(request: Request) -> None:
 
 
 async def dashboard_authorize(request: Request) -> None:
-    """Keep the HTML shell public but protect all dashboard data/config APIs."""
     path = request.url.path.rstrip("/") or "/"
     if path == "/dashboard":
         return
