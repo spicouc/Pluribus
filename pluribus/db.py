@@ -81,18 +81,28 @@ async def _migrate_db() -> None:
             END;
         """)
 
-        # Si una inicialització antiga va quedar a mitges, facts pot contenir
-        # dades anteriors a la creació de facts_fts. Reindexem només les que
-        # encara no hi són, de forma idempotent.
-        await db.execute("""
-            INSERT INTO facts_fts(fact_id, content, scope)
-            SELECT f.id, f.content, f.scope
-            FROM facts AS f
-            WHERE f.deleted_at IS NULL
-              AND NOT EXISTS (
-                  SELECT 1 FROM facts_fts AS ft WHERE ft.fact_id = f.id
-              )
-        """)
+        # Recupera índexs FTS incomplets d'una inicialització antiga. Com que
+        # fact_id és UNINDEXED a FTS5, evitem un NOT EXISTS per cada fact (O(n²)):
+        # només reconstruïm l'índex quan els recomptes no coincideixen.
+        cursor = await db.execute(
+            "SELECT COUNT(*) AS total FROM facts WHERE deleted_at IS NULL"
+        )
+        active_fact_count = (await cursor.fetchone())["total"]
+        cursor = await db.execute("SELECT COUNT(*) AS total FROM facts_fts")
+        fts_fact_count = (await cursor.fetchone())["total"]
+
+        if active_fact_count != fts_fact_count:
+            await db.execute("DELETE FROM facts_fts")
+            await db.execute("""
+                INSERT INTO facts_fts(fact_id, content, scope)
+                SELECT id, content, scope
+                FROM facts
+                WHERE deleted_at IS NULL
+            """)
+            print(
+                "Índex FTS reconstruït "
+                f"({fts_fact_count} → {active_fact_count} fets actius)"
+            )
 
         # Migració 4: entities table for graph traversal
         await db.execute("""
