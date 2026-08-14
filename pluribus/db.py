@@ -25,64 +25,75 @@ async def get_db() -> aiosqlite.Connection:
 
 
 async def _migrate_db() -> None:
-    """Aplica migracions addicionals a l'esquema existent."""
+    """Aplica migracions idempotents a l'esquema existent.
+
+    Les migracions només ignoren el cas esperat de columnes/taules que ja
+    existeixen. Qualsevol altre error es propaga perquè el servei no arrenqui
+    amb un esquema parcial o inconsistent.
+    """
     async with get_db() as db:
-        # Migració 1: ttl_days a facts
-        try:
+        cursor = await db.execute("PRAGMA table_info(facts)")
+        fact_columns = {row["name"] for row in await cursor.fetchall()}
+
+        # Migració 1: category a facts
+        if "category" not in fact_columns:
+            await db.execute(
+                "ALTER TABLE facts ADD COLUMN category TEXT NOT NULL DEFAULT 'events'"
+            )
+            print("Columna category afegida a facts")
+
+        # Migració 2: ttl_days a facts
+        if "ttl_days" not in fact_columns:
             await db.execute("ALTER TABLE facts ADD COLUMN ttl_days INTEGER DEFAULT NULL")
             print("Columna ttl_days afegida a facts")
-        except Exception:
-            pass  # Ja existeix
-        # Migració 2: expires_at a facts
-        try:
+
+        # Migració 3: expires_at a facts
+        if "expires_at" not in fact_columns:
             await db.execute("ALTER TABLE facts ADD COLUMN expires_at TEXT DEFAULT NULL")
             print("Columna expires_at afegida a facts")
-        except Exception:
-            pass  # Ja existeix
-        # Migració 3: entities table for graph traversal
-        try:
-            await db.execute("""
-                CREATE TABLE IF NOT EXISTS entities (
-                    id TEXT PRIMARY KEY DEFAULT (lower(hex(randomblob(16)))),
-                    name TEXT NOT NULL,
-                    type TEXT DEFAULT '',
-                    aliases TEXT DEFAULT '[]',
-                    description TEXT DEFAULT '',
-                    metadata TEXT DEFAULT '{}',
-                    created_at TEXT DEFAULT (datetime('now')),
-                    updated_at TEXT DEFAULT (datetime('now')),
-                    deleted_at TEXT
-                )
-            """)
-            await db.execute("CREATE INDEX IF NOT EXISTS idx_entities_name ON entities(name)")
-            await db.execute("CREATE INDEX IF NOT EXISTS idx_entities_type ON entities(type)")
-            print("Taula entities creada per graph traversal")
-        except Exception:
-            pass  # Ja existeix
-        # Migració 4: triples table for graph traversal
-        try:
-            await db.execute("""
-                CREATE TABLE IF NOT EXISTS triples (
-                    id TEXT PRIMARY KEY DEFAULT (lower(hex(randomblob(16)))),
-                    subject_id TEXT NOT NULL REFERENCES entities(id),
-                    predicate TEXT NOT NULL,
-                    object_id TEXT NOT NULL REFERENCES entities(id),
-                    confidence REAL DEFAULT 1.0,
-                    source_agent_id TEXT,
-                    metadata TEXT DEFAULT '{}',
-                    created_at TEXT DEFAULT (datetime('now')),
-                    updated_at TEXT DEFAULT (datetime('now')),
-                    expires_at TEXT,
-                    deleted_at TEXT
-                )
-            """)
-            await db.execute("CREATE INDEX IF NOT EXISTS idx_triples_subject ON triples(subject_id)")
-            await db.execute("CREATE INDEX IF NOT EXISTS idx_triples_object ON triples(object_id)")
-            await db.execute("CREATE INDEX IF NOT EXISTS idx_triples_predicate ON triples(predicate)")
-            await db.execute("CREATE INDEX IF NOT EXISTS idx_triples_deleted ON triples(deleted_at)")
-            print("Taula triples creada per graph traversal")
-        except Exception:
-            pass  # Ja existeix
+
+        await db.execute(
+            "CREATE INDEX IF NOT EXISTS idx_facts_category ON facts(category)"
+        )
+
+        # Migració 4: entities table for graph traversal
+        await db.execute("""
+            CREATE TABLE IF NOT EXISTS entities (
+                id TEXT PRIMARY KEY DEFAULT (lower(hex(randomblob(16)))),
+                name TEXT NOT NULL,
+                type TEXT DEFAULT '',
+                aliases TEXT DEFAULT '[]',
+                description TEXT DEFAULT '',
+                metadata TEXT DEFAULT '{}',
+                created_at TEXT DEFAULT (datetime('now')),
+                updated_at TEXT DEFAULT (datetime('now')),
+                deleted_at TEXT
+            )
+        """)
+        await db.execute("CREATE INDEX IF NOT EXISTS idx_entities_name ON entities(name)")
+        await db.execute("CREATE INDEX IF NOT EXISTS idx_entities_type ON entities(type)")
+
+        # Migració 5: triples table for graph traversal
+        await db.execute("""
+            CREATE TABLE IF NOT EXISTS triples (
+                id TEXT PRIMARY KEY DEFAULT (lower(hex(randomblob(16)))),
+                subject_id TEXT NOT NULL REFERENCES entities(id),
+                predicate TEXT NOT NULL,
+                object_id TEXT NOT NULL REFERENCES entities(id),
+                confidence REAL DEFAULT 1.0,
+                source_agent_id TEXT,
+                metadata TEXT DEFAULT '{}',
+                created_at TEXT DEFAULT (datetime('now')),
+                updated_at TEXT DEFAULT (datetime('now')),
+                expires_at TEXT,
+                deleted_at TEXT
+            )
+        """)
+        await db.execute("CREATE INDEX IF NOT EXISTS idx_triples_subject ON triples(subject_id)")
+        await db.execute("CREATE INDEX IF NOT EXISTS idx_triples_object ON triples(object_id)")
+        await db.execute("CREATE INDEX IF NOT EXISTS idx_triples_predicate ON triples(predicate)")
+        await db.execute("CREATE INDEX IF NOT EXISTS idx_triples_deleted ON triples(deleted_at)")
+
         await db.commit()
 
 
@@ -91,18 +102,13 @@ async def init_db() -> None:
     sql_path = Path(__file__).resolve().parent.parent / "scripts" / "init_db.sql"
     if not sql_path.exists():
         raise FileNotFoundError(f"No es troba l'script SQL: {sql_path}")
+
     sql = sql_path.read_text(encoding="utf-8")
     async with get_db() as db:
-        # Dividim en sentències separades per ';'
-        statements = [s.strip() for s in sql.split(";") if s.strip()]
-        for stmt in statements:
-            try:
-                await db.execute(stmt)
-            except Exception as exc:
-                # Ignorem errors si la taula ja existeix (idempotent)
-                if "already exists" not in str(exc).lower():
-                    raise exc
+        # executescript preserva blocs BEGIN ... END dels triggers. Fer split(';')
+        # corromp aquests blocs i pot deixar la base de dades a mig inicialitzar.
+        await db.executescript(sql)
         await db.commit()
 
-    # Aplica migracions addicionals
+    # Aplica migracions addicionals. Els errors es propaguen (fail-fast).
     await _migrate_db()
