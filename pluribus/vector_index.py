@@ -95,7 +95,7 @@ class VectorIndex:
             # Load all active chunks with valid embeddings
             cursor = conn.execute("""
                 SELECT c.id as chunk_id, c.fact_id, c.embedding_blob,
-                       f.scope, f.agent_id, f.key
+                       f.scope, f.category, f.agent_id, f.key
                 FROM chunks c
                 JOIN facts f ON c.fact_id = f.id
                 WHERE f.deleted_at IS NULL
@@ -136,6 +136,7 @@ class VectorIndex:
                     "chunk_id": row["chunk_id"],
                     "fact_id": row["fact_id"],
                     "scope": row["scope"],
+                    "category": row["category"],
                     "agent_id": row["agent_id"],
                     "key": row["key"],
                 })
@@ -190,6 +191,7 @@ class VectorIndex:
         self,
         query_vec: np.ndarray,
         scope_filter: Optional[str] = None,
+        category_filter: Optional[str] = None,
         agent_id_filter: Optional[str] = None,
         top_k: int = 5,
     ) -> list[tuple[str, float]]:
@@ -204,13 +206,19 @@ class VectorIndex:
             return []
 
         return await asyncio.to_thread(
-            self._search_sync, query_vec, scope_filter, agent_id_filter, top_k
+            self._search_sync,
+            query_vec,
+            scope_filter,
+            category_filter,
+            agent_id_filter,
+            top_k,
         )
 
     def _search_sync(
         self,
         query_vec: np.ndarray,
         scope_filter: Optional[str],
+        category_filter: Optional[str],
         agent_id_filter: Optional[str],
         top_k: int,
     ) -> list[tuple[str, float]]:
@@ -219,7 +227,11 @@ class VectorIndex:
             return []
 
         # Build allowlist based on filters
-        allowlist = self._build_allowlist(scope_filter, agent_id_filter)
+        allowlist = self._build_allowlist(
+            scope_filter,
+            category_filter,
+            agent_id_filter,
+        )
 
         if allowlist is not None and len(allowlist) == 0:
             return []
@@ -255,10 +267,15 @@ class VectorIndex:
     def _build_allowlist(
         self,
         scope_filter: Optional[str],
+        category_filter: Optional[str],
         agent_id_filter: Optional[str],
     ) -> Optional[np.ndarray]:
         """Build an allowlist array based on metadata filters."""
-        if scope_filter is None and agent_id_filter is None:
+        if (
+            scope_filter is None
+            and category_filter is None
+            and agent_id_filter is None
+        ):
             return self._all_ext_ids_arr
 
         filtered = []
@@ -267,6 +284,8 @@ class VectorIndex:
             if meta is None:
                 continue
             if scope_filter is not None and meta.get("scope") != scope_filter:
+                continue
+            if category_filter is not None and meta.get("category") != category_filter:
                 continue
             if agent_id_filter is not None and meta.get("agent_id") != agent_id_filter:
                 continue
