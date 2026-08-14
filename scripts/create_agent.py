@@ -8,6 +8,12 @@ import sys
 import uuid
 from pathlib import Path
 
+# Executing /opt/pluribus/scripts/create_agent.py sets sys.path[0] to the
+# scripts directory. Add the project root explicitly before importing pluribus.
+_PROJECT_ROOT = str(Path(__file__).resolve().parent.parent)
+if _PROJECT_ROOT not in sys.path:
+    sys.path.insert(0, _PROJECT_ROOT)
+
 import bcrypt
 
 from pluribus.api_keys import fingerprint_api_key, generate_api_key
@@ -20,7 +26,7 @@ def main() -> None:
 
     if not Path(db_path).exists():
         print(f"Error: No es troba la base de dades a {db_path}", file=sys.stderr)
-        print("Arrenca Pluribus una vegada perquè executi init_db().", file=sys.stderr)
+        print("Inicialitza Pluribus una vegada abans de crear l'agent.", file=sys.stderr)
         sys.exit(1)
 
     print("=== Creació d Agent Pluribus ===")
