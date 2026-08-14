@@ -19,6 +19,7 @@ CREATE TABLE IF NOT EXISTS facts (
     id TEXT PRIMARY KEY DEFAULT (lower(hex(randomblob(16)))),
     scope TEXT NOT NULL DEFAULT 'shared',
     agent_id TEXT REFERENCES agents(id),
+    category TEXT NOT NULL DEFAULT 'events',
     key TEXT,
     content TEXT NOT NULL,
     metadata TEXT DEFAULT '{}',
@@ -30,6 +31,7 @@ CREATE TABLE IF NOT EXISTS facts (
 
 CREATE INDEX IF NOT EXISTS idx_facts_scope ON facts(scope);
 CREATE INDEX IF NOT EXISTS idx_facts_agent ON facts(agent_id);
+CREATE INDEX IF NOT EXISTS idx_facts_category ON facts(category);
 CREATE INDEX IF NOT EXISTS idx_facts_key ON facts(key);
 CREATE INDEX IF NOT EXISTS idx_facts_deleted ON facts(deleted_at);
 
