@@ -152,3 +152,13 @@ async def dashboard_authorize(request: Request) -> None:
         return
     if path.startswith("/api/"):
         _require(_request_agent(request), "admin")
+
+
+async def knowledge_authorize(request: Request) -> None:
+    """Protect the current global knowledge graph until it is scope-aware.
+
+    The graph tables and endpoints do not carry enough scope information to
+    safely filter every traversal/edge. Failing closed here prevents cross-scope
+    disclosure and cross-scope relation mutation by standard agents.
+    """
+    _require(_request_agent(request), "admin")
