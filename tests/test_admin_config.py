@@ -5,12 +5,10 @@ from __future__ import annotations
 import tempfile
 import unittest
 from pathlib import Path
-from unittest.mock import patch
 
 from fastapi import HTTPException
 
 from pluribus.admin_config import _atomic_update_env, _validate_updates
-from pluribus.config import settings
 import pluribus.main as main
 
 
@@ -83,24 +81,26 @@ class AtomicEnvTests(unittest.TestCase):
 
 
 class RoutePrecedenceTests(unittest.TestCase):
-    def test_hardened_config_routes_are_registered_before_legacy_duplicates(self) -> None:
-        save_routes = [
-            route
-            for route in main.app.routes
-            if getattr(route, "path", None) == "/api/config/save"
-            and "POST" in (getattr(route, "methods", None) or set())
-        ]
-        self.assertGreaterEqual(len(save_routes), 2)
-        self.assertEqual(save_routes[0].endpoint.__module__, "pluribus.admin_config")
+    def _endpoint_index(self, endpoint_name: str) -> int:
+        for index, route in enumerate(main.app.routes):
+            endpoint = getattr(route, "endpoint", None)
+            if getattr(endpoint, "__name__", None) == endpoint_name:
+                return index
+        self.fail(f"Endpoint {endpoint_name!r} no registrat")
 
-        get_restart_routes = [
-            route
-            for route in main.app.routes
-            if getattr(route, "path", None) == "/api/config/restart"
-            and "GET" in (getattr(route, "methods", None) or set())
-        ]
-        self.assertGreaterEqual(len(get_restart_routes), 2)
-        self.assertEqual(get_restart_routes[0].endpoint.__module__, "pluribus.admin_config")
+    def test_hardened_config_routes_are_registered_before_legacy_duplicates(self) -> None:
+        self.assertLess(
+            self._endpoint_index("secure_save_config"),
+            self._endpoint_index("save_config"),
+        )
+        self.assertLess(
+            self._endpoint_index("reject_get_restart"),
+            self._endpoint_index("restart_pluribus"),
+        )
+        self.assertLess(
+            self._endpoint_index("secure_restart"),
+            self._endpoint_index("restart_pluribus"),
+        )
 
 
 if __name__ == "__main__":
