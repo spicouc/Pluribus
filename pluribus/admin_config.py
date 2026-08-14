@@ -7,8 +7,9 @@ import json
 import os
 from pathlib import Path
 import re
-import subprocess
+import signal
 import tempfile
+import threading
 from typing import Any
 from urllib.parse import urlsplit
 
@@ -78,7 +79,6 @@ def _scalar_text(key: str, value: Any) -> str:
 
 
 def _validate_updates(body: dict[str, Any]) -> tuple[dict[str, str], bool]:
-    """Return canonical env strings plus optional restart request."""
     if not isinstance(body, dict):
         raise HTTPException(status_code=400, detail="Cos JSON invàlid")
 
@@ -144,8 +144,9 @@ def _render_updated_env(existing: str, updates: dict[str, str]) -> str:
         if not stripped.startswith("#") and "=" in stripped:
             current_key = stripped.split("=", 1)[0].strip()
             if current_key in updates:
-                output.append(f"{current_key}={updates[current_key]}\n")
-                seen.add(current_key)
+                if current_key not in seen:
+                    output.append(f"{current_key}={updates[current_key]}\n")
+                    seen.add(current_key)
                 replaced = True
         if not replaced:
             output.append(line if line.endswith("\n") else line + "\n")
@@ -184,15 +185,20 @@ def _atomic_update_env(path_text: str, updates: dict[str, str]) -> None:
             temp_path.unlink(missing_ok=True)
 
 
-def _restart_service() -> None:
-    subprocess.Popen(
-        ["systemctl", "restart", "pluribus"],
-        stdin=subprocess.DEVNULL,
-        stdout=subprocess.DEVNULL,
-        stderr=subprocess.DEVNULL,
-        close_fds=True,
-        start_new_session=True,
-    )
+def _restart_service(delay_seconds: float = 0.5) -> threading.Timer:
+    """Ask systemd to restart us without requiring systemctl/root privileges.
+
+    `pluribus.service` uses Restart=always. A delayed SIGTERM lets the HTTP
+    response leave the process first, then triggers FastAPI's graceful shutdown;
+    systemd starts a fresh process which reads the updated EnvironmentFile.
+    """
+    def terminate() -> None:
+        os.kill(os.getpid(), signal.SIGTERM)
+
+    timer = threading.Timer(delay_seconds, terminate)
+    timer.daemon = True
+    timer.start()
+    return timer
 
 
 async def _audit(agent_id: str, action: str, payload: dict[str, Any]) -> None:
@@ -208,8 +214,6 @@ async def _audit(agent_id: str, action: str, payload: dict[str, Any]) -> None:
             )
             await db.commit()
     except Exception:
-        # Configuration mutation has already succeeded; audit failure must not
-        # convert it into a misleading client-visible failure.
         pass
 
 
