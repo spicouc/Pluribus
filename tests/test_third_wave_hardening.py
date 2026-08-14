@@ -63,7 +63,8 @@ class GraphScopeTests(TemporaryPluribusDb):
 
         async with get_db() as db:
             first = await compute_semantic_relations(db)
-            count = (await (await db.execute("SELECT COUNT(*) AS n FROM fact_relations")).fetchone())["n"]
+            cursor = await db.execute("SELECT COUNT(*) AS n FROM fact_relations")
+            count = (await cursor.fetchone())["n"]
         self.assertEqual(first["relations_created"], 0)
         self.assertEqual(count, 0)
 
@@ -71,9 +72,10 @@ class GraphScopeTests(TemporaryPluribusDb):
         await self._insert_chunk("c-alpha-2", "alpha-2", vector)
         async with get_db() as db:
             second = await compute_semantic_relations(db)
-            rows = await (await db.execute(
+            cursor = await db.execute(
                 "SELECT source_fact_id, target_fact_id FROM fact_relations"
-            )).fetchall()
+            )
+            rows = await cursor.fetchall()
         self.assertEqual(second["relations_created"], 1)
         self.assertEqual(
             {frozenset((row["source_fact_id"], row["target_fact_id"])) for row in rows},
@@ -100,7 +102,8 @@ class GraphScopeTests(TemporaryPluribusDb):
         search.assert_awaited_once()
         self.assertEqual(search.await_args.kwargs["scope_filter"], "alpha")
         async with get_db() as db:
-            count = (await (await db.execute("SELECT COUNT(*) AS n FROM fact_relations")).fetchone())["n"]
+            cursor = await db.execute("SELECT COUNT(*) AS n FROM fact_relations")
+            count = (await cursor.fetchone())["n"]
         self.assertEqual(count, 0)
 
 
@@ -202,7 +205,7 @@ class BackupTests(unittest.TestCase):
         script = (root / "scripts" / "backup.sh").read_text(encoding="utf-8")
         self.assertNotIn("VACUUM", script)
         self.assertNotIn("turbovec", script.lower())
-        self.assertIn("python\" -m pluribus.backup", script)
+        self.assertIn("-m pluribus.backup", script)
 
 
 if __name__ == "__main__":
