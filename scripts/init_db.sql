@@ -16,9 +16,8 @@ CREATE TABLE IF NOT EXISTS agents (
     created_at TEXT DEFAULT (datetime('now'))
 );
 
-CREATE UNIQUE INDEX IF NOT EXISTS idx_agents_api_key_fingerprint
-    ON agents(api_key_fingerprint)
-    WHERE api_key_fingerprint IS NOT NULL;
+-- idx_agents_api_key_fingerprint is created by _migrate_db() only after
+-- verifying that legacy agents tables have the new column.
 
 CREATE TABLE IF NOT EXISTS facts (
     id TEXT PRIMARY KEY DEFAULT (lower(hex(randomblob(16)))),
