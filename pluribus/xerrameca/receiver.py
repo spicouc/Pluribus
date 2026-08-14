@@ -8,7 +8,6 @@ agent's own API key.
 
 from __future__ import annotations
 
-import asyncio
 from dataclasses import dataclass
 import hashlib
 import hmac
@@ -18,7 +17,7 @@ import json
 import os
 from pathlib import Path
 import sqlite3
-from typing import Any, Awaitable, Callable
+from typing import Any, Callable
 
 import httpx
 from fastapi import BackgroundTasks, FastAPI, HTTPException, Request
@@ -65,6 +64,27 @@ def verify_signature(secret: str, body: bytes, provided: str | None) -> bool:
     if not provided:
         return False
     return hmac.compare_digest(_signature(secret, body), provided.strip())
+
+
+def _turn_fields(payload: dict[str, Any]) -> tuple[str, str]:
+    """Extract the canonical Runner v1 nested turn envelope.
+
+    A small top-level compatibility path is retained for early development
+    payloads, but the production Runner sends payload['turn']['id'] and
+    payload['turn']['lease_token'].
+    """
+    turn = payload.get("turn")
+    if isinstance(turn, dict):
+        turn_id = turn.get("id")
+        lease_token = turn.get("lease_token")
+    else:
+        turn_id = payload.get("turn_id")
+        lease_token = payload.get("lease_token")
+    if not isinstance(turn_id, str) or not turn_id:
+        raise ValueError("turn.id obligatori")
+    if not isinstance(lease_token, str) or len(lease_token) < 16:
+        raise ValueError("turn.lease_token obligatori")
+    return turn_id, lease_token
 
 
 def _init_state_db(path: str) -> None:
@@ -116,7 +136,10 @@ def _set_delivery(path: str, key: str, status: str, error: str | None = None) ->
 
 async def default_handler(payload: dict[str, Any]) -> dict[str, Any]:
     """Safe default: acknowledge the turn but require an operator/real handler."""
-    turn_id = payload.get("turn_id", "unknown")
+    try:
+        turn_id, _ = _turn_fields(payload)
+    except ValueError:
+        turn_id = "unknown"
     return {
         "content": f"Torn {turn_id} rebut pel receptor Xerrameca de referència; falta configurar XERRAMECA_HANDLER.",
         "result": "needs_human",
@@ -161,8 +184,7 @@ async def _call_handler(handler: Callable[[dict[str, Any]], Any], payload: dict[
 
 
 async def _reply_to_pluribus(settings: ReceiverSettings, payload: dict[str, Any], result: dict[str, Any]) -> None:
-    turn_id = str(payload["turn_id"])
-    lease_token = str(payload["lease_token"])
+    turn_id, lease_token = _turn_fields(payload)
     body = {
         "content": result["content"],
         "result": result["result"],
@@ -253,13 +275,13 @@ def create_receiver_app(
             raise HTTPException(status_code=400, detail="JSON invàlid") from exc
         if not isinstance(payload, dict):
             raise HTTPException(status_code=400, detail="Payload ha de ser un objecte")
+        if payload.get("event") not in {None, "xerrameca.turn.claimed"}:
+            raise HTTPException(status_code=422, detail="Event Xerrameca no suportat")
 
-        turn_id = payload.get("turn_id")
-        lease_token = payload.get("lease_token")
-        if not isinstance(turn_id, str) or not turn_id:
-            raise HTTPException(status_code=422, detail="turn_id obligatori")
-        if not isinstance(lease_token, str) or len(lease_token) < 16:
-            raise HTTPException(status_code=422, detail="lease_token obligatori")
+        try:
+            turn_id, _lease_token = _turn_fields(payload)
+        except ValueError as exc:
+            raise HTTPException(status_code=422, detail=str(exc)) from exc
 
         key = (
             request.headers.get("X-Pluribus-Idempotency-Key")
@@ -267,8 +289,12 @@ def create_receiver_app(
             or turn_id
         )
         key = str(key)
-        if len(key) > 256:
-            raise HTTPException(status_code=422, detail="idempotency_key massa llarga")
+        if not key or len(key) > 256:
+            raise HTTPException(status_code=422, detail="idempotency_key invàlida")
+        # Runner v1 uses turn_id as the stable idempotency key. Reject a
+        # conflicting caller-supplied key rather than deduplicating the wrong turn.
+        if key != turn_id:
+            raise HTTPException(status_code=422, detail="idempotency_key ha de coincidir amb turn.id")
 
         first = _claim_delivery(settings.state_db, key, turn_id)
         if not first:
