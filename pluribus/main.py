@@ -14,7 +14,7 @@ from pluribus.authorization import agents_authorize, dashboard_authorize, mcp_au
 from pluribus.compact import compact_database
 from pluribus.config import settings
 from pluribus.dashboard import router as dashboard_router
-from pluribus.db import init_db
+from pluribus.db import get_db, init_db
 from pluribus.embedding import embedding_service
 from pluribus.expiry_worker import expiry_worker_loop
 from pluribus.knowledge import router as knowledge_router
@@ -29,7 +29,6 @@ from pluribus.webhooks import router as webhooks_router
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     """Inicialitza DB abans de servir trànsit i gestiona workers interns."""
-    # Fail-fast: no servir trànsit amb un esquema parcial.
     await init_db()
     print("✓ Base de dades inicialitzada correctament")
 
@@ -92,15 +91,45 @@ app.include_router(webhooks_router)
 app.include_router(knowledge_router)
 
 
+async def _sqlite_is_healthy() -> bool:
+    """Execute a real bounded DB query instead of reporting a constant."""
+    try:
+        async with asyncio.timeout(2.0):
+            async with get_db() as db:
+                cursor = await db.execute("SELECT 1 AS ok")
+                row = await cursor.fetchone()
+                return bool(row and row["ok"] == 1)
+    except Exception:
+        return False
+
+
 @app.get("/health")
 async def health() -> JSONResponse:
-    embedding_ready = embedding_service.is_ready
-    return JSONResponse({
-        "status": "ok",
-        "sqlite": True,
-        "embedding_ready": embedding_ready,
-        "version": "2.0.0",
-    })
+    sqlite_ok = await _sqlite_is_healthy()
+    try:
+        embedding_ready = await embedding_service.check_ready()
+    except Exception:
+        embedding_ready = False
+
+    if not sqlite_ok:
+        status = "error"
+        status_code = 503
+    elif not embedding_ready:
+        status = "degraded"
+        status_code = 200
+    else:
+        status = "ok"
+        status_code = 200
+
+    return JSONResponse(
+        status_code=status_code,
+        content={
+            "status": status,
+            "sqlite": sqlite_ok,
+            "embedding_ready": embedding_ready,
+            "version": "2.0.0",
+        },
+    )
 
 
 @app.post("/v1/admin/compact", status_code=200)
