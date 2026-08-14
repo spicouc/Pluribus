@@ -5,7 +5,9 @@ from __future__ import annotations
 import tempfile
 import unittest
 from pathlib import Path
+from unittest.mock import AsyncMock, patch
 
+import httpx
 from fastapi import HTTPException
 
 from pluribus.admin_config import _atomic_update_env, _validate_updates
@@ -80,27 +82,43 @@ class AtomicEnvTests(unittest.TestCase):
             temp_dir.cleanup()
 
 
-class RoutePrecedenceTests(unittest.TestCase):
-    def _endpoint_index(self, endpoint_name: str) -> int:
-        for index, route in enumerate(main.app.routes):
-            endpoint = getattr(route, "endpoint", None)
-            if getattr(endpoint, "__name__", None) == endpoint_name:
-                return index
-        self.fail(f"Endpoint {endpoint_name!r} no registrat")
+class RoutePrecedenceTests(unittest.IsolatedAsyncioTestCase):
+    async def asyncSetUp(self) -> None:
+        self.agent = {
+            "id": "admin-route-test",
+            "name": "admin",
+            "permissions": '{"read":true,"write":true,"delete":true,"admin":true}',
+            "allowed_scopes": '["shared"]',
+        }
+        self.transport = httpx.ASGITransport(app=main.app)
+        self.client = httpx.AsyncClient(
+            transport=self.transport,
+            base_url="http://testserver",
+            headers={"X-API-Key": "test-admin-key-long-enough"},
+        )
 
-    def test_hardened_config_routes_are_registered_before_legacy_duplicates(self) -> None:
-        self.assertLess(
-            self._endpoint_index("secure_save_config"),
-            self._endpoint_index("save_config"),
-        )
-        self.assertLess(
-            self._endpoint_index("reject_get_restart"),
-            self._endpoint_index("restart_pluribus"),
-        )
-        self.assertLess(
-            self._endpoint_index("secure_restart"),
-            self._endpoint_index("restart_pluribus"),
-        )
+    async def asyncTearDown(self) -> None:
+        await self.client.aclose()
+
+    async def test_safe_save_route_shadows_legacy_mutation(self) -> None:
+        with patch(
+            "pluribus.security._authenticate_agent",
+            new=AsyncMock(return_value=self.agent),
+        ):
+            response = await self.client.post(
+                "/api/config/save",
+                json={"PLURIBUS_NOTION_API_KEY": "must-not-be-editable"},
+            )
+        self.assertEqual(response.status_code, 400)
+        self.assertIn("no editables", response.json()["detail"])
+
+    async def test_get_restart_is_blocked_before_legacy_get_handler(self) -> None:
+        with patch(
+            "pluribus.security._authenticate_agent",
+            new=AsyncMock(return_value=self.agent),
+        ):
+            response = await self.client.get("/api/config/restart")
+        self.assertEqual(response.status_code, 405)
 
 
 if __name__ == "__main__":
