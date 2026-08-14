@@ -5,6 +5,7 @@ CREATE TABLE IF NOT EXISTS agents (
     id TEXT PRIMARY KEY,
     name TEXT NOT NULL,
     api_key_hash TEXT NOT NULL,
+    api_key_fingerprint TEXT,
     permissions TEXT DEFAULT '{}',
     allowed_scopes TEXT DEFAULT '["shared"]',
     capabilities TEXT DEFAULT '{}',
@@ -14,6 +15,10 @@ CREATE TABLE IF NOT EXISTS agents (
     is_active INTEGER DEFAULT 1,
     created_at TEXT DEFAULT (datetime('now'))
 );
+
+CREATE UNIQUE INDEX IF NOT EXISTS idx_agents_api_key_fingerprint
+    ON agents(api_key_fingerprint)
+    WHERE api_key_fingerprint IS NOT NULL;
 
 CREATE TABLE IF NOT EXISTS facts (
     id TEXT PRIMARY KEY DEFAULT (lower(hex(randomblob(16)))),
