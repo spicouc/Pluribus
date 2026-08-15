@@ -10,6 +10,7 @@ from fastapi import HTTPException
 
 from pluribus.db import get_db
 
+from .dialogue import turn_context
 from .service import (
     _audit,
     _clean_identifier,
@@ -25,10 +26,11 @@ async def claim_turn(agent: dict[str, Any], turn_id: str) -> dict[str, Any]:
     """Reclama un torn una sola vegada durant la vida de la lease.
 
     Fins i tot una segona instància del mateix agent rep 409 mentre la lease és
-    vigent. Això evita doble execució amb credencials compartides. Una lease
-    caducada torna a ser reclamable de forma atòmica.
+    vigent. Una lease caducada torna a ser reclamable de forma atòmica.
+    Dialogue v1 afegeix context estructurat sense alterar la semàntica de lease.
     """
     turn_id = _clean_identifier(turn_id, "turn_id")
+    result: dict[str, Any]
     async with get_db() as db:
         await db.execute("BEGIN IMMEDIATE")
         await _require_system_enabled(db)
@@ -71,12 +73,13 @@ async def claim_turn(agent: dict[str, Any], turn_id: str) -> dict[str, Any]:
         if cursor.rowcount != 1:
             raise HTTPException(status_code=409, detail="El torn acaba de ser reclamat")
 
+        logical_round = turn["dialogue_round"] or turn["round_no"]
         await _audit(
             db,
             agent["id"],
             "XERRAMECA_CLAIM",
             turn["conversation_id"],
-            {"turn_id": turn_id, "round": turn["round_no"]},
+            {"turn_id": turn_id, "round": logical_round},
         )
         await db.commit()
 
@@ -94,11 +97,17 @@ async def claim_turn(agent: dict[str, Any], turn_id: str) -> dict[str, Any]:
             except (json.JSONDecodeError, TypeError):
                 payload["metadata"] = {}
 
-        return {
+        result = {
             "turn_id": turn_id,
             "conversation_id": turn["conversation_id"],
-            "round": turn["round_no"],
+            "round": logical_round,
+            "turn_sequence": turn["round_no"],
+            "turn_in_round": turn["turn_in_round"],
+            "phase": turn["phase"],
             "lease_token": token,
             "lease_until": lease_until,
             "input_message": payload,
         }
+
+    result["dialogue_context"] = await turn_context(turn_id)
+    return result
