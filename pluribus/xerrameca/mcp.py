@@ -7,15 +7,26 @@ from typing import Any
 from fastapi import HTTPException, Request
 
 from .claim import claim_turn
+from .command import run_command
 from .dialogue import get_conversation, list_conversations, reply_turn
+from .inbox import inbox
 from .models import ReplyRequest
-from .service import inbox, list_messages
+from .service import list_messages
 
 
 TOOLS = [
     {
+        "name": "xerrameca_command",
+        "description": "Executa la interfície uniforme `/xerrameca`: help, agents, status, consulta, stop o inici amb rounds/timeout/delay/supervisor.",
+        "input_schema": {
+            "type": "object",
+            "properties": {"command": {"type": "string"}},
+            "required": ["command"],
+        },
+    },
+    {
         "name": "xerrameca_inbox",
-        "description": "Llista els torns Xerrameca disponibles per a l'agent autenticat.",
+        "description": "Llista els torns Xerrameca disponibles per a l'agent autenticat, respectant l'espera entre torns.",
         "input_schema": {"type": "object", "properties": {}, "required": []},
     },
     {
@@ -91,6 +102,8 @@ async def handle_tool(
     arguments: dict[str, Any],
 ) -> Any:
     agent = request.state.agent
+    if tool_name == "xerrameca_command":
+        return await run_command(agent, str(_required(arguments, "command")))
     if tool_name == "xerrameca_inbox":
         return await inbox(agent)
     if tool_name == "xerrameca_claim":

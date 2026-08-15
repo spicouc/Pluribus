@@ -17,13 +17,27 @@ from pluribus.webhooks import (
 
 from .claim import claim_turn
 from .runner import (
-    _candidate_rows,
+    _candidate_rows as _legacy_candidate_rows,
     _record_failure,
     _record_success,
     _release_claim,
     _require_admin,
     _runner_runtime,
 )
+from .service import _now
+
+
+async def _candidate_rows(limit: int) -> list[dict[str, Any]]:
+    """Filter out successor turns whose command-level delay has not elapsed."""
+    candidates = await _legacy_candidate_rows(max(limit * 4, limit))
+    now = _now()
+    ready = [
+        candidate
+        for candidate in candidates
+        if not candidate.get("turn_created_at")
+        or candidate["turn_created_at"] <= now
+    ]
+    return ready[:limit]
 
 
 async def _dispatch_one(candidate: dict[str, Any]) -> dict[str, Any]:
@@ -63,6 +77,7 @@ async def _dispatch_one(candidate: dict[str, Any]) -> dict[str, Any]:
             "turn_sequence": claim.get("turn_sequence"),
             "turn_in_round": claim.get("turn_in_round"),
             "phase": claim.get("phase"),
+            "ready_at": claim.get("ready_at"),
             "lease_token": claim["lease_token"],
             "lease_until": claim["lease_until"],
         },
