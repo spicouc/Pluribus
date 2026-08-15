@@ -130,7 +130,7 @@ async def lifespan(app: FastAPI):
 app = FastAPI(
     title="Pluribus - Multi-agent shared memory service",
     description="Servei de memòria compartida multi-agent — Pluribus",
-    version="2.5.0",
+    version="2.4.0",
     lifespan=lifespan,
 )
 
@@ -205,7 +205,7 @@ async def health() -> JSONResponse:
             "status": status,
             "sqlite": sqlite_ok,
             "embedding_ready": embedding_ready,
-            "version": "2.5.0",
+            "version": "2.4.0",
         },
     )
 
