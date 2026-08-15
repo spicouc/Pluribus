@@ -43,7 +43,7 @@ from pluribus.xerrameca.console_entry import router as xerrameca_console_entry_r
 from pluribus.xerrameca.dialogue_schema import init_xerrameca_dialogue_db
 from pluribus.xerrameca.monitor import monitor_loop, router as xerrameca_monitor_router
 from pluribus.xerrameca.monitor_schema import init_xerrameca_monitor_db
-from pluribus.xerrameca.runner import runner_loop
+from pluribus.xerrameca.runner_dialogue import runner_loop
 from pluribus.xerrameca.runner_router import router as xerrameca_runner_router
 from pluribus.xerrameca.runner_schema import init_xerrameca_runner_db
 from pluribus.xerrameca.schema import init_xerrameca_db
