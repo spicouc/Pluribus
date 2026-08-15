@@ -1,8 +1,8 @@
 """Unified, scope-safe memory recall for Pluribus.
 
-Recall v2 combines lexical FTS5 and semantic retrieval, ranks complete facts rather
-than individual chunks, and applies authorization inside the service itself so
-internal/MCP callers cannot bypass scope restrictions accidentally.
+Recall v2 combines lexical FTS5 and TurboVec semantic retrieval, ranks complete
+facts rather than individual chunks, and applies authorization inside the
+service itself so internal/MCP callers cannot bypass scope restrictions.
 """
 
 from __future__ import annotations
@@ -21,6 +21,7 @@ from pluribus.config import settings
 from pluribus.db import get_db
 from pluribus.embedding import embedding_service
 from pluribus.validation import validate_category, validate_query, validate_scope
+from pluribus.vector_index import vector_index
 
 router = APIRouter(prefix="/v1/memory", tags=["recall"])
 
@@ -234,6 +235,7 @@ async def _semantic_candidates(
     category: str | None,
     candidate_limit: int,
 ) -> tuple[dict[str, tuple[int, float, str]], bool]:
+    """Use TurboVec for ANN and load SQLite only for winning chunk metadata."""
     try:
         query_vec = await embedding_service.get_embedding_async(query, "query: ")
     except Exception:
@@ -247,17 +249,36 @@ async def _semantic_candidates(
     ):
         return {}, False
 
-    scope_sql, params = _scope_clause(scopes)
+    try:
+        if not await vector_index.ensure_loaded():
+            return {}, False
+        stats = await vector_index.get_stats()
+        if int(stats.get("size", 0)) <= 0:
+            return {}, False
+        scored = await vector_index.search(
+            query_vec,
+            category_filter=category,
+            top_k=min(max(candidate_limit * 3, candidate_limit), 500),
+            scope_filters=scopes,
+        )
+    except Exception:
+        return {}, False
+
+    if not scored:
+        return {}, True
+
+    chunk_ids = [chunk_id for chunk_id, _ in scored]
+    placeholders = ",".join("?" for _ in chunk_ids)
+    scope_sql, scope_params = _scope_clause(scopes)
     sql = f"""
-        SELECT c.id AS chunk_id, c.fact_id, c.chunk_text, c.embedding_blob
+        SELECT c.id AS chunk_id, c.fact_id, c.chunk_text
         FROM chunks c
         JOIN facts f ON c.fact_id = f.id
-        WHERE f.deleted_at IS NULL
+        WHERE c.id IN ({placeholders})
+          AND f.deleted_at IS NULL
           AND {scope_sql}
-          AND c.embedding_blob IS NOT NULL
-          AND length(c.embedding_blob) = ?
     """
-    bind: list[Any] = [*params, settings.EMBED_DIM * 4]
+    bind: list[Any] = [*chunk_ids, *scope_params]
     if category:
         sql += " AND f.category = ?"
         bind.append(category)
@@ -266,28 +287,10 @@ async def _semantic_candidates(
         cursor = await db.execute(sql, bind)
         rows = await cursor.fetchall()
 
-    vectors: list[tuple[str, np.ndarray]] = []
-    chunk_info: dict[str, tuple[str, str]] = {}
-    for row in rows:
-        vec = np.frombuffer(row["embedding_blob"], dtype=np.float32)
-        if (
-            len(vec) != settings.EMBED_DIM
-            or not np.all(np.isfinite(vec))
-            or float(np.linalg.norm(vec)) <= 0
-        ):
-            continue
-        chunk_id = row["chunk_id"]
-        vectors.append((chunk_id, embedding_service._normalize(vec)))
-        chunk_info[chunk_id] = (row["fact_id"], row["chunk_text"])
-
-    if not vectors:
-        return {}, False
-
-    scored = embedding_service.semantic_search(
-        query_vec,
-        vectors,
-        min(max(candidate_limit * 3, candidate_limit), 500),
-    )
+    chunk_info = {
+        row["chunk_id"]: (row["fact_id"], row["chunk_text"])
+        for row in rows
+    }
     facts: dict[str, tuple[int, float, str]] = {}
     fact_rank = 0
     for chunk_id, similarity in scored:
