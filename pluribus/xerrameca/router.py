@@ -7,6 +7,7 @@ from typing import Any
 from fastapi import APIRouter, Request
 
 from .claim import claim_turn
+from .command import CommandRequest, run_command
 from .control import update_participant_safe, update_system_state_safe
 from .dialogue import (
     create_conversation,
@@ -15,6 +16,7 @@ from .dialogue import (
     reply_turn,
     start_conversation,
 )
+from .inbox import inbox
 from .models import (
     AssignTurnRequest,
     ConversationCreateRequest,
@@ -32,7 +34,6 @@ from .service import (
     cancel_conversation,
     finish_conversation,
     get_system_state,
-    inbox,
     list_messages,
     pause_conversation,
     resume_conversation,
@@ -46,6 +47,13 @@ router = APIRouter(prefix="/v1/xerrameca", tags=["xerrameca"])
 
 def _agent(request: Request) -> dict[str, Any]:
     return request.state.agent
+
+
+@router.post("/command")
+async def xerrameca_command(
+    request: Request, body: CommandRequest
+) -> dict[str, Any]:
+    return await run_command(_agent(request), body.command)
 
 
 @router.get("/system")
