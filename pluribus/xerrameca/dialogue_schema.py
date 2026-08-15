@@ -44,6 +44,12 @@ async def init_xerrameca_dialogue_db() -> None:
         )
         await _add_column(
             db,
+            "xerrameca_conversations",
+            "turn_delay_seconds",
+            "INTEGER NOT NULL DEFAULT 0",
+        )
+        await _add_column(
+            db,
             "xerrameca_turns",
             "dialogue_round",
             "INTEGER",
@@ -71,5 +77,33 @@ async def init_xerrameca_dialogue_db() -> None:
         await db.execute(
             "CREATE INDEX IF NOT EXISTS idx_xerrameca_turns_dialogue_round "
             "ON xerrameca_turns(conversation_id, dialogue_round, turn_in_round)"
+        )
+
+        # For command-created dialogues, created_at on successor turns is the
+        # not-before timestamp. The first kickoff turn is not delayed because
+        # its input message is task/control rather than a result.
+        await db.execute(
+            """CREATE TRIGGER IF NOT EXISTS xerrameca_turn_delay_ready
+               AFTER INSERT ON xerrameca_turns
+               WHEN EXISTS (
+                   SELECT 1
+                     FROM xerrameca_conversations c
+                     JOIN xerrameca_messages m ON m.id = NEW.input_message_id
+                    WHERE c.id = NEW.conversation_id
+                      AND c.turn_delay_seconds > 0
+                      AND m.message_type = 'result'
+               )
+               BEGIN
+                   UPDATE xerrameca_turns
+                      SET created_at = strftime(
+                          '%Y-%m-%dT%H:%M:%S.000000Z',
+                          julianday(NEW.created_at) + (
+                              SELECT c.turn_delay_seconds / 86400.0
+                                FROM xerrameca_conversations c
+                               WHERE c.id = NEW.conversation_id
+                          )
+                      )
+                    WHERE id = NEW.id;
+               END"""
         )
         await db.commit()
