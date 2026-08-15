@@ -41,6 +41,7 @@ class VectorIndex:
         self._ext_by_chunk: dict[str, int] = {}
         self._all_ext_ids: list[int] = []
         self._all_ext_ids_arr: Optional[np.ndarray] = None
+        self._db_path: str | None = None
 
     def invalidate(self) -> None:
         """Force the next search to rebuild from SQLite."""
@@ -57,12 +58,14 @@ class VectorIndex:
             conn.close()
 
     async def ensure_loaded(self) -> bool:
-        """Load/rebuild when the SQLite generation differs from our snapshot."""
+        """Load/rebuild when the SQLite generation or database path changed."""
+        current_db_path = str(settings.DB_PATH)
         current_generation = await asyncio.to_thread(self._read_generation_sync)
         if (
             self._loaded
             and self._index is not None
             and self._generation == current_generation
+            and self._db_path == current_db_path
         ):
             return True
 
@@ -76,6 +79,7 @@ class VectorIndex:
                 self._loaded
                 and self._index is not None
                 and self._generation == current_generation
+                and self._db_path == current_db_path
             ):
                 return True
 
@@ -94,23 +98,24 @@ class VectorIndex:
                 self._generation,
                 time.time() - t0,
             )
-            # An empty but successfully-built index is still a valid snapshot.
             return self._loaded and self._index is not None
         finally:
             self._building = False
 
-    def _set_empty_index(self, generation: int) -> None:
+    def _set_empty_index(self, generation: int, db_path: str) -> None:
         self._index = IdMapIndex(dim=settings.EMBED_DIM, bit_width=4)
         self._meta_by_ext = {}
         self._ext_by_chunk = {}
         self._all_ext_ids = []
         self._all_ext_ids_arr = None
         self._generation = generation
+        self._db_path = db_path
         self._loaded = True
 
     def _rebuild_sync(self) -> int:
         """Build from one consistent SQLite read snapshot."""
-        conn = sqlite3.connect(settings.DB_PATH)
+        db_path = str(settings.DB_PATH)
+        conn = sqlite3.connect(db_path)
         conn.row_factory = sqlite3.Row
         try:
             conn.execute("BEGIN")
@@ -141,7 +146,6 @@ class VectorIndex:
                     continue
                 norm = float(np.linalg.norm(vec))
                 if norm <= 0:
-                    # Zero placeholders are not semantic vectors.
                     continue
                 vec = vec / norm
                 chunk_ids.append(row["chunk_id"])
@@ -158,7 +162,7 @@ class VectorIndex:
                 )
 
             if not vectors:
-                self._set_empty_index(generation)
+                self._set_empty_index(generation, db_path)
                 return 0
 
             vectors_arr = np.asarray(vectors, dtype=np.float32)
@@ -184,6 +188,7 @@ class VectorIndex:
             self._all_ext_ids = all_ext_ids
             self._all_ext_ids_arr = np.asarray(all_ext_ids, dtype=np.uint64)
             self._generation = generation
+            self._db_path = db_path
             self._loaded = True
             return len(chunk_ids)
         finally:
@@ -196,7 +201,13 @@ class VectorIndex:
         category_filter: Optional[str] = None,
         agent_id_filter: Optional[str] = None,
         top_k: int = 5,
+        scope_filters: Optional[list[str]] = None,
     ) -> list[tuple[str, float]]:
+        """Search the current index with optional single- or multi-scope filters.
+
+        ``scope_filter`` is retained for backward compatibility. If both forms
+        are supplied they are intersected, which fails closed on disagreement.
+        """
         if not await self.ensure_loaded():
             return []
         if self._index is None or len(self._index) == 0:
@@ -210,10 +221,9 @@ class VectorIndex:
             category_filter,
             agent_id_filter,
             top_k,
+            scope_filters,
         )
 
-        # If a mutation landed while the search was executing, rebuild and retry
-        # once so a request never knowingly returns a stale generation.
         latest_generation = await asyncio.to_thread(self._read_generation_sync)
         if latest_generation != snapshot_generation:
             if not await self.rebuild():
@@ -227,6 +237,7 @@ class VectorIndex:
                 category_filter,
                 agent_id_filter,
                 top_k,
+                scope_filters,
             )
         return results
 
@@ -237,6 +248,7 @@ class VectorIndex:
         category_filter: Optional[str],
         agent_id_filter: Optional[str],
         top_k: int,
+        scope_filters: Optional[list[str]] = None,
     ) -> list[tuple[str, float]]:
         if self._index is None or self._all_ext_ids_arr is None:
             return []
@@ -246,7 +258,10 @@ class VectorIndex:
             return []
 
         allowlist = self._build_allowlist(
-            scope_filter, category_filter, agent_id_filter
+            scope_filter,
+            category_filter,
+            agent_id_filter,
+            scope_filters=scope_filters,
         )
         if allowlist is not None and len(allowlist) == 0:
             return []
@@ -276,20 +291,33 @@ class VectorIndex:
         scope_filter: Optional[str],
         category_filter: Optional[str],
         agent_id_filter: Optional[str],
+        scope_filters: Optional[list[str]] = None,
     ) -> Optional[np.ndarray]:
+        allowed_scopes: set[str] | None = None
+        if scope_filters is not None:
+            allowed_scopes = {scope for scope in scope_filters if isinstance(scope, str)}
+        if scope_filter is not None:
+            if allowed_scopes is None:
+                allowed_scopes = {scope_filter}
+            else:
+                allowed_scopes &= {scope_filter}
+
         if (
-            scope_filter is None
+            allowed_scopes is None
             and category_filter is None
             and agent_id_filter is None
         ):
             return self._all_ext_ids_arr
+
+        if allowed_scopes is not None and not allowed_scopes:
+            return np.asarray([], dtype=np.uint64)
 
         filtered: list[int] = []
         for ext_id in self._all_ext_ids:
             meta = self._meta_by_ext.get(ext_id)
             if meta is None:
                 continue
-            if scope_filter is not None and meta.get("scope") != scope_filter:
+            if allowed_scopes is not None and meta.get("scope") not in allowed_scopes:
                 continue
             if category_filter is not None and meta.get("category") != category_filter:
                 continue
