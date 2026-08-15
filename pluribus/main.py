@@ -33,6 +33,7 @@ from pluribus.lint import router as lint_router
 from pluribus.mcp import router as mcp_router
 from pluribus.mcp_async import router as mcp_async_router
 from pluribus.memory import router as memory_router
+from pluribus.memory_sync import init_memory_sync_db, router as memory_sync_router
 from pluribus.query_save import router as query_save_router
 from pluribus.recall import router as recall_router
 from pluribus.security import register_security_middleware
@@ -51,9 +52,10 @@ async def lifespan(app: FastAPI):
     """Inicialitza DB abans de servir trànsit i gestiona workers interns."""
     await init_db()
     await init_directives_db()
+    await init_memory_sync_db()
     await init_xerrameca_db()
     await init_xerrameca_runner_db()
-    print("✓ Base de dades, Directives, Xerrameca i Runner inicialitzats correctament")
+    print("✓ Base de dades, Directives, Memory Sync, Xerrameca i Runner inicialitzats correctament")
 
     task_handles: list[asyncio.Task] = []
 
@@ -109,7 +111,7 @@ async def lifespan(app: FastAPI):
 app = FastAPI(
     title="Pluribus - Multi-agent shared memory service",
     description="Servei de memòria compartida multi-agent — Pluribus",
-    version="2.3.0",
+    version="2.4.0",
     lifespan=lifespan,
 )
 
@@ -119,6 +121,9 @@ memory_dependencies = [Depends(memory_authorize)]
 # Recall performs defense-in-depth authorization inside its own service so it is
 # safe for REST and non-HTTP callers such as MCP.
 app.include_router(recall_router)
+# Memory Sync has its own scope-safe service authorization and must precede the
+# legacy dynamic memory routes.
+app.include_router(memory_sync_router)
 # Directives are a separate control plane: facts remain passive memory.
 app.include_router(directives_router)
 # Async semantic routes must precede the legacy duplicates in memory.py.
@@ -134,7 +139,7 @@ app.include_router(xerrameca_console_entry_router)
 app.include_router(admin_config_view_router, dependencies=[Depends(dashboard_authorize)])
 app.include_router(admin_config_router, dependencies=[Depends(dashboard_authorize)])
 app.include_router(dashboard_router, dependencies=[Depends(dashboard_authorize)])
-# Intercept MCP semantic/recall calls while delegating other tools to legacy handlers.
+# Intercept MCP semantic/recall/sync/directive calls while delegating other tools.
 app.include_router(mcp_async_router, dependencies=[Depends(mcp_authorize)])
 app.include_router(mcp_router, dependencies=[Depends(mcp_authorize)])
 app.include_router(agents_router, dependencies=[Depends(agents_authorize)])
@@ -181,7 +186,7 @@ async def health() -> JSONResponse:
             "status": status,
             "sqlite": sqlite_ok,
             "embedding_ready": embedding_ready,
-            "version": "2.3.0",
+            "version": "2.4.0",
         },
     )
 
