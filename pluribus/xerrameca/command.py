@@ -131,11 +131,19 @@ def _json_object(value: Any) -> dict[str, Any]:
     return parsed if isinstance(parsed, dict) else {}
 
 
+def _can_participate(permissions: dict[str, Any]) -> bool:
+    return bool(
+        permissions.get("admin", False)
+        or (permissions.get("read", False) and permissions.get("write", False))
+    )
+
+
 async def _available_agents(agent: dict[str, Any]) -> list[dict[str, Any]]:
     _require_command_access(agent)
     async with get_db() as db:
         cursor = await db.execute(
-            """SELECT id, name, allowed_scopes, capabilities, last_active_at
+            """SELECT id, name, permissions, allowed_scopes, capabilities,
+                      last_active_at
                FROM agents
                WHERE is_active = 1 AND id != ?
                ORDER BY name COLLATE NOCASE, id""",
@@ -144,7 +152,8 @@ async def _available_agents(agent: dict[str, Any]) -> list[dict[str, Any]]:
         result: list[dict[str, Any]] = []
         for row in await cursor.fetchall():
             scopes = _json_list(row["allowed_scopes"])
-            if COMMAND_SCOPE not in scopes:
+            permissions = _json_object(row["permissions"])
+            if COMMAND_SCOPE not in scopes or not _can_participate(permissions):
                 continue
             result.append(
                 {
@@ -295,8 +304,11 @@ async def _annotate_kickoff(conversation_id: str, delay: int) -> None:
             content = content.rstrip() + f"\n- {marker}.\n"
         await db.execute(
             "UPDATE xerrameca_messages SET content = ?, metadata = ? WHERE id = ?",
-            (json.dumps(content)[1:-1].encode().decode("unicode_escape") if False else content,
-             json.dumps(metadata, ensure_ascii=False), row["input_message_id"]),
+            (
+                content,
+                json.dumps(metadata, ensure_ascii=False),
+                row["input_message_id"],
+            ),
         )
         await db.commit()
 
