@@ -7,14 +7,9 @@ from typing import Any
 from fastapi import HTTPException, Request
 
 from .claim import claim_turn
+from .dialogue import get_conversation, list_conversations, reply_turn
 from .models import ReplyRequest
-from .service import (
-    get_conversation,
-    inbox,
-    list_conversations,
-    list_messages,
-    reply_turn,
-)
+from .service import inbox, list_messages
 
 
 TOOLS = [
@@ -25,7 +20,7 @@ TOOLS = [
     },
     {
         "name": "xerrameca_claim",
-        "description": "Reclama atòmicament un torn i obté una lease temporal.",
+        "description": "Reclama atòmicament un torn i obté lease + context Dialogue Protocol v1.",
         "input_schema": {
             "type": "object",
             "properties": {"turn_id": {"type": "string"}},
@@ -34,7 +29,7 @@ TOOLS = [
     },
     {
         "name": "xerrameca_reply",
-        "description": "Respon un torn reclamat. result pot ser continue, complete, blocked, needs_human o error.",
+        "description": "Respon un torn reclamat. En alternating, complete proposa tancament i l'altre agent l'ha de confirmar.",
         "input_schema": {
             "type": "object",
             "properties": {
@@ -48,7 +43,7 @@ TOOLS = [
                 },
                 "next_agent_id": {
                     "type": "string",
-                    "description": "Només el supervisor pot escollir-lo en política supervisor.",
+                    "description": "Només el supervisor; Dialogue v1 manté alternança entre els dos participants.",
                 },
                 "metadata": {"type": "object", "default": {}},
             },
@@ -62,7 +57,7 @@ TOOLS = [
     },
     {
         "name": "xerrameca_get",
-        "description": "Obté l'estat d'una Xerrameca on l'agent participa.",
+        "description": "Obté l'estat i protocol d'una Xerrameca on l'agent participa.",
         "input_schema": {
             "type": "object",
             "properties": {"conversation_id": {"type": "string"}},

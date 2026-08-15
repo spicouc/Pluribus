@@ -8,6 +8,13 @@ from fastapi import APIRouter, Request
 
 from .claim import claim_turn
 from .control import update_participant_safe, update_system_state_safe
+from .dialogue import (
+    create_conversation,
+    get_conversation,
+    list_conversations,
+    reply_turn,
+    start_conversation,
+)
 from .models import (
     AssignTurnRequest,
     ConversationCreateRequest,
@@ -23,18 +30,13 @@ from .models import (
 from .service import (
     assign_turn,
     cancel_conversation,
-    create_conversation,
     finish_conversation,
-    get_conversation,
     get_system_state,
     inbox,
-    list_conversations,
     list_messages,
     pause_conversation,
-    reply_turn,
     resume_conversation,
     skip_turn,
-    start_conversation,
     update_conversation_settings,
 )
 

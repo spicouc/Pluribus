@@ -40,7 +40,10 @@ from pluribus.semantic_async import router as semantic_router
 from pluribus.webhooks import router as webhooks_router
 from pluribus.xerrameca import router as xerrameca_router
 from pluribus.xerrameca.console_entry import router as xerrameca_console_entry_router
-from pluribus.xerrameca.runner import runner_loop
+from pluribus.xerrameca.dialogue_schema import init_xerrameca_dialogue_db
+from pluribus.xerrameca.monitor import monitor_loop, router as xerrameca_monitor_router
+from pluribus.xerrameca.monitor_schema import init_xerrameca_monitor_db
+from pluribus.xerrameca.runner_dialogue import runner_loop
 from pluribus.xerrameca.runner_router import router as xerrameca_runner_router
 from pluribus.xerrameca.runner_schema import init_xerrameca_runner_db
 from pluribus.xerrameca.schema import init_xerrameca_db
@@ -52,8 +55,12 @@ async def lifespan(app: FastAPI):
     await init_db()
     await init_directives_db()
     await init_xerrameca_db()
+    await init_xerrameca_dialogue_db()
     await init_xerrameca_runner_db()
-    print("✓ Base de dades, Directives, Xerrameca i Runner inicialitzats correctament")
+    await init_xerrameca_monitor_db()
+    print(
+        "✓ Base de dades, Directives, Xerrameca Dialogue, Runner i Monitor inicialitzats correctament"
+    )
 
     task_handles: list[asyncio.Task] = []
 
@@ -97,6 +104,18 @@ async def lifespan(app: FastAPI):
     task_handles.append(runner_task)
     print("✓ Xerrameca Runner iniciat (desactivat per defecte fins habilitació admin)")
 
+    async def _run_xerrameca_monitor() -> None:
+        try:
+            await monitor_loop()
+        except asyncio.CancelledError:
+            pass
+        except Exception as exc:
+            print(f"⚠ Xerrameca Monitor aturat: {exc}")
+
+    monitor_task = asyncio.create_task(_run_xerrameca_monitor())
+    task_handles.append(monitor_task)
+    print("✓ Xerrameca Monitor iniciat (observació passiva per defecte)")
+
     yield
 
     for task in task_handles:
@@ -109,7 +128,7 @@ async def lifespan(app: FastAPI):
 app = FastAPI(
     title="Pluribus - Multi-agent shared memory service",
     description="Servei de memòria compartida multi-agent — Pluribus",
-    version="2.3.0",
+    version="2.4.0",
     lifespan=lifespan,
 )
 
@@ -126,9 +145,8 @@ app.include_router(semantic_router, dependencies=memory_dependencies)
 app.include_router(memory_router, dependencies=memory_dependencies)
 app.include_router(query_save_router, dependencies=memory_dependencies)
 app.include_router(lint_router, dependencies=memory_dependencies)
-# The public dashboard entry switches to Xerrameca with ?view=xerrameca and
-# delegates the default view to the legacy dashboard. It must precede the
-# legacy /dashboard route; data APIs remain authenticated.
+# The public dashboard entry switches to Xerrameca/Monitor views and delegates
+# the default view to the legacy dashboard. Data APIs remain authenticated.
 app.include_router(xerrameca_console_entry_router)
 # Hardened config read/mutation routes must precede dashboard.py's legacy duplicates.
 app.include_router(admin_config_view_router, dependencies=[Depends(dashboard_authorize)])
@@ -140,6 +158,7 @@ app.include_router(mcp_router, dependencies=[Depends(mcp_authorize)])
 app.include_router(agents_router, dependencies=[Depends(agents_authorize)])
 app.include_router(xerrameca_router)
 app.include_router(xerrameca_runner_router)
+app.include_router(xerrameca_monitor_router)
 app.include_router(webhooks_router)
 # Current graph model is global, so fail closed to admin until it becomes scope-aware.
 app.include_router(knowledge_router, dependencies=[Depends(knowledge_authorize)])
@@ -181,7 +200,7 @@ async def health() -> JSONResponse:
             "status": status,
             "sqlite": sqlite_ok,
             "embedding_ready": embedding_ready,
-            "version": "2.3.0",
+            "version": "2.4.0",
         },
     )
 
