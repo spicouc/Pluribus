@@ -112,8 +112,6 @@ class ReceiverTests(unittest.TestCase):
         first_body = _serialize_payload(self._payload("lease-token-first-123456"))
         second_body = _serialize_payload(self._payload("lease-token-second-12345"))
 
-        # Simulate an accepted attempt whose callback processing did not finish.
-        # Avoid completing the local row so the new Pluribus lease may supersede it.
         with patch(
             "pluribus.xerrameca.receiver._process_delivery",
             new=AsyncMock(),
@@ -213,7 +211,7 @@ class ConsoleStaticTests(unittest.TestCase):
         self.assertIn("Xerrameca Console", response.text)
         self.assertIn("API key admin", response.text)
 
-    def test_main_registers_console_before_legacy_dashboard(self) -> None:
+    def test_main_registers_console_and_monitor_before_legacy_dashboard(self) -> None:
         import inspect
         import pluribus.main as main
 
@@ -221,7 +219,8 @@ class ConsoleStaticTests(unittest.TestCase):
         console_pos = source.index("app.include_router(xerrameca_console_entry_router)")
         legacy_pos = source.index("app.include_router(dashboard_router")
         self.assertLess(console_pos, legacy_pos)
-        self.assertIn('version="2.3.0"', source)
+        self.assertIn("app.include_router(xerrameca_monitor_router)", source)
+        self.assertIn('version="2.4.0"', source)
 
 
 if __name__ == "__main__":
