@@ -1,7 +1,7 @@
-"""Public dashboard switch: legacy dashboard or Xerrameca console.
+"""Public dashboard switch: legacy dashboard, Xerrameca console or monitor.
 
-Only the HTML shell is public. Xerrameca data and mutations still require the
-admin API key entered by the operator and sent as X-API-Key by the console.
+Only the HTML shells are public. Xerrameca data and mutations still require the
+admin API key entered by the operator and sent as X-API-Key by the consoles.
 """
 
 from __future__ import annotations
@@ -11,6 +11,7 @@ from fastapi.responses import HTMLResponse
 
 from pluribus.dashboard import get_dashboard as legacy_dashboard
 from .console import _HTML
+from .monitor_console import _HTML as _MONITOR_HTML
 
 router = APIRouter(tags=["xerrameca-console"])
 
@@ -25,8 +26,12 @@ _DASHBOARD_LINK = """
 
 
 def _console_html() -> str:
-    """Add small operational controls without forking the whole console template."""
+    """Add operational controls without forking the whole console template."""
     html = _HTML
+    dashboard_link = '<a class="btn" href="/dashboard">Dashboard</a>'
+    monitor_link = '<a class="btn warn" href="/dashboard?view=xerrameca-monitor">Monitor</a>'
+    html = html.replace(dashboard_link, monitor_link + dashboard_link, 1)
+
     cancel_button = "<button class=\"btn danger\" onclick=\"cancelConv('${esc(c.id)}')\">Cancel·la</button>"
     finish_button = (
         "<button class=\"btn good\" onclick=\"finishConv('${esc(c.id)}')\">Finalitza</button>"
@@ -55,8 +60,11 @@ def _legacy_html(value: object) -> tuple[str, int]:
 
 @router.get("/dashboard", response_class=HTMLResponse)
 async def dashboard_entry(view: str = Query(default="", max_length=32)) -> HTMLResponse:
-    if view.strip().lower() == "xerrameca":
+    selected = view.strip().lower()
+    if selected == "xerrameca":
         return HTMLResponse(_console_html())
+    if selected == "xerrameca-monitor":
+        return HTMLResponse(_MONITOR_HTML)
 
     legacy = await legacy_dashboard()
     body, status_code = _legacy_html(legacy)
