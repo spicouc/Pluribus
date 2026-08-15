@@ -163,8 +163,8 @@ DIRECTIVE_TOOLS = [
             "properties": {
                 "agent_id": {"type": "string"},
                 "capability": {"type": "string"},
-                "can_execute": {"type": "boolean", "default": false},
-                "can_delegate": {"type": "boolean", "default": false},
+                "can_execute": {"type": "boolean", "default": False},
+                "can_delegate": {"type": "boolean", "default": False},
             },
             "required": ["agent_id", "capability"],
         },
@@ -183,79 +183,55 @@ def _dump_result(value: Any) -> Any:
     return value
 
 
-async def _handle_directive_tool(
-    request: Request,
-    tool_name: str,
-    arguments: dict[str, Any],
-) -> Any:
+async def _handle_directive_tool(request: Request, tool_name: str, arguments: dict[str, Any]) -> Any:
     if tool_name == "directive_inbox":
         limit = int(arguments.get("limit", 50))
         if not 1 <= limit <= 200:
             raise ValueError("limit fora de rang")
         return _dump_result(await directive_inbox(request, limit=limit))
-
     if tool_name == "directive_create":
-        body = DirectiveCreateRequest.model_validate(arguments)
-        return _dump_result(await create_directive(request, body))
+        return _dump_result(await create_directive(request, DirectiveCreateRequest.model_validate(arguments)))
 
     directive_id = arguments.get("directive_id")
     if tool_name == "directive_get":
         if not isinstance(directive_id, str):
             raise ValueError("directive_id requerit")
         return _dump_result(await get_directive(request, directive_id))
-
     if tool_name == "directive_claim":
         if not isinstance(directive_id, str):
             raise ValueError("directive_id requerit")
-        body = DirectiveClaimRequest.model_validate(
-            {"lease_seconds": arguments.get("lease_seconds", 300)}
-        )
+        body = DirectiveClaimRequest.model_validate({"lease_seconds": arguments.get("lease_seconds", 300)})
         return _dump_result(await claim_directive(request, directive_id, body))
-
     if tool_name == "directive_complete":
         if not isinstance(directive_id, str):
             raise ValueError("directive_id requerit")
-        body = DirectiveCompleteRequest.model_validate(
-            {"result": arguments.get("result", {})}
-        )
+        body = DirectiveCompleteRequest.model_validate({"result": arguments.get("result", {})})
         return _dump_result(await complete_directive(request, directive_id, body))
-
     if tool_name == "directive_fail":
         if not isinstance(directive_id, str):
             raise ValueError("directive_id requerit")
-        body = DirectiveFailRequest.model_validate({"error": arguments.get("error")})
-        return _dump_result(await fail_directive(request, directive_id, body))
-
+        return _dump_result(await fail_directive(request, directive_id, DirectiveFailRequest.model_validate({"error": arguments.get("error")})))
     if tool_name == "directive_reject":
         if not isinstance(directive_id, str):
             raise ValueError("directive_id requerit")
-        body = DirectiveRejectRequest.model_validate(
-            {"reason": arguments.get("reason", "rejected")}
-        )
+        body = DirectiveRejectRequest.model_validate({"reason": arguments.get("reason", "rejected")})
         return _dump_result(await reject_directive(request, directive_id, body))
-
     if tool_name == "directive_list_grants":
         caller = getattr(request.state, "agent", None) or {}
         agent_id = arguments.get("agent_id") or caller.get("id")
         if not isinstance(agent_id, str):
             raise ValueError("agent_id requerit")
         return _dump_result(await list_directive_grants(request, agent_id))
-
     if tool_name == "directive_set_grant":
         agent_id = arguments.get("agent_id")
         capability = arguments.get("capability")
         if not isinstance(agent_id, str) or not isinstance(capability, str):
             raise ValueError("agent_id i capability requerits")
-        body = DirectiveGrantRequest.model_validate(
-            {
-                "can_execute": arguments.get("can_execute", False),
-                "can_delegate": arguments.get("can_delegate", False),
-            }
-        )
-        return _dump_result(
-            await set_directive_grant(request, agent_id, capability, body)
-        )
-
+        body = DirectiveGrantRequest.model_validate({
+            "can_execute": arguments.get("can_execute", False),
+            "can_delegate": arguments.get("can_delegate", False),
+        })
+        return _dump_result(await set_directive_grant(request, agent_id, capability, body))
     raise ValueError("directive tool desconeguda")
 
 
@@ -274,7 +250,6 @@ async def mcp_handle_async(request: Request) -> JSONResponse:
     method = body.get("method", "")
     params = body.get("params", {}) or {}
     id_: Any = body.get("id")
-
     if method == "tools/list":
         return _success({"tools": ALL_TOOLS}, id_)
     if method != "tools/call":
@@ -293,8 +268,7 @@ async def mcp_handle_async(request: Request) -> JSONResponse:
         except ValidationError:
             return _error(-32602, "Invalid memory_recall arguments", id_)
         try:
-            agent = getattr(request.state, "agent", None) or {}
-            result = await recall_service(agent, recall_request)
+            result = await recall_service(getattr(request.state, "agent", None) or {}, recall_request)
             return _success(result.model_dump(), id_)
         except HTTPException as exc:
             return _error(exc.status_code, str(exc.detail), id_)
@@ -305,8 +279,7 @@ async def mcp_handle_async(request: Request) -> JSONResponse:
         try:
             cursor = int(arguments.get("cursor", 0))
             limit = int(arguments.get("limit", 100))
-            agent = getattr(request.state, "agent", None) or {}
-            result = await memory_sync_service(agent, cursor=cursor, limit=limit)
+            result = await memory_sync_service(getattr(request.state, "agent", None) or {}, cursor=cursor, limit=limit)
             return _success(result.model_dump(), id_)
         except (TypeError, ValueError):
             return _error(-32602, "Invalid memory_sync arguments", id_)
@@ -317,10 +290,7 @@ async def mcp_handle_async(request: Request) -> JSONResponse:
 
     if tool_name in DIRECTIVE_TOOL_NAMES:
         try:
-            return _success(
-                await _handle_directive_tool(request, tool_name, arguments),
-                id_,
-            )
+            return _success(await _handle_directive_tool(request, tool_name, arguments), id_)
         except (ValidationError, TypeError, ValueError):
             return _error(-32602, "Invalid directive arguments", id_)
         except HTTPException as exc:
@@ -330,8 +300,7 @@ async def mcp_handle_async(request: Request) -> JSONResponse:
 
     if tool_name in XERRAMECA_TOOL_NAMES:
         try:
-            result = await handle_xerrameca_tool(request, tool_name, arguments)
-            return _success(result, id_)
+            return _success(await handle_xerrameca_tool(request, tool_name, arguments), id_)
         except HTTPException as exc:
             return _error(exc.status_code, str(exc.detail), id_)
         except Exception:
@@ -343,7 +312,6 @@ async def mcp_handle_async(request: Request) -> JSONResponse:
     query = arguments.get("query", "")
     if not isinstance(query, str) or not query.strip():
         return _error(-32602, "query is required", id_)
-
     scope = arguments.get("scope", "shared")
     category = arguments.get("category", "")
     try:
@@ -356,16 +324,13 @@ async def mcp_handle_async(request: Request) -> JSONResponse:
         agent = getattr(request.state, "agent", None) or {}
         if agent.get("id"):
             await _audit_search(agent["id"], query, len(rows), semantic=True, fallback=fallback)
-        results = [
-            {
-                "fact_id": row["fact_id"],
-                "content": row["content"],
-                "scope": row["scope"],
-                "category": row["category"],
-                "score": row["score"],
-            }
-            for row in rows
-        ]
+        results = [{
+            "fact_id": row["fact_id"],
+            "content": row["content"],
+            "scope": row["scope"],
+            "category": row["category"],
+            "score": row["score"],
+        } for row in rows]
         return _success({"results": results, "total": len(results), "query": query, "fallback": fallback}, id_)
     except Exception:
         return _error(-32603, "Semantic search failed", id_)
