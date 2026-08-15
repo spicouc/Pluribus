@@ -13,10 +13,10 @@ from .runner import (
     get_runner_system,
     list_runner_configs,
     rotate_runner_secret,
-    runner_tick,
     update_runner_system,
     upsert_runner_config,
 )
+from .runner_dialogue import runner_tick
 
 
 router = APIRouter(prefix="/v1/xerrameca", tags=["xerrameca-runner"])
