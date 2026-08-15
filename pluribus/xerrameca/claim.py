@@ -27,10 +27,12 @@ async def claim_turn(agent: dict[str, Any], turn_id: str) -> dict[str, Any]:
 
     Fins i tot una segona instància del mateix agent rep 409 mentre la lease és
     vigent. Una lease caducada torna a ser reclamable de forma atòmica.
-    Dialogue v1 afegeix context estructurat sense alterar la semàntica de lease.
+    Dialogue v1 afegeix context estructurat quan la seva migració és present,
+    sense trencar instal·lacions/tests que només inicialitzen Xerrameca legacy.
     """
     turn_id = _clean_identifier(turn_id, "turn_id")
     result: dict[str, Any]
+    has_dialogue_schema = False
     async with get_db() as db:
         await db.execute("BEGIN IMMEDIATE")
         await _require_system_enabled(db)
@@ -73,7 +75,20 @@ async def claim_turn(agent: dict[str, Any], turn_id: str) -> dict[str, Any]:
         if cursor.rowcount != 1:
             raise HTTPException(status_code=409, detail="El torn acaba de ser reclamat")
 
-        logical_round = turn["dialogue_round"] or turn["round_no"]
+        turn_keys = set(turn.keys())
+        has_dialogue_schema = {
+            "dialogue_round",
+            "turn_in_round",
+            "phase",
+        }.issubset(turn_keys)
+        logical_round = (
+            turn["dialogue_round"]
+            if has_dialogue_schema and turn["dialogue_round"] is not None
+            else turn["round_no"]
+        )
+        turn_in_round = turn["turn_in_round"] if has_dialogue_schema else None
+        phase = (turn["phase"] or "dialogue") if has_dialogue_schema else "dialogue"
+
         await _audit(
             db,
             agent["id"],
@@ -102,12 +117,21 @@ async def claim_turn(agent: dict[str, Any], turn_id: str) -> dict[str, Any]:
             "conversation_id": turn["conversation_id"],
             "round": logical_round,
             "turn_sequence": turn["round_no"],
-            "turn_in_round": turn["turn_in_round"],
-            "phase": turn["phase"],
+            "turn_in_round": turn_in_round,
+            "phase": phase,
             "lease_token": token,
             "lease_until": lease_until,
             "input_message": payload,
         }
 
-    result["dialogue_context"] = await turn_context(turn_id)
+    if has_dialogue_schema:
+        result["dialogue_context"] = await turn_context(turn_id)
+    else:
+        result["dialogue_context"] = {
+            "protocol_version": "legacy-v0",
+            "dialogue_round": result["round"],
+            "turn_in_round": None,
+            "phase": "dialogue",
+            "history": [],
+        }
     return result
