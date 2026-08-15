@@ -56,6 +56,13 @@ async def claim_turn(agent: dict[str, Any], turn_id: str) -> dict[str, Any]:
             raise HTTPException(status_code=423, detail="La Xerrameca no està activa")
 
         now = _now()
+        # Dialogue command delay uses created_at as a durable not-before time
+        # for successor turns. The lease timeout starts only after this guard.
+        if turn["created_at"] and turn["created_at"] > now:
+            raise HTTPException(
+                status_code=409,
+                detail=f"El torn encara no està disponible; ready_at={turn['created_at']}",
+            )
         if turn["status"] == "claimed" and turn["lease_until"] and turn["lease_until"] > now:
             raise HTTPException(status_code=409, detail="El torn ja està reclamat")
         if turn["status"] not in {"ready", "claimed"}:
@@ -68,9 +75,10 @@ async def claim_turn(agent: dict[str, Any], turn_id: str) -> dict[str, Any]:
                SET status = 'claimed', claimed_by = ?, lease_token = ?,
                    claimed_at = ?, lease_until = ?
                WHERE id = ?
+                 AND created_at <= ?
                  AND (status = 'ready'
                       OR (status = 'claimed' AND lease_until <= ?))""",
-            (agent["id"], token, now, lease_until, turn_id, now),
+            (agent["id"], token, now, lease_until, turn_id, now, now),
         )
         if cursor.rowcount != 1:
             raise HTTPException(status_code=409, detail="El torn acaba de ser reclamat")
@@ -119,6 +127,7 @@ async def claim_turn(agent: dict[str, Any], turn_id: str) -> dict[str, Any]:
             "turn_sequence": turn["round_no"],
             "turn_in_round": turn_in_round,
             "phase": phase,
+            "ready_at": turn["created_at"],
             "lease_token": token,
             "lease_until": lease_until,
             "input_message": payload,
