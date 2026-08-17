@@ -90,6 +90,63 @@ async def _migrate_db() -> None:
             END;
         """)
 
+        # ── facts_fts schema migration (legacy FTS without `scope`) ───────
+        # Older databases created facts_fts as (fact_id, content) without the
+        # `scope` column that the current triggers/queries expect. Recreating
+        # the FTS with scope is the only way to add a column to a virtual
+        # FTS5 table, and must happen before the triggers are recreated.
+        cursor = await db.execute("PRAGMA table_info(facts_fts)")
+        fts_cols = {row["name"] for row in await cursor.fetchall()}
+        if "scope" not in fts_cols:
+            await db.executescript(
+                """
+                DROP TRIGGER IF EXISTS facts_ai;
+                DROP TRIGGER IF EXISTS facts_ad;
+                DROP TRIGGER IF EXISTS facts_au;
+                DROP TABLE IF EXISTS facts_fts;
+                """
+            )
+            await db.execute(
+                """
+                CREATE VIRTUAL TABLE facts_fts USING fts5(
+                    fact_id UNINDEXED,
+                    content,
+                    scope UNINDEXED,
+                    tokenize="unicode61 categories 'L* N*'"
+                );
+                """
+            )
+            cursor = await db.execute(
+                "SELECT id, content, scope FROM facts WHERE deleted_at IS NULL"
+            )
+            for row in await cursor.fetchall():
+                await db.execute(
+                    "INSERT INTO facts_fts(fact_id, content, scope) VALUES (?, ?, ?)",
+                    (row["id"], row["content"], row["scope"] or ""),
+                )
+            await db.execute("PRAGMA quick_check")
+            # Recreate FTS sync triggers (dropped above) against the new schema
+            await db.executescript(
+                """
+                CREATE TRIGGER IF NOT EXISTS facts_ai AFTER INSERT ON facts BEGIN
+                    INSERT INTO facts_fts(fact_id, content, scope)
+                    VALUES (new.id, new.content, new.scope);
+                END;
+
+                CREATE TRIGGER IF NOT EXISTS facts_ad AFTER DELETE ON facts BEGIN
+                    DELETE FROM facts_fts WHERE fact_id = old.id;
+                END;
+
+                CREATE TRIGGER IF NOT EXISTS facts_au AFTER UPDATE ON facts
+                WHEN old.content != new.content BEGIN
+                    DELETE FROM facts_fts WHERE fact_id = old.id;
+                    INSERT INTO facts_fts(fact_id, content, scope)
+                    VALUES (new.id, new.content, new.scope);
+                END;
+                """
+            )
+            await db.commit()
+
         cursor = await db.execute(
             "SELECT COUNT(*) AS total FROM facts WHERE deleted_at IS NULL"
         )
