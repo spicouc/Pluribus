@@ -28,6 +28,7 @@ from pluribus.directives import router as directives_router
 from pluribus.directives_schema import init_directives_db
 from pluribus.embedding import embedding_service
 from pluribus.expiry_worker import expiry_worker_loop
+from pluribus.identity_provider import router as identity_provider_router
 from pluribus.knowledge import router as knowledge_router
 from pluribus.lint import router as lint_router
 from pluribus.mcp import router as mcp_router
@@ -160,6 +161,7 @@ app.include_router(dashboard_router, dependencies=[Depends(dashboard_authorize)]
 # Intercept MCP semantic/recall/sync/directive calls while delegating other tools.
 app.include_router(mcp_async_router, dependencies=[Depends(mcp_authorize)])
 app.include_router(mcp_router, dependencies=[Depends(mcp_authorize)])
+app.include_router(identity_provider_router, dependencies=[Depends(agents_authorize)])
 app.include_router(agents_router, dependencies=[Depends(agents_authorize)])
 app.include_router(xerrameca_router)
 app.include_router(xerrameca_runner_router)
