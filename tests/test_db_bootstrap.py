@@ -150,5 +150,106 @@ class DatabaseBootstrapTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual((await cursor.fetchone())["total"], 0)
 
 
+
+
+    async def test_legacy_fts_without_scope_is_migrated(self) -> None:
+        """Reproduce the production failure: a DB whose facts_fts lacks the
+        `scope` column must be migrated (recreated with scope) without data
+        loss, and subsequent INSERT/UPDATE/DELETE must keep FTS in sync."""
+        async with aiosqlite.connect(str(self.db_path)) as db:
+            await db.executescript("""
+                CREATE TABLE agents (
+                    id TEXT PRIMARY KEY,
+                    name TEXT NOT NULL,
+                    api_key_hash TEXT NOT NULL
+                );
+
+                CREATE TABLE facts (
+                    id TEXT PRIMARY KEY DEFAULT (lower(hex(randomblob(16)))),
+                    scope TEXT NOT NULL DEFAULT 'shared',
+                    agent_id TEXT REFERENCES agents(id),
+                    key TEXT,
+                    content TEXT NOT NULL,
+                    metadata TEXT DEFAULT '{}',
+                    version INTEGER DEFAULT 1,
+                    created_at TEXT DEFAULT (datetime('now')),
+                    updated_at TEXT DEFAULT (datetime('now')),
+                    deleted_at TEXT
+                );
+
+                CREATE VIRTUAL TABLE facts_fts USING fts5(
+                    fact_id UNINDEXED,
+                    content,
+                    tokenize='unicode61'
+                );
+
+                INSERT INTO facts(content) VALUES ('legacy no-scope fact');
+            """)
+            await db.commit()
+
+        # First init_db must NOT raise "table facts_fts has no column named scope"
+        await init_db()
+
+        async with get_db() as db:
+            cursor = await db.execute("PRAGMA table_info(facts_fts)")
+            cols = {row["name"] for row in await cursor.fetchall()}
+            self.assertIn("scope", cols)  # migration added scope
+
+            cursor = await db.execute(
+                "SELECT id FROM facts WHERE content = ?", ("legacy no-scope fact",)
+            )
+            fact_id = (await cursor.fetchone())["id"]
+            cursor = await db.execute(
+                "SELECT content, scope FROM facts_fts WHERE fact_id = ?", (fact_id,)
+            )
+            row = await cursor.fetchone()
+            self.assertEqual(row["content"], "legacy no-scope fact")  # no data loss
+            self.assertEqual(row["scope"], "shared")  # scope backfilled
+
+            # INSERT after migration
+            await db.execute("INSERT INTO facts(content) VALUES (?)", ("nou fact",))
+            await db.commit()
+            cursor = await db.execute(
+                "SELECT scope FROM facts_fts WHERE content = ?", ("nou fact",)
+            )
+            self.assertEqual((await cursor.fetchone())["scope"], "shared")
+
+            # UPDATE after migration
+            await db.execute(
+                "UPDATE facts SET content = ? WHERE id = ?",
+                ("nou fact upd", fact_id),
+            )
+            await db.commit()
+            cursor = await db.execute(
+                "SELECT content FROM facts_fts WHERE fact_id = ?", (fact_id,)
+            )
+            self.assertEqual((await cursor.fetchone())["content"], "nou fact upd")
+
+            # DELETE after migration
+            await db.execute("DELETE FROM facts WHERE id = ?", (fact_id,))
+            await db.commit()
+            cursor = await db.execute(
+                "SELECT COUNT(*) AS total FROM facts_fts WHERE fact_id = ?", (fact_id,)
+            )
+            self.assertEqual((await cursor.fetchone())["total"], 0)
+
+        # Second init_db must be idempotent and raise nothing
+        await init_db()
+
+        async with get_db() as db:
+            cursor = await db.execute("PRAGMA quick_check")
+            self.assertEqual((await cursor.fetchone())[0], "ok")
+
+            cursor = await db.execute(
+                "SELECT COUNT(*) AS total FROM facts_fts"
+            )
+            fts_count = (await cursor.fetchone())["total"]
+            cursor = await db.execute(
+                "SELECT COUNT(*) AS total FROM facts WHERE deleted_at IS NULL"
+            )
+            active_count = (await cursor.fetchone())["total"]
+            self.assertEqual(fts_count, active_count)
+
+
 if __name__ == "__main__":
     unittest.main()
