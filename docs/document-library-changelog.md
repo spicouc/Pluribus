@@ -80,3 +80,29 @@ Auth: defense-in-depth modeled on recall.py (X-API-Key; 401/403; allowed_scopes 
 **Rollback L1**: `git revert <sha>`; the router is additive, reverting removes the endpoints.
 
 (Test-only fix note: helper `create_doc` in test_documents_crud.py was patched to accept `scope`/`category`/`tags` so the scope-filter test is correct. Runtime untouched.)
+
+---
+## L2 — Markdown-aware chunks + FTS search
+
+**Added** `pluribus/document_chunks.py` (chunker + FTS sync) and wired into
+`pluribus/documents.py` (chunk+index generation on create/update/delete). New
+endpoints:
+- GET /v1/documents/search?q=&scope=&category=&tag=&limit=&offset= — FTS over document chunks
+- GET /v1/documents/{id}/chunks?version= — reverse chunk->document lookup
+
+**Chunking**: `chunk_markdown()` splits on ATX headings; each heading+body = 1 chunk
+(section=heading), preamble = empty-section chunk; fallback to paragraph chunks when
+no heading; max_len=6000 guard; degenerate text still yields >=1 chunk.
+`documents_fts` (FTS5) is maintained explicitly (latest version only) via
+`rebuild_document_index()` on create/content-update/soft-delete.
+
+**FTS5 note (important):** `bm25()`/`snippet()` are only valid at top row-level over
+the FTS table — never inside MIN() or a derived table. The search paginates bare
+document_id rows (GROUP BY) and ranks per-chunk with bm25 in a separate row-level
+query; the best score per doc is computed in Python from the chunk scores.
+
+**Tests**: `tests/test_documents_chunks.py` (16 passed: 4 unit chunker + 12 API).
+Regression: `215 passed / 0 failed / 22 subtests`. quick_check: integrity ok, service
+health 200 + embedding_ready true after restart. Migration: none (L0 tables only).
+**Rollback L2**: `git revert <sha>`; reverting removes the endpoints and the chunker;
+leftover document_chunks/documents_fts rows are harmless.

@@ -1,4 +1,4 @@
-"""Markdown document library CRUD + versioning (phase L1).
+"""Markdown document library CRUD + versioning (L1) + chunking/search (L2).
 
 L1 builds a Markdown document CRUD + versioning layer **on top of** the L0
 schema tables (``documents``, ``document_versions``, ...). It is purely
@@ -13,14 +13,19 @@ additive and scope-safe:
   already authenticates the agent into ``request.state.agent``; each handler
   re-checks permission + scope in a defense-in-depth style (like recall.py).
 
-Later phases (L2+) add chunking/search/vector provenance on top; L1 does NOT
-populate ``document_chunks``/``documents_fts`` nor generate embeddings.
+L2 adds Markdown-aware chunking + FTS full-text search **on document chunks**
+(``document_chunks`` / ``documents_fts``). Chunks are regenerated whenever a
+document is created, its content is updated (new version) or it is deleted;
+``documents_fts`` is kept in sync so ``GET /v1/documents/search`` returns
+content-level hits with snippets + relevance. No embeddings, no vector index,
+no fact interaction.
 """
 
 from __future__ import annotations
 
 import hashlib
 import json
+import logging
 from typing import Any, Optional
 
 from fastapi import APIRouter, HTTPException, Query, Request
@@ -28,12 +33,19 @@ from pydantic import BaseModel, Field, field_validator
 
 from pluribus.audit import log_audit
 from pluribus.db import get_db
+from pluribus.document_chunks import (
+    _FTS_CONTENT_COLUMN,
+    rebuild_document_index,
+    sanitize_fts_query,
+)
 from pluribus.validation import (
     validate_category,
     validate_content,
     validate_metadata,
     validate_scope,
 )
+
+logger = logging.getLogger("pluribus.documents")
 
 router = APIRouter(prefix="/v1/documents", tags=["documents"])
 
@@ -183,6 +195,53 @@ class DocumentUpdateRequest(BaseModel):
 class DeleteResult(BaseModel):
     document_id: str
     message: str = "Document eliminat correctament (soft delete)"
+
+
+# ── L2 chunking / FTS search response models ───────────────────────────
+class DocumentChunkRead(BaseModel):
+    id: str
+    chunk_index: int
+    section: str = ""
+    chunk_text: str
+    version: int
+
+
+class DocumentChunksResult(BaseModel):
+    document_id: str
+    version: int
+    total: int
+    chunks: list[DocumentChunkRead]
+
+
+class DocumentChunkHit(BaseModel):
+    chunk_id: str
+    document_id: str
+    version: int
+    section: str = ""
+    snippet: str = ""
+    score: float = 0.0
+
+
+class DocumentSearchHit(BaseModel):
+    """One matching document, aggregated with its best chunk hits."""
+
+    document_id: str
+    title: str
+    scope: str
+    category: str = ""
+    tags: list[str] = Field(default_factory=list)
+    description: str = ""
+    current_version: int = 1
+    relevance: float = 0.0
+    hits: list[DocumentChunkHit] = Field(default_factory=list)
+
+
+class DocumentSearchResult(BaseModel):
+    items: list[DocumentSearchHit]
+    total: int
+    scope: str
+    query: str = ""
+    filters: dict[str, Any] = Field(default_factory=dict)
 
 
 def _validate_title(value: str) -> str:
@@ -349,6 +408,12 @@ async def create_document(request: Request, body: DocumentCreateRequest) -> Docu
                 {"scope": body.scope, "title": body.title, "content_length": len(body.content)}
             ),
         )
+        # L2: generate Markdown-aware chunks for version 1 and mirror them into
+        # documents_fts so content-level FTS search works immediately.
+        try:
+            await rebuild_document_index(db, document_id=document_id)
+        except Exception:  # pragma: no cover - never block a valid create
+            logger.exception("chunk/FTS rebuild failed on create for doc %s", document_id)
         await db.commit()
 
         doc = await _load_document(db, document_id)
@@ -392,6 +457,186 @@ async def get_document_by_title(
         doc = dict(row)
         latest = await _latest_version(db, doc["id"])
     return _doc_read(doc, content=latest["content"] if latest else None)
+
+
+@router.get("/search", response_model=DocumentSearchResult)
+async def search_documents(
+    request: Request,
+    q: str = Query(..., min_length=1, max_length=256),
+    scope: str = Query("shared"),
+    category: Optional[str] = Query(None),
+    tag: Optional[str] = Query(None),
+    limit: int = Query(20, ge=1, le=100),
+    offset: int = Query(0, ge=0),
+) -> DocumentSearchResult:
+    """Full-text search over document chunks via ``documents_fts`` (L2).
+
+    Searches the content of the latest version's chunks using an FTS5 MATCH
+    query (the user input is sanitised into a quoted phrase so arbitrary text
+    cannot raise FTS query-syntax errors). Returns the matching documents
+    aggregated with their best chunk hits (snippet + relevance `score`), one
+    `DocumentSearchHit` per document, paginated by document. Filters honour
+    scope (required), plus optional category and tag. Authentication + scope +
+    read permission are enforced exactly like the CRUD endpoints.
+    """
+    agent: dict[str, Any] = getattr(request.state, "agent", None) or {}
+    normalized_scope = validate_scope(scope)
+    _require(agent, "read", normalized_scope)
+
+    match = sanitize_fts_query(q.strip())
+    if not match:
+        return DocumentSearchResult(
+            items=[], total=0, scope=normalized_scope, query=q,
+            filters={"category": category, "tag": tag},
+        )
+
+    # Paginated ranked list of distinct matching documents (latest-version only).
+    # NOTE: FTS5 auxiliary functions (bm25/snippet) require the FTS table to be
+    # referenced by its real name (no alias) — so we alias only `documents` as d.
+    doc_where = (
+        "documents_fts MATCH ?"
+        " AND d.deleted_at IS NULL"
+        " AND d.scope = ?"
+        " AND documents_fts.version = d.current_version"
+    )
+    doc_params: list[Any] = [match, normalized_scope]
+    if category:
+        doc_where += " AND d.category = ?"
+        doc_params.append(validate_category(category))
+    if tag and tag.strip():
+        doc_where += " AND d.tags LIKE ?"
+        doc_params.append(f'%"{tag.strip()}"%')
+
+    async with get_db() as db:
+        # total matching documents
+        total_cursor = await db.execute(
+            f"""SELECT COUNT(*) AS total FROM (
+                    SELECT d.id FROM documents_fts
+                    JOIN documents d ON d.id = documents_fts.document_id
+                    WHERE {doc_where}
+                    GROUP BY d.id
+                )""",
+            doc_params,
+        )
+        total = (await total_cursor.fetchone())["total"]
+
+        # FTS5: bm25()/snippet() are only valid at top row-level over the FTS
+        # table, never inside MIN() or a derived table. So paginate the distinct
+        # matching document_id rows here (no ranking math), then the row-level
+        # hit query below (own cursor) computes bm25 per chunk and we rank the
+        # docs in Python by their best chunk rank.
+        page_cursor = await db.execute(
+            f"""SELECT d.id
+                FROM documents_fts
+                JOIN documents d ON d.id = documents_fts.document_id
+                WHERE {doc_where}
+                GROUP BY d.id
+                ORDER BY d.id          -- stable ordering; real relevance ranking
+                                       -- is applied per-doc on the hit rows
+                LIMIT ? OFFSET ?""",
+            [*doc_params, limit, offset],
+        )
+        page_rows = await page_cursor.fetchall()
+        page_ids = [row["id"] for row in page_rows]
+        best_by_doc: dict[str, float] = {}  # populated after hit ranking
+
+        if not page_ids:
+            return DocumentSearchResult(
+                items=[], total=total, scope=normalized_scope, query=q,
+                filters={"category": category, "tag": tag},
+            )
+
+        placeholders = ",".join("?" for _ in page_ids)
+        hit_where = (
+            f"documents_fts MATCH ?"
+            " AND d.deleted_at IS NULL"
+            " AND d.scope = ?"
+            " AND documents_fts.version = d.current_version"
+            f" AND d.id IN ({placeholders})"
+        )
+        hit_params: list[Any] = [match, normalized_scope, *page_ids]
+        if category:
+            hit_where += " AND d.category = ?"
+            hit_params.append(validate_category(category))
+        if tag and tag.strip():
+            hit_where += " AND d.tags LIKE ?"
+            hit_params.append(f'%"{tag.strip()}"%')
+
+        cursor = await db.execute(
+            f"""SELECT d.id AS document_id, d.title, d.scope, d.category, d.tags,
+                       d.description, d.current_version,
+                       documents_fts.chunk_id AS chunk_id,
+                       documents_fts.version AS chunk_version,
+                       documents_fts.content AS chunk_text,
+                       snippet(documents_fts, {_FTS_CONTENT_COLUMN}, '⟪', '⟫', ' … ', 12) AS snippet,
+                       bm25(documents_fts) AS rank
+                FROM documents_fts
+                JOIN documents d ON d.id = documents_fts.document_id
+                WHERE {hit_where}
+                ORDER BY rank ASC""",
+            hit_params,
+        )
+        hit_rows = await cursor.fetchall()
+
+    # Aggregate hits by document in ranked order (first hit per doc = best).
+    items: list[DocumentSearchHit] = []
+    hits_by_doc: dict[str, list[DocumentChunkHit]] = {}
+    meta_by_doc: dict[str, dict[str, Any]] = {}
+    for row in hit_rows:
+        document_id = row["document_id"]
+        meta_by_doc.setdefault(
+            document_id,
+            {
+                "title": row["title"],
+                "scope": row["scope"],
+                "category": row["category"] or "",
+                "tags": _parse_json_list(row["tags"]),
+                "description": row["description"] or "",
+                "current_version": row["current_version"],
+            },
+        )
+        hits_by_doc.setdefault(document_id, []).append(
+            DocumentChunkHit(
+                chunk_id=row["chunk_id"],
+                document_id=document_id,
+                version=row["chunk_version"],
+                section="",
+                snippet=row["snippet"] or "",
+                score=round(-row["rank"], 6),
+            )
+        )
+    for document_id in page_ids:
+        meta = meta_by_doc.get(document_id, {})
+        hits = hits_by_doc.get(document_id, [])
+        best_score = best_by_doc.get(document_id, 0.0)
+        items.append(
+            DocumentSearchHit(
+                document_id=document_id,
+                title=meta.get("title", ""),
+                scope=meta.get("scope", normalized_scope),
+                category=meta.get("category", ""),
+                tags=meta.get("tags", []),
+                description=meta.get("description", ""),
+                current_version=meta.get("current_version", 1),
+                relevance=round(-best_score, 6),
+                hits=hits,
+            )
+        )
+
+    return DocumentSearchResult(
+        items=items, total=total, scope=normalized_scope, query=q,
+        filters={"category": category, "tag": tag},
+    )
+
+
+def _parse_json_list(value: Any) -> list[str]:
+    if isinstance(value, str):
+        try:
+            parsed = json.loads(value)
+            return parsed if isinstance(parsed, list) else []
+        except (json.JSONDecodeError, TypeError):
+            return []
+    return value if isinstance(value, list) else []
 
 
 @router.get("", response_model=DocumentList)
@@ -626,6 +871,14 @@ async def update_document(
                         (new_title, latest["id"]),
                     )
 
+        # L2: keep chunks + documents_fts consistent with the now-current
+        # version (re-chunks the latest version; no-op if content unchanged).
+        if new_content is not None:
+            try:
+                await rebuild_document_index(db, document_id=document_id)
+            except Exception:  # pragma: no cover - never block a valid update
+                logger.exception("chunk/FTS rebuild failed on update for doc %s", document_id)
+
         await log_audit(
             db,
             agent["id"],
@@ -668,6 +921,12 @@ async def delete_document(request: Request, document_id: str) -> DeleteResult:
             "WHERE id = ?",
             (document_id,),
         )
+        # L2: clear the document's FTS rows so deleted content is no longer
+        # returned by /v1/documents/search.
+        try:
+            await rebuild_document_index(db, document_id=document_id)
+        except Exception:  # pragma: no cover - never block a valid delete
+            logger.exception("chunk/FTS rebuild failed on delete for doc %s", document_id)
         await log_audit(
             db,
             agent["id"],
@@ -679,3 +938,50 @@ async def delete_document(request: Request, document_id: str) -> DeleteResult:
         await db.commit()
 
     return DeleteResult(document_id=document_id)
+
+
+@router.get("/{document_id}/chunks", response_model=DocumentChunksResult)
+async def list_document_chunks(
+    request: Request, document_id: str, version: Optional[int] = Query(None)
+) -> DocumentChunksResult:
+    """List the Markdown chunks of a document (L2).
+
+    Returns the chunks generated for the given ``version`` (defaults to the
+    document's current version). This is the natural chunk→document reverse
+    lookup for L2: given a document, see exactly which chunks back its FTS
+    searchable content.
+    """
+    agent: dict[str, Any] = getattr(request.state, "agent", None) or {}
+    async with get_db() as db:
+        doc = await _load_document(db, document_id)
+        if doc is None or doc["deleted_at"] is not None:
+            raise HTTPException(status_code=404, detail="Document no trobat")
+        _require(agent, "read", doc["scope"])
+
+        target_version = version if version is not None else (doc["current_version"] or 1)
+        cursor = await db.execute(
+            """SELECT c.id, c.chunk_index, c.section, c.chunk_text, v.version
+               FROM document_chunks c
+               JOIN document_versions v ON v.id = c.version_id
+               WHERE c.document_id = ? AND v.version = ?
+               ORDER BY c.chunk_index ASC""",
+            (document_id, target_version),
+        )
+        rows = await cursor.fetchall()
+
+    chunks = [
+        DocumentChunkRead(
+            id=row["id"],
+            chunk_index=row["chunk_index"],
+            section=row["section"] or "",
+            chunk_text=row["chunk_text"],
+            version=row["version"],
+        )
+        for row in rows
+    ]
+    return DocumentChunksResult(
+        document_id=document_id,
+        version=target_version,
+        total=len(chunks),
+        chunks=chunks,
+    )
