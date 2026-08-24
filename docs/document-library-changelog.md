@@ -58,3 +58,25 @@ unchanged, all new tables present). Service restarted; health `200 ok`,
 **Rollback L0**: `git revert <sha>`; or restore the DB snapshot above. Because
 the migration is idempotent/additive, simply reverting the code is sufficient;
 the extra empty tables are harmless if left behind.
+
+---
+## L1 — Markdown CRUD + versioning (router)
+
+**Added** `pluribus/documents.py` (APIRouter prefix `/v1/documents`), registered in
+`pluribus/main.py`. Endpoints:
+- POST /v1/documents (create, v1 snapshot + sha256 content_hash, 201)
+- GET /v1/documents/{id} (get by id, 404 if deleted/missing)
+- GET /v1/documents/lookup?title=&scope= (slug-equivalent; no slug column in L0 — decision documented for L2)
+- GET /v1/documents (list/search by scope/category/tag/q, paginated)
+- PUT /v1/documents/{id} (mints new document_versions row + bumps current_version ONLY when content_hash changes; metadata-only edits don't mint empty versions)
+- DELETE /v1/documents/{id} (soft-delete, sets deleted_at)
+- GET /v1/documents/{id}/versions + .../versions/{version} (history + snapshot)
+
+Auth: defense-in-depth modeled on recall.py (X-API-Key; 401/403; allowed_scopes check).
+
+**Tests**: `tests/test_documents_crud.py` (21 passed). Regression: `199 passed / 0 failed / 22 subtests`.
+**quick_check**: service restarted, health 200, embedding_ready true.
+**Migration**: none new (uses L0 tables). No ALTER on facts/FTS.
+**Rollback L1**: `git revert <sha>`; the router is additive, reverting removes the endpoints.
+
+(Test-only fix note: helper `create_doc` in test_documents_crud.py was patched to accept `scope`/`category`/`tags` so the scope-filter test is correct. Runtime untouched.)

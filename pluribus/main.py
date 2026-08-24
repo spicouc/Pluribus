@@ -26,6 +26,7 @@ from pluribus.dashboard import router as dashboard_router
 from pluribus.db import get_db, init_db
 from pluribus.directives import router as directives_router
 from pluribus.directives_schema import init_directives_db
+from pluribus.documents import router as documents_router
 from pluribus.embedding import embedding_service
 from pluribus.expiry_worker import expiry_worker_loop
 from pluribus.identity_provider import router as identity_provider_router
@@ -167,6 +168,10 @@ app.include_router(xerrameca_router)
 app.include_router(xerrameca_runner_router)
 app.include_router(xerrameca_monitor_router)
 app.include_router(webhooks_router)
+# Document library CRUD + versioning (L1). Documents are scope-safe and do
+# their own defense-in-depth authorization (read/write/delete + scope), like
+# recall.py, so they are safe for REST and non-HTTP callers.
+app.include_router(documents_router)
 # Current graph model is global, so fail closed to admin until it becomes scope-aware.
 app.include_router(knowledge_router, dependencies=[Depends(knowledge_authorize)])
 
