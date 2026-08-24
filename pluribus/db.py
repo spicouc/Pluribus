@@ -199,7 +199,153 @@ async def _migrate_db() -> None:
         await db.execute("CREATE INDEX IF NOT EXISTS idx_triples_predicate ON triples(predicate)")
         await db.execute("CREATE INDEX IF NOT EXISTS idx_triples_deleted ON triples(deleted_at)")
 
+        await _migrate_documents(db)
+
         await db.commit()
+
+
+async def _migrate_documents(db) -> None:
+    """Idempotent migration for the Markdown document library (L0-L7).
+
+    Purely additive: these tables live next to (never inside) the `facts`
+    memory schema. Documents are stored as their own first-class records and
+    are NOT written into `facts`, `facts_fts` or `chunks`. Facts semantics,
+    Recall v2, the Fact VectorIndex and notion_cache are untouched.
+
+    L0 creates the base schema: ``documents``, ``document_versions``,
+    ``document_chunks``, the ``documents_fts`` FTS5 mirror and a dedicated
+    ``document_vector_index_state`` generation counter with its own sync
+    triggers. Later phases build on top without further ALTERs to facts.
+    """
+    await db.execute("""
+        CREATE TABLE IF NOT EXISTS documents (
+            id TEXT PRIMARY KEY DEFAULT (lower(hex(randomblob(16)))),
+            title TEXT NOT NULL,
+            scope TEXT NOT NULL DEFAULT 'shared',
+            category TEXT DEFAULT '',
+            tags TEXT DEFAULT '[]',
+            description TEXT DEFAULT '',
+            metadata TEXT DEFAULT '{}',
+            current_version INTEGER DEFAULT 1,
+            created_at TEXT DEFAULT (datetime('now')),
+            updated_at TEXT DEFAULT (datetime('now')),
+            deleted_at TEXT
+        )
+    """)
+    await db.execute("CREATE INDEX IF NOT EXISTS idx_documents_scope ON documents(scope)")
+    await db.execute("CREATE INDEX IF NOT EXISTS idx_documents_title ON documents(title)")
+    await db.execute("CREATE INDEX IF NOT EXISTS idx_documents_deleted ON documents(deleted_at)")
+
+    await db.execute("""
+        CREATE TABLE IF NOT EXISTS document_versions (
+            id TEXT PRIMARY KEY DEFAULT (lower(hex(randomblob(16)))),
+            document_id TEXT NOT NULL REFERENCES documents(id) ON DELETE CASCADE,
+            version INTEGER NOT NULL,
+            title TEXT NOT NULL,
+            content TEXT NOT NULL,
+            content_hash TEXT NOT NULL,
+            change_note TEXT DEFAULT '',
+            author_agent_id TEXT,
+            created_at TEXT DEFAULT (datetime('now')),
+            UNIQUE(document_id, version)
+        )
+    """)
+    await db.execute(
+        "CREATE INDEX IF NOT EXISTS idx_document_versions_doc ON document_versions(document_id)"
+    )
+
+    await db.execute("""
+        CREATE TABLE IF NOT EXISTS document_chunks (
+            id TEXT PRIMARY KEY DEFAULT (lower(hex(randomblob(16)))),
+            version_id TEXT NOT NULL REFERENCES document_versions(id) ON DELETE CASCADE,
+            document_id TEXT NOT NULL REFERENCES documents(id) ON DELETE CASCADE,
+            chunk_index INTEGER NOT NULL DEFAULT 0,
+            section TEXT DEFAULT '',
+            chunk_text TEXT NOT NULL,
+            embedding_blob BLOB,
+            created_at TEXT DEFAULT (datetime('now'))
+        )
+    """)
+    await db.execute(
+        "CREATE INDEX IF NOT EXISTS idx_document_chunks_version ON document_chunks(version_id)"
+    )
+    await db.execute(
+        "CREATE INDEX IF NOT EXISTS idx_document_chunks_document ON document_chunks(document_id)"
+    )
+
+    # FTS5 mirror over the latest chunked content of each version. The content
+    # column is the only indexed field; id/scope fields are UNINDEXED markers.
+    await db.execute("""
+        CREATE VIRTUAL TABLE IF NOT EXISTS documents_fts USING fts5(
+            chunk_id UNINDEXED,
+            document_id UNINDEXED,
+            version UNINDEXED,
+            scope UNINDEXED,
+            content,
+            tokenize="unicode61 categories 'L* N*'"
+        )
+    """)
+
+    # Generation counter for the derived DocumentVectorIndex (L3/L4). This is a
+    # dedicated counter, separate from vector_index_state.generation which
+    # tracks the *facts* TurboVec index. Its only triggers are on
+    # document_chunks.embedding_blob shape changes, never on facts tables.
+    await db.execute("""
+        CREATE TABLE IF NOT EXISTS document_vector_index_state (
+            singleton INTEGER PRIMARY KEY CHECK (singleton = 1),
+            generation INTEGER NOT NULL DEFAULT 0
+        )
+    """)
+    await db.execute(
+        "INSERT OR IGNORE INTO document_vector_index_state(singleton, generation) VALUES (1, 0)"
+    )
+    await db.executescript("""
+        DROP TRIGGER IF EXISTS docvec_chunks_ai;
+        DROP TRIGGER IF EXISTS docvec_chunks_au;
+        DROP TRIGGER IF EXISTS docvec_chunks_ad;
+        DROP TRIGGER IF EXISTS docvec_docs_au;
+        DROP TRIGGER IF EXISTS docvec_docs_ad;
+
+        CREATE TRIGGER docvec_chunks_ai AFTER INSERT ON document_chunks BEGIN
+            UPDATE document_vector_index_state SET generation = generation + 1 WHERE singleton = 1;
+        END;
+        CREATE TRIGGER docvec_chunks_au
+        AFTER UPDATE OF embedding_blob, document_id, chunk_text, version_id ON document_chunks BEGIN
+            UPDATE document_vector_index_state SET generation = generation + 1 WHERE singleton = 1;
+        END;
+        CREATE TRIGGER docvec_chunks_ad AFTER DELETE ON document_chunks BEGIN
+            UPDATE document_vector_index_state SET generation = generation + 1 WHERE singleton = 1;
+        END;
+        CREATE TRIGGER docvec_docs_au
+        AFTER UPDATE OF scope, deleted_at ON documents BEGIN
+            UPDATE document_vector_index_state SET generation = generation + 1 WHERE singleton = 1;
+        END;
+        CREATE TRIGGER docvec_docs_ad AFTER DELETE ON documents BEGIN
+            UPDATE document_vector_index_state SET generation = generation + 1 WHERE singleton = 1;
+        END;
+    """)
+
+    # L5: provenance edges between documents and derived facts.
+    # Metadata-only provenance; it never writes or alters facts themselves.
+    await db.execute("""
+        CREATE TABLE IF NOT EXISTS document_fact_provenance (
+            id TEXT PRIMARY KEY DEFAULT (lower(hex(randomblob(16)))),
+            document_id TEXT NOT NULL REFERENCES documents(id) ON DELETE CASCADE,
+            fact_id TEXT NOT NULL REFERENCES facts(id) ON DELETE CASCADE,
+            document_version INTEGER,
+            reason TEXT DEFAULT '',
+            confidence REAL DEFAULT 1.0,
+            created_at TEXT DEFAULT (datetime('now')),
+            created_by_agent_id TEXT,
+            UNIQUE(document_id, fact_id)
+        )
+    """)
+    await db.execute(
+        "CREATE INDEX IF NOT EXISTS idx_doc_prov_document ON document_fact_provenance(document_id)"
+    )
+    await db.execute(
+        "CREATE INDEX IF NOT EXISTS idx_doc_prov_fact ON document_fact_provenance(fact_id)"
+    )
 
 
 async def init_db() -> None:
