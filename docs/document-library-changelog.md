@@ -106,3 +106,24 @@ Regression: `215 passed / 0 failed / 22 subtests`. quick_check: integrity ok, se
 health 200 + embedding_ready true after restart. Migration: none (L0 tables only).
 **Rollback L2**: `git revert <sha>`; reverting removes the endpoints and the chunker;
 leftover document_chunks/documents_fts rows are harmless.
+
+---
+## L2-CERT — Chunk provenance (line ranges + heading paths + embedding state)
+
+Certifies and hardens the L2 chunk provenance. **Schema (additive, idempotent)** in
+`document_chunks`: adds `heading_path`, `line_start`, `line_end`, `chunk_sha`,
+`embedding_state` (default 'pending'), `embedding_model`, `embedding_dim`,
+`embedding_attempts`; new indexes `idx_document_chunks_state`, `idx_document_chunks_sha`.
+
+Verified:
+- `heading_path`: nested `# Architecture > ## Storage > ### Backups` -> "Architecture > Storage > Backups". If only 'section' were enough this stays additive.
+- `line_start`/`line_end`: 1-based inclusive ranges mapping to the original Markdown.
+- long_section >6000 chars: lossless, deterministic, <=max_len chunks, no gaps/dupes.
+- code_fence ```...``` blocks: no lost lines, no destructive splits.
+- versioning: search returns only current (v2); explicit GET of v1 chunks still available.
+- soft_delete: 0 FTS results; history preserved.
+- scope: shared-only agent denied on private (search, chunks, version selector, GET) - no version= bypass.
+
+**Tests**: `tests/test_document_chunk_provenance.py` (8 passed). Doc-related combined: 49 passed.
+**Full regression**: `223 passed / 0 failed / 22 subtests`. quick_check: integrity ok. restart health 200.
+**Rollback**: `git revert <sha>` (additive schema; leftover columns harmless).

@@ -261,8 +261,16 @@ async def _migrate_documents(db) -> None:
             document_id TEXT NOT NULL REFERENCES documents(id) ON DELETE CASCADE,
             chunk_index INTEGER NOT NULL DEFAULT 0,
             section TEXT DEFAULT '',
+            heading_path TEXT DEFAULT '',
             chunk_text TEXT NOT NULL,
+            line_start INTEGER NOT NULL DEFAULT 0,
+            line_end INTEGER NOT NULL DEFAULT 0,
+            chunk_sha TEXT DEFAULT '',
+            embedding_state TEXT NOT NULL DEFAULT 'pending',
             embedding_blob BLOB,
+            embedding_model TEXT,
+            embedding_dim INTEGER,
+            embedding_attempts INTEGER NOT NULL DEFAULT 0,
             created_at TEXT DEFAULT (datetime('now'))
         )
     """)
@@ -271,6 +279,33 @@ async def _migrate_documents(db) -> None:
     )
     await db.execute(
         "CREATE INDEX IF NOT EXISTS idx_document_chunks_document ON document_chunks(document_id)"
+    )
+
+    # ── Provenance + embedding-state columns (L2-CERT/L3, additive) ──────
+    # Existing databases created document_chunks with only (section, chunk_text,
+    # embedding_blob). We add heading_path/line ranges (L2 provenance), the
+    # chunk content SHA + embedding state columns (L3) idempotently so older
+    # DBs upgrade in place without ever touching the facts tables.
+    _chunks_cols = await db.execute("PRAGMA table_info(document_chunks)")
+    _chunk_col_names = {row["name"] for row in await _chunks_cols.fetchall()}
+    _chunk_additives = {
+        "heading_path": "ALTER TABLE document_chunks ADD COLUMN heading_path TEXT DEFAULT ''",
+        "line_start": "ALTER TABLE document_chunks ADD COLUMN line_start INTEGER NOT NULL DEFAULT 0",
+        "line_end": "ALTER TABLE document_chunks ADD COLUMN line_end INTEGER NOT NULL DEFAULT 0",
+        "chunk_sha": "ALTER TABLE document_chunks ADD COLUMN chunk_sha TEXT DEFAULT ''",
+        "embedding_state": "ALTER TABLE document_chunks ADD COLUMN embedding_state TEXT NOT NULL DEFAULT 'pending'",
+        "embedding_model": "ALTER TABLE document_chunks ADD COLUMN embedding_model TEXT",
+        "embedding_dim": "ALTER TABLE document_chunks ADD COLUMN embedding_dim INTEGER",
+        "embedding_attempts": "ALTER TABLE document_chunks ADD COLUMN embedding_attempts INTEGER NOT NULL DEFAULT 0",
+    }
+    for _name, _sql in _chunk_additives.items():
+        if _name not in _chunk_col_names:
+            await db.execute(_sql)
+    await db.execute(
+        "CREATE INDEX IF NOT EXISTS idx_document_chunks_state ON document_chunks(embedding_state)"
+    )
+    await db.execute(
+        "CREATE INDEX IF NOT EXISTS idx_document_chunks_sha ON document_chunks(chunk_sha)"
     )
 
     # FTS5 mirror over the latest chunked content of each version. The content
