@@ -382,6 +382,22 @@ async def _migrate_documents(db) -> None:
         "CREATE INDEX IF NOT EXISTS idx_doc_prov_fact ON document_fact_provenance(fact_id)"
     )
 
+    # L3: embedding-reuse cache for document chunks, keyed on
+    # (chunk_sha, embedding_model, embedding_dim). A model/dim change presents a
+    # different key so incompatible vectors are never silently reused. Purely
+    # additive, independent of the facts schema.
+    await db.execute("""
+        CREATE TABLE IF NOT EXISTS document_embedding_cache (
+            sha TEXT NOT NULL,
+            model TEXT NOT NULL,
+            dim INTEGER NOT NULL,
+            embedding_blob BLOB NOT NULL,
+            created_at TEXT DEFAULT (datetime('now')),
+            PRIMARY KEY (sha, model, dim)
+        )
+    """)
+    await db.execute("CREATE INDEX IF NOT EXISTS idx_doc_emb_cache_sha ON document_embedding_cache(sha)")
+
 
 async def init_db() -> None:
     """Inicialitza l'esquema de la base de dades executant init_db.sql."""

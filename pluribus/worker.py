@@ -20,6 +20,7 @@ import requests
 
 from pluribus.config import settings
 from pluribus.db import get_db, init_db
+from pluribus.library_indexer import run_library_indexer
 
 logger = logging.getLogger("pluribus_worker")
 
@@ -272,6 +273,10 @@ async def run() -> dict[str, Any]:
             results["consolidation"] = await consolidate_facts(db)
             results["semantic_relations"] = await compute_semantic_relations(db)
             results["maintenance"] = await maintenance(db)
+            # L3: generate document-chunk embeddings (independent of facts).
+            # Ollama-down here degrades the document semantic index but never
+            # corrupts ingest/FTS/API and never raises out of the worker.
+            results["document_embeddings"] = await run_library_indexer(db)
         results["notion_sync"] = await run_notion_sync()
     except Exception as exc:
         logger.exception("Error fatal al worker")
