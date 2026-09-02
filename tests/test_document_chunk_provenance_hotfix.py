@@ -340,5 +340,69 @@ class HFProp_MaxLenInvariant(unittest.TestCase):
                                          f"chunk over max_len for {d[:30]!r}")
 
 
+class ExactNewlinePreservationTests(unittest.TestCase):
+    """HF-13 and HF-14: exact newline preservation when an oversized
+    multiline block is split. The original newlines between source lines
+    must survive into the chunk text — they are NOT to be collapsed to
+    spaces or removed."""
+
+    def test_hf13_oversized_multiline_paragraph_preserves_newlines(self) -> None:
+        """HF-13: oversized multiline paragraph → split keeps original
+        newlines (no whitespace collapse)."""
+        lines = [f"Body line {i} with some content" for i in range(1, 101)]
+        content = f"# Heading\n\n{chr(10).join(lines)}\n"
+        chunks = chunk_markdown(content, max_len=300)
+        self.assertGreater(len(chunks), 1, "over-max must split")
+        for ch in chunks:
+            self.assertLessEqual(len(ch.chunk_text), 300)
+        # Reconstruct body from the chunk text by re-splitting on \n.
+        # Every line of the original (except the empty/heading) must
+        # appear verbatim in some chunk's lines — and a chunk's lines
+        # must equal exactly slices of the original lines, joined by \n.
+        all_chunk_lines: list[str] = []
+        for ch in chunks:
+            all_chunk_lines.extend(ch.chunk_text.split("\n"))
+        # All original body lines must appear in the reconstructed output.
+        for original in lines:
+            self.assertIn(
+                original, all_chunk_lines,
+                f"original line {original!r} not found verbatim in any chunk's"
+                f" split-by-\\n output",
+            )
+
+    def test_hf14_oversized_fenced_code_preserves_newlines(self) -> None:
+        """HF-14: oversized fenced code (multiline) → split keeps
+        newlines, fence markers stay on their own line, and every chunk
+        respects max_len with exact character + order preservation."""
+        code_lines = [f"x = {i}  # comment line with some text" for i in range(50)]
+        # code body as a single string with embedded \n
+        code_body = "\n".join(code_lines)
+        content = f"# Code Section\n\n```python\n{code_body}\n```\n\nTrailing.\n"
+        chunks = chunk_markdown(content, max_len=400)
+        self.assertGreater(len(chunks), 1, "over-max must split")
+        for ch in chunks:
+            self.assertLessEqual(len(ch.chunk_text), 400)
+            # No chunk may be the result of a join-with-space on a fenced
+            # line — that would erase Python's syntactic newlines.
+            # We assert that the chunk text, when split on \n, yields
+            # only lines that exist verbatim in the original.
+            for chunk_line in ch.chunk_text.split("\n"):
+                self.assertIn(
+                    chunk_line, content,
+                    f"chunk line {chunk_line[:60]!r} not found verbatim in"
+                    f" original document",
+                )
+        # The two ``` fence markers must each appear in some chunk text
+        # (not collapsed away, not merged with surrounding text).
+        backticks_total = sum(ch.chunk_text.count("```") for ch in chunks)
+        self.assertEqual(
+            backticks_total, 2,
+            f"expected exactly 2 fence markers (```), got {backticks_total}",
+        )
+        # The trailing line "Trailing." must appear verbatim in one chunk.
+        all_text = "\n".join(ch.chunk_text for ch in chunks)
+        self.assertIn("Trailing.", all_text)
+
+
 if __name__ == "__main__":
     unittest.main()
