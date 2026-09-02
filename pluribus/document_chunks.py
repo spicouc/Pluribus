@@ -324,121 +324,47 @@ def _split_oversized(
                 line_offset + len(lines) - 1,
             )
         ]
-    return _split_lines_by_blank(lines, line_offset, max_len)
-
-
-def _split_lines_by_blank(
-    lines: list[str],
-    line_offset: int,
-    max_len: int,
-) -> list[_SplitPart]:
-    """Step 1: split ``lines`` into blank-line-separated paragraph groups."""
+    # Pack whole lines into sub-chunks, preserving the original newlines
+    # between them. A line that individually exceeds ``max_len`` is hard-
+    # wrapped at character boundaries (last-resort).
     parts: list[_SplitPart] = []
-    cur: list[str] = []
-    cur_start_idx = -1  # -1 sentinel: no paragraph in progress
-    for i, line in enumerate(lines):
-        if line.strip() == "":
-            if cur_start_idx >= 0:
-                parts.extend(
-                    _split_paragraph(cur, line_offset + cur_start_idx, max_len)
-                )
-                cur = []
-                cur_start_idx = -1
-        else:
-            if cur_start_idx < 0:
-                cur_start_idx = i
-            cur.append(line)
-    if cur and cur_start_idx >= 0:
-        parts.extend(
-            _split_paragraph(cur, line_offset + cur_start_idx, max_len)
-        )
-    return parts
+    cur_lines: list[str] = []
+    cur_len = 0  # length of "\n".join(cur_lines)
 
-
-def _split_paragraph(
-    para_lines: list[str],
-    para_line_start: int,
-    max_len: int,
-) -> list[_SplitPart]:
-    """Step 2 (and 3): split a single paragraph group.
-
-    ``para_line_start`` is the 1-based line number of ``para_lines[0]`` in
-    the source document. Sentences that stay within the same line are
-    emitted together with that line's index; sentence splits that cross
-    line boundaries are not attempted (the existing v1 strategy did not do
-    it either and a sentence can only live on a single line in this
-    grammar).
-    """
-    para_text = "\n".join(para_lines)
-    if len(para_text) <= max_len:
-        return [
-            _SplitPart(
-                para_text,
-                para_line_start,
-                para_line_start + len(para_lines) - 1,
-            )
-        ]
-
-    parts: list[_SplitPart] = []
-    # Strategy 2: sentence split. We split each *line* individually into
-    # sentences (a sentence never spans lines in the v1 grammar) and
-    # pack consecutive sentences into a part until adding the next would
-    # exceed max_len. When a single sentence is itself > max_len, we
-    # fall through to the per-line hard-wrap in step 3.
-    sentence_buf: list[str] = []
-    sentence_buf_lines: list[int] = []  # 1-based line indices contributing
-    sentence_buf_len = 0
-
-    def flush_sentence_buf() -> None:
-        nonlocal sentence_buf, sentence_buf_lines, sentence_buf_len
-        if not sentence_buf:
+    def flush() -> None:
+        nonlocal cur_lines, cur_len
+        if not cur_lines:
             return
-        joined = " ".join(sentence_buf)
-        if len(joined) <= max_len:
-            parts.append(
-                _SplitPart(
-                    joined,
-                    sentence_buf_lines[0],
-                    sentence_buf_lines[-1],
-                )
+        parts.append(
+            _SplitPart(
+                "\n".join(cur_lines),
+                line_offset + line_count - len(cur_lines),
+                line_offset + line_count - 1,
             )
-        else:
-            # Step 3: a single sentence (or accumulated group) > max_len.
-            # Walk the contributing lines and hard-wrap each line that
-            # individually exceeds max_len.
-            for line_text, line_idx in zip(sentence_buf, sentence_buf_lines):
-                if len(line_text) <= max_len:
-                    parts.append(_SplitPart(line_text, line_idx, line_idx))
-                else:
-                    parts.extend(_hard_wrap_line(line_text, line_idx, max_len))
-        sentence_buf = []
-        sentence_buf_lines = []
-        sentence_buf_len = 0
+        )
+        cur_lines = []
+        cur_len = 0
 
-    for line_offset_in_para, line_text in enumerate(para_lines):
-        line_idx_1based = para_line_start + line_offset_in_para
-        # Split the line on sentence boundaries. ``re.split`` with a
-        # capturing group returns the delimiters interleaved with pieces.
-        pieces = re.split(r"(?<=[.!?]) +", line_text)
-        if not pieces:
+    line_count = 0
+    for i, line in enumerate(lines):
+        line_count = i + 1
+        # Empty lines inside a segment are paragraph separators at the
+        # caller level; here they're just lines we must keep verbatim.
+        line_byte_len = len(line)
+        if line_byte_len > max_len:
+            # Last resort: hard-wrap this single line, keeping its source
+            # line range. Preserve its trailing newline behaviour by
+            # emitting as a single text equal to the original line.
+            flush()
+            parts.extend(_hard_wrap_line(line, line_offset + i, max_len))
             continue
-        for piece in pieces:
-            if not piece:
-                continue
-            if len(piece) > max_len:
-                # Flush whatever fits, then hard-wrap this oversized piece.
-                flush_sentence_buf()
-                parts.extend(_hard_wrap_line(piece, line_idx_1based, max_len))
-                continue
-            # Tentative join: would adding this piece overflow?
-            tentative_len = sentence_buf_len + (1 if sentence_buf else 0) + len(piece)
-            if tentative_len > max_len and sentence_buf:
-                flush_sentence_buf()
-            sentence_buf.append(piece)
-            sentence_buf_lines.append(line_idx_1based)
-            sentence_buf_len = (sentence_buf_len + (1 if len(sentence_buf) > 1 else 0)
-                                + len(piece))
-    flush_sentence_buf()
+        # Would adding this line (plus a separator newline) overflow?
+        tentative = cur_len + (1 if cur_lines else 0) + line_byte_len
+        if tentative > max_len and cur_lines:
+            flush()
+        cur_lines.append(line)
+        cur_len = (cur_len + (1 if len(cur_lines) > 1 else 0) + line_byte_len)
+    flush()
     return parts
 
 
