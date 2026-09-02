@@ -63,10 +63,33 @@ class Chunk:
 
 @dataclass
 class _Segment:
-    """A raw (possibly over-max) block destined to become one or more chunks."""
+    """A raw (possibly over-max) block destined to become one or more chunks.
+
+    ``lines`` is the list of body lines that produced ``chunk_text`` via
+    ``"\n".join(lines)``; ``line_start`` is the 1-based line number of
+    ``lines[0]`` in the source document so the splitter can compute per-part
+    line ranges when it has to sub-split an oversized block.
+    """
 
     section: str
     heading_path: str
+    chunk_text: str
+    line_start: int
+    line_end: int
+    lines: list[str] = field(default_factory=list)
+
+
+@dataclass
+class _SplitPart:
+    """One sub-chunk produced by ``_split_oversized`` with its own line range.
+
+    ``line_start`` / ``line_end`` are 1-based, inclusive, and map to the
+    original Markdown source — not to the parent segment's range. This is the
+    fix for BUG A: every sub-chunk carries its real provenance, so a chunk
+    whose ``chunk_text`` only covers a subset of the parent block's lines no
+    longer falsely claims the whole parent range.
+    """
+
     chunk_text: str
     line_start: int
     line_end: int
@@ -86,8 +109,12 @@ def chunk_markdown(content: str, *, max_len: int = 6000) -> list[Chunk]:
 
     ``max_len`` guards against a single pathological block being stored as one
     oversized chunk: when a body segment exceeds ``max_len`` chars it is
-    further split (deterministically) while preserving ``line_start``/``line_end``
-    from the parent block so provenance always maps to the original Markdown.
+    further split (deterministically) into sub-chunks. **Each sub-chunk
+    receives its own ``line_start`` / ``line_end`` derived from the lines of
+    text that actually produced it** — sub-chunks never inherit the parent
+    segment's range. The split order is blank-line → sentence-boundary →
+    character-level hard wrap, with hard wrap as the last-resort ceiling that
+    guarantees ``0 < len(chunk_text) <= max_len`` for every emitted chunk.
     """
     if not content:
         return []
@@ -99,9 +126,9 @@ def chunk_markdown(content: str, *, max_len: int = 6000) -> list[Chunk]:
     for seg in segments:
         text = seg.chunk_text
         if max_len and len(text) > max_len:
-            parts = _split_oversized(text, max_len)
+            parts = _split_oversized(seg.lines, seg.line_start, max_len)
             for part in parts:
-                p = part.strip("\n")
+                p = part.chunk_text.strip("\n")
                 if not p.strip():
                     continue
                 chunks.append(
@@ -109,8 +136,8 @@ def chunk_markdown(content: str, *, max_len: int = 6000) -> list[Chunk]:
                         index,
                         seg.section,
                         p,
-                        line_start=seg.line_start,
-                        line_end=seg.line_end,
+                        line_start=part.line_start,
+                        line_end=part.line_end,
                         heading_path=seg.heading_path,
                     )
                 )
@@ -146,27 +173,33 @@ def _build_segments(lines: list[str]) -> list[_Segment]:
 def _heading_segments(lines: list[str]) -> list[_Segment]:
     """Build segments from a heading-driven document.
 
-    ``line_start``/``line_end`` are 1-based inclusive ranges into ``lines``.
-    A heading block's range starts at its heading line (the heading text is not
+    ``line_start``/``line_end`` are 1-based inclusive ranges into ``lines``
+    covering the **body** block of each section (the heading itself is not
     duplicated into ``chunk_text`` — it lives in ``section``/``heading_path``).
-    Nested headings produce a ``> ``-joined heading_path breadcrumb.
+    The range therefore points at the lines of the source that actually
+    produced ``chunk_text``: ``line_start`` is the first body line (the line
+    right after the heading) and ``line_end`` is the last body line
+    (inclusive). Nested headings produce a ``> ``-joined ``heading_path``.
     """
     segments: list[_Segment] = []
     stack: list[tuple[int, str]] = []  # (level, heading_text)
     path = ""
     section = ""
     body: list[str] = []
-    start_1based = 0
+    body_start_1based = 0  # 1-based source line of body[0]; 0 = no body yet
+    body_end_1based = 0    # 1-based source line of body[-1]
     first_heading_seen = False
 
-    def flush(end_idx: int) -> None:
-        nonlocal body, start_1based
+    def flush() -> None:
+        nonlocal body, body_start_1based, body_end_1based
         if not any(ln.strip() for ln in body):
             body = []
             return
-        seg_end = end_idx  # last body line is at 1-based ``end_idx``
         segments.append(
-            _Segment(section, path, "\n".join(body), max(start_1based, 1), seg_end)
+            _Segment(
+                section, path, "\n".join(body),
+                body_start_1based, body_end_1based, list(body),
+            )
         )
         body = []
 
@@ -175,12 +208,15 @@ def _heading_segments(lines: list[str]) -> list[_Segment]:
         if m:
             if first_heading_seen:
                 # Close the previous heading block's body.
-                flush(i)
+                flush()
             else:
                 # Preamble before the first heading (start at line 1).
-                if any(ln.strip() for ln in body):
+                if body and any(ln.strip() for ln in body):
                     segments.append(
-                        _Segment("", "", "\n".join(body), 1, i)
+                        _Segment(
+                            "", "", "\n".join(body),
+                            body_start_1based, body_end_1based, list(body),
+                        )
                     )
                 body = []
                 first_heading_seen = True
@@ -192,21 +228,38 @@ def _heading_segments(lines: list[str]) -> list[_Segment]:
             stack.append((level, heading))
             path = " > ".join(text for _, text in stack)
             section = heading
-            # The heading is at 1-based ``i + 1``; the body starts after it.
-            start_1based = i + 1
+            # The heading is at 1-based ``i + 1``; the body starts on the next
+            # line (``i + 2``). body_start_1based is set when the first body
+            # line is observed (below), so sub-chunks that come from a
+            # still-empty body stay out of the segment stream.
+            body_start_1based = 0
+            body_end_1based = 0
         else:
+            line_1based = i + 1
+            if body_start_1based == 0:
+                body_start_1based = line_1based
+            body_end_1based = line_1based
             body.append(line)
 
     if first_heading_seen:
-        flush(len(lines))
-    elif any(ln.strip() for ln in body):
+        flush()
+    elif body and any(ln.strip() for ln in body):
         # No headings at all was handled separately, but keep the fallback safe.
-        segments.append(_Segment("", "", "\n".join(body), 1, len(lines)))
+        segments.append(
+            _Segment(
+                "", "", "\n".join(body),
+                body_start_1based, body_end_1based, list(body),
+            )
+        )
     return segments
 
 
 def _paragraph_segments(lines: list[str]) -> list[_Segment]:
-    """Fallback: split on blank lines into paragraph segments with provenance."""
+    """Fallback: split on blank lines into paragraph segments with provenance.
+
+    The per-paragraph ``lines`` list is retained so ``_split_oversized`` can
+    compute exact ``line_start`` / ``line_end`` for any sub-chunk it produces.
+    """
     # Walk the lines tracking blank-line boundaries.
     segments: list[_Segment] = []
     para: list[str] = []
@@ -214,38 +267,203 @@ def _paragraph_segments(lines: list[str]) -> list[_Segment]:
     for i, line in enumerate(lines):
         if line.strip() == "":
             if para:
-                segments.append(_Segment("", "", "\n".join(para), start + 1, i))
+                segments.append(_Segment("", "", "\n".join(para), start + 1, i, list(para)))
                 para = []
         else:
             if not para:
                 start = i
             para.append(line)
     if para:
-        segments.append(_Segment("", "", "\n".join(para), start + 1, len(lines)))
+        segments.append(_Segment("", "", "\n".join(para), start + 1, len(lines), list(para)))
     return segments
 
 
-def _split_oversized(text: str, max_len: int) -> list[str]:
-    """Split a single block that exceeds ``max_len`` on blank lines if possible,
-    otherwise on sentence boundaries, otherwise hard wrap. Deterministic."""
-    if not max_len or len(text) <= max_len:
-        return [text]
-    parts: list[str] = []
-    for para in _BLANK_LINE_RE.split(text):
-        para = para.strip("\n")
-        if len(para) <= max_len:
-            parts.append(para)
+def _split_oversized(
+    lines: list[str],
+    line_offset: int,
+    max_len: int,
+) -> list[_SplitPart]:
+    """Split a block of lines (a single oversized segment) into sub-chunks.
+
+    This is the central fix for BUG A and BUG B:
+
+    * **BUG A** — every returned :class:`_SplitPart` carries its own
+      ``line_start`` / ``line_end`` derived from the lines of text that
+      actually produced it. Sub-chunks do **not** inherit the parent
+      segment's range. ``line_offset`` is the 1-based line number of
+      ``lines[0]`` in the source document.
+    * **BUG B** — when neither blank-line nor sentence-boundary splitting
+      produces a part whose length fits ``max_len``, a character-level
+      hard-wrap guarantees the invariant
+      ``0 < len(part.chunk_text) <= max_len`` for every emitted part.
+
+    Split order (greedy, applied to the joined text of each paragraph):
+
+    1. **Blank-line split** — paragraphs separated by one or more blank
+       lines are split apart. Each paragraph is emitted if it fits, else
+       it is recursively processed by step 2.
+    2. **Sentence-boundary split** — a paragraph that is still > ``max_len``
+       is split on sentence terminators (``.``, ``!``, ``?``) followed by
+       whitespace. Each sentence group that fits ``max_len`` is emitted;
+       remaining long sentences are processed by step 3.
+    3. **Hard wrap** — the last-resort floor: any remaining chunk whose
+       ``chunk_text`` still exceeds ``max_len`` is sliced into pieces of
+       at most ``max_len`` characters. Each piece carries the same line
+       range as the line it was sliced from (a single very long line can
+       legitimately produce several pieces that all share its 1-based
+       index — the text on that line *is* the source of those pieces).
+    """
+    if not max_len or not lines:
+        return []
+    full_text = "\n".join(lines)
+    if len(full_text) <= max_len:
+        return [
+            _SplitPart(
+                full_text,
+                line_offset,
+                line_offset + len(lines) - 1,
+            )
+        ]
+    return _split_lines_by_blank(lines, line_offset, max_len)
+
+
+def _split_lines_by_blank(
+    lines: list[str],
+    line_offset: int,
+    max_len: int,
+) -> list[_SplitPart]:
+    """Step 1: split ``lines`` into blank-line-separated paragraph groups."""
+    parts: list[_SplitPart] = []
+    cur: list[str] = []
+    cur_start_idx = -1  # -1 sentinel: no paragraph in progress
+    for i, line in enumerate(lines):
+        if line.strip() == "":
+            if cur_start_idx >= 0:
+                parts.extend(
+                    _split_paragraph(cur, line_offset + cur_start_idx, max_len)
+                )
+                cur = []
+                cur_start_idx = -1
+        else:
+            if cur_start_idx < 0:
+                cur_start_idx = i
+            cur.append(line)
+    if cur and cur_start_idx >= 0:
+        parts.extend(
+            _split_paragraph(cur, line_offset + cur_start_idx, max_len)
+        )
+    return parts
+
+
+def _split_paragraph(
+    para_lines: list[str],
+    para_line_start: int,
+    max_len: int,
+) -> list[_SplitPart]:
+    """Step 2 (and 3): split a single paragraph group.
+
+    ``para_line_start`` is the 1-based line number of ``para_lines[0]`` in
+    the source document. Sentences that stay within the same line are
+    emitted together with that line's index; sentence splits that cross
+    line boundaries are not attempted (the existing v1 strategy did not do
+    it either and a sentence can only live on a single line in this
+    grammar).
+    """
+    para_text = "\n".join(para_lines)
+    if len(para_text) <= max_len:
+        return [
+            _SplitPart(
+                para_text,
+                para_line_start,
+                para_line_start + len(para_lines) - 1,
+            )
+        ]
+
+    parts: list[_SplitPart] = []
+    # Strategy 2: sentence split. We split each *line* individually into
+    # sentences (a sentence never spans lines in the v1 grammar) and
+    # pack consecutive sentences into a part until adding the next would
+    # exceed max_len. When a single sentence is itself > max_len, we
+    # fall through to the per-line hard-wrap in step 3.
+    sentence_buf: list[str] = []
+    sentence_buf_lines: list[int] = []  # 1-based line indices contributing
+    sentence_buf_len = 0
+
+    def flush_sentence_buf() -> None:
+        nonlocal sentence_buf, sentence_buf_lines, sentence_buf_len
+        if not sentence_buf:
+            return
+        joined = " ".join(sentence_buf)
+        if len(joined) <= max_len:
+            parts.append(
+                _SplitPart(
+                    joined,
+                    sentence_buf_lines[0],
+                    sentence_buf_lines[-1],
+                )
+            )
+        else:
+            # Step 3: a single sentence (or accumulated group) > max_len.
+            # Walk the contributing lines and hard-wrap each line that
+            # individually exceeds max_len.
+            for line_text, line_idx in zip(sentence_buf, sentence_buf_lines):
+                if len(line_text) <= max_len:
+                    parts.append(_SplitPart(line_text, line_idx, line_idx))
+                else:
+                    parts.extend(_hard_wrap_line(line_text, line_idx, max_len))
+        sentence_buf = []
+        sentence_buf_lines = []
+        sentence_buf_len = 0
+
+    for line_offset_in_para, line_text in enumerate(para_lines):
+        line_idx_1based = para_line_start + line_offset_in_para
+        # Split the line on sentence boundaries. ``re.split`` with a
+        # capturing group returns the delimiters interleaved with pieces.
+        pieces = re.split(r"(?<=[.!?]) +", line_text)
+        if not pieces:
             continue
-        sentences = re.split(r"(?<=[.!?]) +", para)
-        buf = ""
-        for sentence in sentences:
-            if buf and len(buf) + len(sentence) + 1 > max_len:
-                parts.append(buf)
-                buf = sentence
-            else:
-                buf = f"{buf} {sentence}".strip() if buf else sentence
-        if buf:
-            parts.append(buf)
+        for piece in pieces:
+            if not piece:
+                continue
+            if len(piece) > max_len:
+                # Flush whatever fits, then hard-wrap this oversized piece.
+                flush_sentence_buf()
+                parts.extend(_hard_wrap_line(piece, line_idx_1based, max_len))
+                continue
+            # Tentative join: would adding this piece overflow?
+            tentative_len = sentence_buf_len + (1 if sentence_buf else 0) + len(piece)
+            if tentative_len > max_len and sentence_buf:
+                flush_sentence_buf()
+            sentence_buf.append(piece)
+            sentence_buf_lines.append(line_idx_1based)
+            sentence_buf_len = (sentence_buf_len + (1 if len(sentence_buf) > 1 else 0)
+                                + len(piece))
+    flush_sentence_buf()
+    return parts
+
+
+def _hard_wrap_line(
+    line_text: str,
+    line_idx_1based: int,
+    max_len: int,
+) -> list[_SplitPart]:
+    """Step 3: slice ``line_text`` into pieces of at most ``max_len`` chars.
+
+    Every piece maps to the same source line — that line *is* the source
+    of every piece. This is the only place where the splitter crosses a
+    mid-character boundary; it is reached exclusively when neither the
+    blank-line nor the sentence-boundary strategies can bring a part
+    under ``max_len`` (e.g. a 15 000-char token with no whitespace or
+    punctuation, or a 15 000-char single line inside a code fence).
+    """
+    if max_len <= 0:
+        return [_SplitPart(line_text, line_idx_1based, line_idx_1based)]
+    if len(line_text) <= max_len:
+        return [_SplitPart(line_text, line_idx_1based, line_idx_1based)]
+    parts: list[_SplitPart] = []
+    for start in range(0, len(line_text), max_len):
+        piece = line_text[start:start + max_len]
+        parts.append(_SplitPart(piece, line_idx_1based, line_idx_1based))
     return parts
 
 
