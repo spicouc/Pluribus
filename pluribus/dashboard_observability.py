@@ -40,6 +40,7 @@ from urllib.parse import urlparse
 import httpx
 from fastapi import APIRouter, Depends, HTTPException, Query, Request, Response
 
+from pluribus.agent_telemetry import presence_for, work_state_truthful
 from pluribus.config import settings
 from pluribus.db import get_db
 from pluribus.dashboard_session import dashboard_session_authorize
@@ -218,22 +219,63 @@ async def dashboard_summary(_request: Request) -> dict[str, Any]:
 
 @router.get("/agents", dependencies=[Depends(dashboard_session_authorize)])
 async def dashboard_agents(_request: Request) -> dict[str, Any]:
-    """List known agents. ALL telemetry fields are UNKNOWN by default.
+    """List known agents with D2-B telemetry where authoritative
+    sources exist.
 
-    No heuristic inference. The fields exist so the UI can render
-    a uniform table, but no value is fabricated from text matches
-    in historical memory.
+    D2-B truthfulness rules (D2-A approved):
+      - presence  : computed from last_active_at (ONLINE/STALE/OFFLINE/UNKNOWN)
+      - reported_work_state : raw from agents.work_state
+      - work_state : pass-through when ONLINE/STALE; UNKNOWN when OFFLINE
+      - last_known_activity : real timestamp (ISO) or UNKNOWN
+      - current_task: ONLY if the agent has a CLAIMED directive
+      - pending_directive: real data from directives where present
+      - project : real ONLY if the agent has reported current_project
+      - blocker : real ONLY if the agent has reported current_blocker
+                   (NONE = explicit agent reported no blocker; UNKNOWN
+                   = never reported)
+      - last_result: UNKNOWN (D2-C will provide authoritative
+        source via Directives)
+      - active_flag is_admin / is_active, not presence
+
+    No heuristic inference. No memory-text mining. No historical
+    PASS/BLOCKED strings interpreted as current state.
     """
     async with get_db() as db:
         cur = await db.execute(
-            "SELECT id, name, permissions, allowed_scopes, is_active "
-            "FROM agents ORDER BY name"
+            """SELECT id, name, permissions, allowed_scopes, is_active,
+                      last_active_at, work_state, current_task_id,
+                      current_project, current_blocker
+               FROM agents ORDER BY name"""
         )
         rows = await cur.fetchall()
+        # Active CLAIMED directives per agent (current_task).
+        cur = await db.execute(
+            """SELECT target_agent_id, id, action, created_at
+               FROM directives
+               WHERE status = 'claimed'"""
+        )
+        claimed_rows = await cur.fetchall()
+        # PENDING directives per agent.
+        cur = await db.execute(
+            """SELECT target_agent_id, id, action, created_at
+               FROM directives
+               WHERE status = 'pending'
+               ORDER BY created_at DESC"""
+        )
+        pending_rows = await cur.fetchall()
+
+    claimed_by_agent: dict[str, list[tuple]] = {}
+    for tr, did, daction, dcreated in claimed_rows:
+        claimed_by_agent.setdefault(tr, []).append((did, daction, dcreated))
+    pending_by_agent: dict[str, list[tuple]] = {}
+    for tr, did, daction, dcreated in pending_rows:
+        pending_by_agent.setdefault(tr, []).append((did, daction, dcreated))
 
     agents = []
     for row in rows:
-        agent_id, name, perms_json, scopes_json, is_active = row
+        (agent_id, name, perms_json, scopes_json, is_active,
+         last_active_at, work_state, current_task_id,
+         current_project, current_blocker) = row
         try:
             perms = json.loads(perms_json) if perms_json else {}
         except Exception:
@@ -242,24 +284,84 @@ async def dashboard_agents(_request: Request) -> dict[str, Any]:
             scopes = json.loads(scopes_json) if scopes_json else []
         except Exception:
             scopes = []
+
+        # Presence (D2-B)
+        p = presence_for(last_active_at)
+        presence = p["presence"]
+        age = p["age_seconds"]
+
+        # Work state (D2-B)
+        ws = work_state_truthful(work_state, presence)
+        effective_work_state = ws["work_state"]
+        last_reported_work_state = ws["last_reported_work_state"]
+        telemetry_freshness = ws["telemetry_freshness"]
+
+        # current_task: ONLY from a CLAIMED directive or from
+        # current_task_id that matches a directive.
+        claimed = claimed_by_agent.get(agent_id, [])
+        current_task = UNKNOWN
+        current_task_id_val: Any = UNKNOWN
+        if current_task_id and any(d[0] == current_task_id for d in claimed):
+            current_task_id_val = current_task_id
+            current_task = f"directive:{current_task_id}"
+        elif claimed:
+            did, daction, dcreated = claimed[0]
+            current_task_id_val = did
+            current_task = f"directive:{did}"
+
+        # pending_directive (D1 truthfulness — separate from current_task)
+        pending = pending_by_agent.get(agent_id, [])
+        pending_directive = None
+        if pending:
+            did, daction, dcreated = pending[0]
+            pending_directive = {
+                "id":          did,
+                "action":      daction,
+                "created_at":  dcreated,
+            }
+
+        # last_known_activity: real timestamp or UNKNOWN
+        last_known_activity = last_active_at if last_active_at else UNKNOWN
+
+        # project: ONLY from explicit current_project; UNKNOWN if not reported.
+        # The directive scope lives in the directive row; we do not
+        # mine it. Project = explicit agent telemetry.
+        project = current_project if current_project else UNKNOWN
+        # blocker: explicit current_blocker. Documented semantics:
+        #   current_blocker == None or empty -> NONE
+        #   current_blocker set -> that string
+        #   never reported -> UNKNOWN
+        if current_blocker is None or current_blocker == "":
+            blocker = "NONE" if last_active_at else UNKNOWN
+        else:
+            blocker = current_blocker
+
         agents.append({
-            "name":                name,
-            "identity":            agent_id,
-            "active_flag":         bool(is_active),
-            "online_now":          UNKNOWN,
-            "last_known_activity": UNKNOWN,
-            "current_task":        UNKNOWN,
-            "pending_directive":   None,
-            "project":             UNKNOWN,
-            "blocker":             UNKNOWN,
-            "last_result":         UNKNOWN,
-            "registered_at":       UNKNOWN,
-            "allowed_scopes":      scopes,
-            "permissions":         perms,
+            "name":                    name,
+            "identity":                agent_id,
+            "active_flag":             bool(is_active),
+            "presence":                presence,
+            "last_known_activity":     last_known_activity,
+            "age_seconds":             age,
+            "telemetry_freshness":     telemetry_freshness,
+            "reported_work_state":     last_reported_work_state,
+            "work_state":              effective_work_state,
+            "current_task":            current_task,
+            "current_task_id":         current_task_id_val,
+            "pending_directive":       pending_directive,
+            "project":                 project,
+            "blocker":                 blocker,
+            "last_result":             UNKNOWN,  # D2-C: authoritative Directives
+            "allowed_scopes":          scopes,
+            "permissions":             perms,
         })
 
-    return {"agents": agents, "count": len(agents),
-            "source": "pluribus_identity", "last_update": _now_iso()}
+    return {
+        "agents":       agents,
+        "count":        len(agents),
+        "source":       "pluribus_telemetry",
+        "last_update":  _now_iso(),
+    }
 
 
 # --- /v1/dashboard/memory ------------------------------------------------

@@ -4,11 +4,16 @@ from __future__ import annotations
 
 import json
 import uuid
-from typing import Any
+from typing import Any, Optional
 
 import bcrypt
 from fastapi import APIRouter, HTTPException, Request
+from pydantic import BaseModel, Field
 
+from pluribus.agent_telemetry import (
+    normalize_work_state,
+    validate_heartbeat_field,
+)
 from pluribus.api_keys import fingerprint_api_key, generate_api_key
 from pluribus.db import get_db
 from pluribus.models import (
@@ -103,16 +108,74 @@ async def get_agent(request: Request, agent_id: str) -> AgentResponse:
 
 @router.patch("/{agent_id}/heartbeat", status_code=204)
 async def agent_heartbeat(request: Request, agent_id: str) -> None:
+    """Update the agent's current-state telemetry.
+
+    Self-only: the authenticated agent.id must equal path agent_id,
+    otherwise 403. The server always updates last_active_at with
+    SERVER time (datetime('now')) — never trust a client timestamp
+    for presence classification.
+
+    All body fields are optional. If a field is omitted, the
+    existing value is preserved. If a field is explicitly null OR
+    an empty string, the value is cleared (set to NULL).
+
+    Heartbeat does NOT create a fact in Memory. Telemetry is
+    ephemeral; authoritative history lives in Directives.
+    """
     agent: dict[str, Any] = request.state.agent
     if agent["id"] != agent_id:
         raise HTTPException(status_code=403, detail="Només pots fer heartbeat del teu propi agent")
 
+    body: dict[str, Any] = {}
+    try:
+        if request.headers.get("content-type", "").startswith("application/json"):
+            body = await request.json()
+            if not isinstance(body, dict):
+                raise ValueError("body must be a JSON object")
+    except Exception:
+        body = {}
+
+    work_state_raw = body.get("work_state", "__OMIT__")
+    if work_state_raw == "__OMIT__":
+        ws_value: Optional[str] = None  # skip
+        ws_set = False
+    else:
+        ws_value = normalize_work_state(work_state_raw)
+        if ws_value is None and work_state_raw is not None and work_state_raw != "":
+            raise HTTPException(
+                status_code=422,
+                detail="work_state invalid; allowed: IDLE, WORKING, BLOCKED, WAITING, ERROR, UNKNOWN",
+            )
+        # empty string or null -> clear to UNKNOWN (set to NULL handled
+        # by update). Omit -> skip (preserves prior).
+        ws_set = True
+
+    extra: dict[str, str] = {}
+    for fld in ("current_task_id", "current_project", "current_blocker"):
+        raw = body.get(fld, "__OMIT__")
+        if raw == "__OMIT__":
+            continue  # skip -> preserve prior
+        ok, normalized = validate_heartbeat_field(fld, raw)
+        if not ok:
+            raise HTTPException(status_code=422, detail=f"{fld} invalid (type or length)")
+        extra[fld] = "" if normalized is None else normalized
+
     client_host = request.client.host if request.client else "unknown"
     async with get_db() as db:
-        await db.execute(
-            "UPDATE agents SET last_active_at = datetime('now'), last_ip = ? WHERE id = ? AND is_active = 1",
-            (client_host, agent_id),
-        )
+        # Always update last_active_at + last_ip with SERVER time.
+        updates = ["last_active_at = datetime('now')", "last_ip = ?"]
+        params: list[Any] = [client_host]
+        if ws_set:
+            updates.append("work_state = ?")
+            # Empty string and None both mean "clear" -> write NULL.
+            params.append(None if ws_value is None else ws_value)
+        for k, v in extra.items():
+            updates.append(f"{k} = ?")
+            params.append(None if v == "" else v)
+        params.append(agent_id)
+        sql = (f"UPDATE agents SET {', '.join(updates)} "
+               "WHERE id = ? AND is_active = 1")
+        await db.execute(sql, params)
         await db.commit()
 
 

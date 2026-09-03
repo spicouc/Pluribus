@@ -53,6 +53,20 @@ async def _migrate_db() -> None:
                WHERE api_key_fingerprint IS NOT NULL"""
         )
 
+        # D2-B: current-state telemetry columns (additive, idempotent).
+        # These are explicit CURRENT-STATE fields, not historical
+        # memory. They overwrite on each heartbeat. Do NOT use them
+        # as authoritative sources for past results — see directives.
+        agent_telemetry_cols = {
+            "work_state":      "ALTER TABLE agents ADD COLUMN work_state TEXT DEFAULT 'UNKNOWN'",
+            "current_task_id": "ALTER TABLE agents ADD COLUMN current_task_id TEXT",
+            "current_project": "ALTER TABLE agents ADD COLUMN current_project TEXT",
+            "current_blocker": "ALTER TABLE agents ADD COLUMN current_blocker TEXT",
+        }
+        for col, sql in agent_telemetry_cols.items():
+            if col not in agent_columns:
+                await db.execute(sql)
+
         # Webhook security/delivery columns are migrated before the app starts,
         # avoiding concurrent first-request ALTER TABLE races. Legacy helper
         # migration in webhooks.py remains as a defensive compatibility layer.

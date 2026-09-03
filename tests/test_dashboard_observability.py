@@ -73,7 +73,11 @@ def _seed_agent_sync(agent_id: str, key: str, name: str,
 def _init_db_sync() -> None:
     if _DB.exists():
         _DB.unlink()
-    asyncio.run(init_db())
+    async def _go():
+        await init_db()
+        from pluribus.directives_schema import init_directives_db
+        await init_directives_db()
+    asyncio.run(_go())
 
 
 def _seed_secret_fixtures() -> None:
@@ -193,22 +197,30 @@ class DashboardObservabilityTests(unittest.TestCase):
         self.assertIn("agents", j)
         self.assertIsInstance(j["agents"], list)
         for a in j["agents"]:
-            for k in ("name", "identity", "active_flag", "allowed_scopes", "online_now"):
+            for k in ("name", "identity", "active_flag", "allowed_scopes", "presence"):
                 self.assertIn(k, a, f"agent missing {k}: {a}")
-            self.assertIn(a["online_now"], ("YES", "NO", "UNKNOWN"))
+            self.assertIn(a["presence"], ("ONLINE", "STALE", "OFFLINE", "UNKNOWN"))
 
-    def test_d1_04_unknown_telemetry_is_never_fabricated(self) -> None:
+    def test_d1_04_unknown_telemetry_when_no_heartbeat(self) -> None:
+        """When the agent has not sent a heartbeat, the dashboard
+        reports presence=UNKNOWN, work_state=UNKNOWN, current_task=UNKNOWN,
+        project=UNKNOWN, last_known_activity=UNKNOWN. This is the
+        D1 truthfulness rule carried into D2-B: telemetry is only
+        real when the agent has explicitly reported it."""
         c = self._client
         cookies = _login(c)
         r = c.get("/v1/dashboard/agents", cookies=cookies)
         self.assertEqual(r.status_code, 200)
         j = r.json()
         for a in j["agents"]:
+            self.assertEqual(a.get("presence"), "UNKNOWN")
+            self.assertEqual(a.get("work_state"), "UNKNOWN")
             self.assertEqual(a.get("current_task"), "UNKNOWN")
             self.assertEqual(a.get("project"), "UNKNOWN")
             self.assertEqual(a.get("blocker"), "UNKNOWN")
             self.assertEqual(a.get("last_result"), "UNKNOWN")
             self.assertEqual(a.get("last_known_activity"), "UNKNOWN")
+            self.assertIsNone(a.get("pending_directive"))
 
     def test_d1_05_memory_latest_works(self) -> None:
         c = self._client
@@ -753,3 +765,415 @@ class DashboardObservabilityTests(unittest.TestCase):
         r = self._client.get("/v1/dashboard/summary", headers={"X-API-Key": "wrong-key-12345678901234567890"})
         self.assertEqual(r.status_code, 401, r.text[:200])
         self.assertIn("Clau API inv", r.json().get("detail", "") or r.text)
+
+    # ====== D2-B: AGENT TELEMETRY FOUNDATION =========================
+    def test_d2_01_heartbeat_updates_last_active_at(self) -> None:
+        """Heartbeat updates last_active_at with SERVER time (not a
+        client-supplied value)."""
+        # Pre-seed: no last_active_at
+        c = self._client
+        # The setUp() has already created the agent
+        # Issue a heartbeat via the agents router
+        r = c.patch("/v1/agents/d1-test-agent/heartbeat", headers={"X-API-Key": KEY})
+        self.assertEqual(r.status_code, 204, r.text[:200])
+        # The dashboard now shows the agent with a real presence
+        cookies = _login(c)
+        r = c.get("/v1/dashboard/agents", cookies=cookies)
+        self.assertEqual(r.status_code, 200)
+        agents = {a["identity"]: a for a in r.json()["agents"]}
+        self.assertIn("d1-test-agent", agents)
+        a = agents["d1-test-agent"]
+        self.assertIn(a["presence"], ("ONLINE", "STALE"))
+        # last_known_activity is a real timestamp, not UNKNOWN
+        self.assertNotEqual(a["last_known_activity"], "UNKNOWN")
+        self.assertIsNotNone(a["last_known_activity"])
+        self.assertIsNotNone(a["age_seconds"])
+
+    def test_d2_02_agent_can_update_own_telemetry(self) -> None:
+        """An agent can PATCH its own heartbeat with telemetry fields."""
+        c = self._client
+        r = c.patch("/v1/agents/d1-test-agent/heartbeat", headers={"X-API-Key": KEY},
+                    json={"work_state": "WORKING",
+                          "current_project": "D2-B",
+                          "current_blocker": "",
+                          "current_task_id": "dir-1"})
+        self.assertEqual(r.status_code, 204, r.text[:200])
+        # Verify via dashboard
+        cookies = _login(c)
+        r = c.get("/v1/dashboard/agents", cookies=cookies)
+        agents = {a["identity"]: a for a in r.json()["agents"]}
+        a = agents["d1-test-agent"]
+        self.assertEqual(a["work_state"], "WORKING")
+        self.assertEqual(a["project"], "D2-B")
+        # current_blocker = "" means "explicit NONE" (D2-B semantics)
+        self.assertEqual(a["blocker"], "NONE")
+
+    def test_d2_03_agent_cannot_update_another_agent_telemetry(self) -> None:
+        """Self-only rule: agent A cannot heartbeat for agent B."""
+        c = self._client
+        r = c.patch("/v1/agents/d1-noread-agent/heartbeat", headers={"X-API-Key": KEY},
+                    json={"work_state": "WORKING"})
+        self.assertEqual(r.status_code, 403, r.text[:200])
+        # Verify the other agent is unchanged
+        cookies = _login(c)
+        r = c.get("/v1/dashboard/agents", cookies=cookies)
+        agents = {a["identity"]: a for a in r.json()["agents"]}
+        # The no-read agent should still show UNKNOWN
+        noread = agents.get("d1-noread-agent")
+        if noread:
+            self.assertEqual(noread["presence"], "UNKNOWN")
+
+    def test_d2_04_omitted_work_state_preserves_existing(self) -> None:
+        """If a heartbeat body omits work_state, the previous value
+        is preserved (do NOT default to IDLE)."""
+        c = self._client
+        # First heartbeat: WORKING
+        r = c.patch("/v1/agents/d1-test-agent/heartbeat", headers={"X-API-Key": KEY},
+                    json={"work_state": "WORKING"})
+        self.assertEqual(r.status_code, 204, r.text[:200])
+        # Second heartbeat: no body
+        r = c.patch("/v1/agents/d1-test-agent/heartbeat", headers={"X-API-Key": KEY})
+        self.assertEqual(r.status_code, 204, r.text[:200])
+        # Verify work_state is still WORKING (preserved)
+        cookies = _login(c)
+        r = c.get("/v1/dashboard/agents", cookies=cookies)
+        agents = {a["identity"]: a for a in r.json()["agents"]}
+        a = agents["d1-test-agent"]
+        self.assertEqual(a["work_state"], "WORKING",
+                         f"omitted work_state should preserve prior; got {a['work_state']!r}")
+
+    def test_d2_05_explicit_idle_sets_idle(self) -> None:
+        """An explicit work_state=IDLE sets IDLE (overrides previous)."""
+        c = self._client
+        # Set to WORKING
+        c.patch("/v1/agents/d1-test-agent/heartbeat", headers={"X-API-Key": KEY},
+               json={"work_state": "WORKING"})
+        # Then set to IDLE explicitly
+        r = c.patch("/v1/agents/d1-test-agent/heartbeat", headers={"X-API-Key": KEY},
+                    json={"work_state": "IDLE"})
+        self.assertEqual(r.status_code, 204, r.text[:200])
+        cookies = _login(c)
+        r = c.get("/v1/dashboard/agents", cookies=cookies)
+        agents = {a["identity"]: a for a in r.json()["agents"]}
+        self.assertEqual(agents["d1-test-agent"]["work_state"], "IDLE")
+
+    def test_d2_06_invalid_work_state_rejected(self) -> None:
+        """An invalid work_state is rejected with 422."""
+        c = self._client
+        r = c.patch("/v1/agents/d1-test-agent/heartbeat", headers={"X-API-Key": KEY},
+                    json={"work_state": "BUSY"})  # not in the allowed list
+        self.assertEqual(r.status_code, 422, r.text[:200])
+        # The value is NOT saved
+        cookies = _login(c)
+        r = c.get("/v1/dashboard/agents", cookies=cookies)
+        agents = {a["identity"]: a for a in r.json()["agents"]}
+        a = agents["d1-test-agent"]
+        # work_state was UNKNOWN and is still UNKNOWN (no successful save)
+        self.assertNotEqual(a["work_state"], "BUSY")
+
+    def test_d2_07_presence_unknown_without_heartbeat(self) -> None:
+        """An agent that has never sent a heartbeat shows presence=UNKNOWN."""
+        c = self._client
+        # Create a new agent
+        import asyncio
+        async def _seed():
+            from pluribus.db import get_db
+            new_key = "fresh-key-CCCCCCCCCCCCCCCCCCCCCCC"
+            new_hash = bcrypt.hashpw(new_key.encode("utf-8"),
+                                     bcrypt.gensalt(rounds=4)).decode("utf-8")
+            async with get_db() as db:
+                await db.execute(
+                    "INSERT OR REPLACE INTO agents (id, name, api_key_hash, api_key_fingerprint, permissions, allowed_scopes, is_active) VALUES (?, ?, ?, ?, ?, ?, 1)",
+                    ("fresh-agent", "fresh", new_hash,
+                     fingerprint_api_key(new_key),
+                     json.dumps({"read": True}), json.dumps(["shared"])),
+                )
+                await db.commit()
+        asyncio.run(_seed())
+        # No heartbeat sent — presence should be UNKNOWN
+        cookies = _login(c)
+        r = c.get("/v1/dashboard/agents", cookies=cookies)
+        agents = {a["identity"]: a for a in r.json()["agents"]}
+        self.assertEqual(agents["fresh-agent"]["presence"], "UNKNOWN")
+        self.assertEqual(agents["fresh-agent"]["work_state"], "UNKNOWN")
+        self.assertEqual(agents["fresh-agent"]["last_known_activity"], "UNKNOWN")
+
+    def test_d2_08_presence_online(self) -> None:
+        """A recent heartbeat (age <= 60s) -> presence=ONLINE."""
+        c = self._client
+        r = c.patch("/v1/agents/d1-test-agent/heartbeat", headers={"X-API-Key": KEY})
+        self.assertEqual(r.status_code, 204)
+        # Force the last_active_at to a very recent time (now)
+        # (the patch already did this with server time)
+        cookies = _login(c)
+        r = c.get("/v1/dashboard/agents", cookies=cookies)
+        a = {x["identity"]: x for x in r.json()["agents"]}["d1-test-agent"]
+        self.assertEqual(a["presence"], "ONLINE",
+                         f"age_seconds={a['age_seconds']} -> presence {a['presence']}")
+
+    def test_d2_09_presence_stale(self) -> None:
+        """last_active_at between 60s and 300s ago -> presence=STALE."""
+        c = self._client
+        # Send a heartbeat to set last_active_at = now
+        c.patch("/v1/agents/d1-test-agent/heartbeat", headers={"X-API-Key": KEY})
+        # Then forcibly set last_active_at to 120 seconds ago
+        import asyncio
+        async def _set_stale():
+            from pluribus.db import get_db
+            from datetime import datetime, timezone, timedelta
+            t = (datetime.now(timezone.utc) - timedelta(seconds=120)).strftime(
+                "%Y-%m-%d %H:%M:%S")
+            async with get_db() as db:
+                await db.execute(
+                    "UPDATE agents SET last_active_at = ? WHERE id = ?",
+                    (t, "d1-test-agent"),
+                )
+                await db.commit()
+        asyncio.run(_set_stale())
+        cookies = _login(c)
+        r = c.get("/v1/dashboard/agents", cookies=cookies)
+        a = {x["identity"]: x for x in r.json()["agents"]}["d1-test-agent"]
+        self.assertEqual(a["presence"], "STALE",
+                         f"expected STALE (age={a['age_seconds']}s); got {a['presence']}")
+        # Work state still works (STALE is not OFFLINE)
+        # We did not set work_state so it should be UNKNOWN
+        self.assertEqual(a["work_state"], "UNKNOWN")
+
+    def test_d2_10_presence_offline(self) -> None:
+        """last_active_at > 300s ago -> presence=OFFLINE."""
+        c = self._client
+        c.patch("/v1/agents/d1-test-agent/heartbeat", headers={"X-API-Key": KEY})
+        import asyncio
+        async def _set_offline():
+            from pluribus.db import get_db
+            from datetime import datetime, timezone, timedelta
+            t = (datetime.now(timezone.utc) - timedelta(seconds=600)).strftime(
+                "%Y-%m-%d %H:%M:%S")
+            async with get_db() as db:
+                await db.execute(
+                    "UPDATE agents SET last_active_at = ? WHERE id = ?",
+                    (t, "d1-test-agent"),
+                )
+                await db.commit()
+        asyncio.run(_set_offline())
+        cookies = _login(c)
+        r = c.get("/v1/dashboard/agents", cookies=cookies)
+        a = {x["identity"]: x for x in r.json()["agents"]}["d1-test-agent"]
+        self.assertEqual(a["presence"], "OFFLINE",
+                         f"expected OFFLINE (age={a['age_seconds']}s); got {a['presence']}")
+
+    def test_d2_11_is_active_does_not_imply_online(self) -> None:
+        """D1 regression rule: an active agent that has never sent
+        a heartbeat is NOT online. is_active == 1 but presence == UNKNOWN."""
+        c = self._client
+        # Create a fresh agent (is_active=1, no heartbeat)
+        import asyncio
+        async def _seed():
+            from pluribus.db import get_db
+            new_key = "active-only-key-EEEEEEEEEEEEEEEEEEE"
+            new_hash = bcrypt.hashpw(new_key.encode("utf-8"),
+                                     bcrypt.gensalt(rounds=4)).decode("utf-8")
+            async with get_db() as db:
+                await db.execute(
+                    "INSERT OR REPLACE INTO agents (id, name, api_key_hash, api_key_fingerprint, permissions, allowed_scopes, is_active) VALUES (?, ?, ?, ?, ?, ?, 1)",
+                    ("active-only", "active-only", new_hash,
+                     fingerprint_api_key(new_key),
+                     json.dumps({"read": True}), json.dumps(["shared"])),
+                )
+                await db.commit()
+        asyncio.run(_seed())
+        cookies = _login(c)
+        r = c.get("/v1/dashboard/agents", cookies=cookies)
+        a = {x["identity"]: x for x in r.json()["agents"]}["active-only"]
+        self.assertTrue(a["active_flag"])
+        self.assertEqual(a["presence"], "UNKNOWN")  # NOT online
+
+    def test_d2_12_pending_directive_not_current_task(self) -> None:
+        """D1 truthfulness: a PENDING directive is shown as
+        pending_directive, NEVER as current_task."""
+        c = self._client
+        # Send a heartbeat so the agent is not UNKNOWN
+        c.patch("/v1/agents/d1-test-agent/heartbeat", headers={"X-API-Key": KEY})
+        # Insert a pending directive targeting the agent
+        import asyncio
+        async def _seed_directive():
+            from pluribus.db import get_db
+            async with get_db() as db:
+                await db.execute(
+                    """INSERT INTO directives
+                       (id, issuer_agent_id, target_agent_id, scope, action,
+                        arguments, required_capability, status, expires_at)
+                       VALUES (?, ?, ?, ?, ?, ?, ?, 'pending', datetime('now', '+1 day'))""",
+                    ("dir-pending-1", "issuer", "d1-test-agent",
+                     "shared", "test_action", "{}", "test_cap"),
+                )
+                await db.commit()
+        asyncio.run(_seed_directive())
+        cookies = _login(c)
+        r = c.get("/v1/dashboard/agents", cookies=cookies)
+        a = {x["identity"]: x for x in r.json()["agents"]}["d1-test-agent"]
+        # current_task remains UNKNOWN
+        self.assertEqual(a["current_task"], "UNKNOWN")
+        # pending_directive shows the pending one
+        self.assertIsNotNone(a["pending_directive"])
+        self.assertEqual(a["pending_directive"]["id"], "dir-pending-1")
+
+    def test_d2_13_historical_memory_cannot_populate_state(self) -> None:
+        """D1 regression: a fact mentioning 'BLOCKED' or 'PASS' or
+        'project=foo' in historical memory must NOT populate
+        blocker / last_result / project on the agent."""
+        c = self._client
+        c.patch("/v1/agents/d1-test-agent/heartbeat", headers={"X-API-Key": KEY})
+        # Insert noisy historical facts
+        import asyncio
+        async def _seed_facts():
+            from pluribus.db import get_db
+            async with get_db() as db:
+                await db.execute(
+                    "INSERT INTO facts (scope, category, key, content, agent_id, created_at) VALUES (?, ?, ?, ?, ?, ?)",
+                    ("shared", "events", "old_blocked",
+                     "BLOCKED in 2025 (long since resolved)", None,
+                     "2025-01-01 00:00:00"),
+                )
+                await db.execute(
+                    "INSERT INTO facts (scope, category, key, content, agent_id, created_at) VALUES (?, ?, ?, ?, ?, ?)",
+                    ("shared", "events", "old_pass",
+                     "PASS last week", None, "2025-01-02 00:00:00"),
+                )
+                await db.execute(
+                    "INSERT INTO facts (scope, category, key, content, agent_id, created_at) VALUES (?, ?, ?, ?, ?, ?)",
+                    ("shared", "events", "old_project",
+                     "project=xerrameca mentioned here", None,
+                     "2025-01-03 00:00:00"),
+                )
+                await db.commit()
+        asyncio.run(_seed_facts())
+        cookies = _login(c)
+        r = c.get("/v1/dashboard/agents", cookies=cookies)
+        a = {x["identity"]: x for x in r.json()["agents"]}["d1-test-agent"]
+        # None of the historical text became authoritative state
+        self.assertEqual(a["blocker"], "NONE")  # No current_blocker set
+        self.assertNotIn("xerrameca", (a["project"] or "").lower())
+        self.assertEqual(a["last_result"], "UNKNOWN")
+
+    def test_d2_14_offline_old_working_not_presented_as_fresh(self) -> None:
+        """D2 freshness: an OFFLINE agent that last reported WORKING
+        must NOT show work_state=WORKING as fresh. effective
+        work_state = UNKNOWN; last_reported_work_state preserves
+        the historical value."""
+        c = self._client
+        # Report WORKING, then go offline
+        c.patch("/v1/agents/d1-test-agent/heartbeat", headers={"X-API-Key": KEY},
+               json={"work_state": "WORKING"})
+        import asyncio
+        async def _offline():
+            from pluribus.db import get_db
+            from datetime import datetime, timezone, timedelta
+            t = (datetime.now(timezone.utc) - timedelta(seconds=600)).strftime(
+                "%Y-%m-%d %H:%M:%S")
+            async with get_db() as db:
+                await db.execute(
+                    "UPDATE agents SET last_active_at = ? WHERE id = ?",
+                    (t, "d1-test-agent"),
+                )
+                await db.commit()
+        asyncio.run(_offline())
+        cookies = _login(c)
+        r = c.get("/v1/dashboard/agents", cookies=cookies)
+        a = {x["identity"]: x for x in r.json()["agents"]}["d1-test-agent"]
+        self.assertEqual(a["presence"], "OFFLINE")
+        # effective work_state is UNKNOWN (NOT WORKING as fresh)
+        self.assertEqual(a["work_state"], "UNKNOWN")
+        # but the last reported is preserved
+        self.assertEqual(a["reported_work_state"], "WORKING")
+        self.assertEqual(a["telemetry_freshness"], "OFFLINE")
+
+    def test_d2_15_current_project_explicit_only(self) -> None:
+        """project is set ONLY when the agent reports current_project
+        explicitly. Otherwise UNKNOWN."""
+        c = self._client
+        # No heartbeat yet
+        cookies = _login(c)
+        r = c.get("/v1/dashboard/agents", cookies=cookies)
+        a = {x["identity"]: x for x in r.json()["agents"]}["d1-test-agent"]
+        self.assertEqual(a["project"], "UNKNOWN")
+        # Heartbeat with project
+        c.patch("/v1/agents/d1-test-agent/heartbeat", headers={"X-API-Key": KEY},
+               json={"current_project": "D2-B"})
+        r = c.get("/v1/dashboard/agents", cookies=cookies)
+        a = {x["identity"]: x for x in r.json()["agents"]}["d1-test-agent"]
+        self.assertEqual(a["project"], "D2-B")
+
+    def test_d2_16_blocker_distinguishes_none_from_unknown(self) -> None:
+        """blocker = NONE if the agent explicitly reported no blocker
+        (empty string). blocker = UNKNOWN if the agent has never
+        reported. blocker = <string> if reported."""
+        c = self._client
+        # Heartbeat with empty current_blocker -> NONE
+        c.patch("/v1/agents/d1-test-agent/heartbeat", headers={"X-API-Key": KEY},
+               json={"current_blocker": ""})
+        cookies = _login(c)
+        r = c.get("/v1/dashboard/agents", cookies=cookies)
+        a = {x["identity"]: x for x in r.json()["agents"]}["d1-test-agent"]
+        self.assertEqual(a["blocker"], "NONE")
+        # Clear the agent and check UNKNOWN
+        import asyncio
+        async def _clear():
+            from pluribus.db import get_db
+            async with get_db() as db:
+                await db.execute(
+                    "UPDATE agents SET last_active_at = NULL, current_blocker = NULL WHERE id = ?",
+                    ("d1-test-agent",),
+                )
+                await db.commit()
+        asyncio.run(_clear())
+        r = c.get("/v1/dashboard/agents", cookies=cookies)
+        a = {x["identity"]: x for x in r.json()["agents"]}["d1-test-agent"]
+        self.assertEqual(a["blocker"], "UNKNOWN")
+        # Now report an explicit blocker
+        c.patch("/v1/agents/d1-test-agent/heartbeat", headers={"X-API-Key": KEY},
+               json={"current_blocker": "API rate limited"})
+        r = c.get("/v1/dashboard/agents", cookies=cookies)
+        a = {x["identity"]: x for x in r.json()["agents"]}["d1-test-agent"]
+        self.assertEqual(a["blocker"], "API rate limited")
+
+    def test_d2_17_heartbeat_does_not_create_memory_fact(self) -> None:
+        """D2 architectural invariant: heartbeats do not create
+        facts in Memory."""
+        c = self._client
+        # Count facts before
+        import asyncio
+        async def _count_facts():
+            from pluribus.db import get_db
+            async with get_db() as db:
+                cur = await db.execute("SELECT count(*) FROM facts")
+                row = await cur.fetchone()
+                return row[0]
+        before = asyncio.run(_count_facts())
+        # Send a heartbeat
+        c.patch("/v1/agents/d1-test-agent/heartbeat", headers={"X-API-Key": KEY},
+               json={"work_state": "WORKING"})
+        after = asyncio.run(_count_facts())
+        self.assertEqual(after, before, "heartbeat must not create a fact")
+
+    def test_d2_18_server_timestamp_controls_heartbeat_freshness(self) -> None:
+        """The server controls last_active_at with datetime('now'),
+        not the client. We verify by sending a heartbeat and
+        confirming the timestamp is recent (not some old value)."""
+        c = self._client
+        from datetime import datetime, timezone
+        before = datetime.now(timezone.utc)
+        c.patch("/v1/agents/d1-test-agent/heartbeat", headers={"X-API-Key": KEY},
+               json={"work_state": "WORKING"})
+        after = datetime.now(timezone.utc)
+        # Verify the last_active_at is between before and after
+        cookies = _login(c)
+        r = c.get("/v1/dashboard/agents", cookies=cookies)
+        a = {x["identity"]: x for x in r.json()["agents"]}["d1-test-agent"]
+        last = datetime.strptime(a["last_known_activity"],
+                                 "%Y-%m-%d %H:%M:%S").replace(tzinfo=timezone.utc)
+        # last_active_at should be very close to "now"
+        self.assertLessEqual((last - before).total_seconds(), 5,
+                             f"server timestamp not in [before, after] window; diff={(last-before).total_seconds()}")
+        self.assertLessEqual((after - last).total_seconds(), 5,
+                             f"server timestamp not in [before, after] window; diff={(after-last).total_seconds()}")
