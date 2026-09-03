@@ -35,6 +35,7 @@ operator running `curl`). The browser never sees it.
 
 from __future__ import annotations
 
+import hashlib
 import hmac
 import json
 import os
@@ -55,6 +56,11 @@ from pluribus.db import get_db
 SESSION_COOKIE_NAME = "pluribus_dashboard_session"
 SESSION_TTL_SECONDS = 30 * 60  # 30 minutes — FIXED lifetime
 LOGIN_CODE_TTL_SECONDS = 90     # 90 seconds, single use
+LOGIN_CODE_BYTES = 16           # 16 bytes = 128 bits of entropy. The code is
+                                # a copy/paste token, not typed manually.
+LOGIN_CODE_MAX_ATTEMPTS_PER_IP = 5
+LOGIN_CODE_RATE_WINDOW_SECONDS = 60
+LOGIN_CODE_MAX_ATTEMPTS_GLOBAL = 60   # global ceiling per window
 
 
 # --- DB schema for sessions + login codes --------------------------------
@@ -87,6 +93,16 @@ async def _ensure_dashboard_tables() -> None:
         await db.execute(
             "CREATE INDEX IF NOT EXISTS idx_dashboard_login_codes_expires "
             "ON dashboard_login_codes(expires_at)"
+        )
+        # Rate-limit tracking for POST /dashboard/login. Per-IP
+        # counter (sliding window) plus a global counter as a safety
+        # net against distributed brute force.
+        await db.execute(
+            """CREATE TABLE IF NOT EXISTS dashboard_login_attempts (
+                key TEXT PRIMARY KEY,
+                window_start INTEGER NOT NULL,
+                count INTEGER NOT NULL
+            )"""
         )
         await db.commit()
 
@@ -144,26 +160,25 @@ async def _delete_session(token: str) -> None:
 
 
 def _hash_code(code: str) -> str:
-    """Hash the login code with the API key fingerprint of the agent
-    who issued it, so even if the codes table leaks, codes can't be
-    used to impersonate other agents."""
-    # Use HMAC-SHA256 with a server-side pepper. The pepper is the
-    # DB path + a static random salt generated on first use and
-    # cached in settings (kept simple here — the agent_id is mixed
-    # into the hash so codes are bound to a specific agent row).
-    return hmac.new(
-        (settings.DB_PATH or "pluribus").encode("utf-8"),
-        code.encode("utf-8"),
-        "sha256",
-    ).hexdigest()
+    """Hash the raw login code with SHA-256 for DB storage.
+
+    The raw code is never persisted — only this digest. The code
+    itself carries 128 bits of entropy from ``secrets.token_urlsafe``,
+    so an HMAC pepper is unnecessary. (We previously used the DB
+    path as a fake "pepper"; that is configuration metadata, not
+    a cryptographic secret, and is not appropriate here.)
+    """
+    return hashlib.sha256(code.encode("utf-8")).hexdigest()
 
 
 async def _issue_login_code(agent_id: str) -> tuple[str, int]:
-    """Create a fresh one-time login code, return (code, expires_in_s)."""
+    """Create a fresh one-time login code, return (code, ttl_seconds).
+
+    Code: ``secrets.token_urlsafe(16)`` → 22-character URL-safe
+    string → 128 bits of entropy. Copy/paste only, never typed.
+    """
     await _ensure_dashboard_tables()
-    # 6 random bytes → 8-char base32 (Crockford-style). 64 bits is
-    # well within the brute-force-resistant range for a 90-second TTL.
-    code = secrets.token_hex(3).upper()  # 6 hex chars, e.g. "3A7F1B"
+    code = secrets.token_urlsafe(LOGIN_CODE_BYTES)  # 16 bytes → 22 chars
     code_hash = _hash_code(code)
     now = int(time.time())
     expires = now + LOGIN_CODE_TTL_SECONDS
@@ -210,6 +225,65 @@ async def _consume_login_code(code: str) -> Optional[str]:
         row = await cur2.fetchone()
         await db.commit()
     return row[0] if row else None
+
+
+# --- Rate limiting for /dashboard/login ----------------------------------
+
+
+async def _check_and_record_login_attempt(
+    client_host: str,
+    success: bool,
+) -> tuple[bool, int]:
+    """Record a login attempt and report whether the request must be
+    rejected by rate limit. Returns (allowed, count_in_window).
+
+    Per-IP: at most ``LOGIN_CODE_MAX_ATTEMPTS_PER_IP`` per
+    ``LOGIN_CODE_RATE_WINDOW_SECONDS`` seconds.
+    Global ceiling: ``LOGIN_CODE_MAX_ATTEMPTS_GLOBAL`` per window.
+
+    Successful attempts are NOT counted against the per-IP or
+    global limit. (We only want to throttle brute force.)
+    """
+    if success:
+        return True, 0
+    now = int(time.time())
+    window = LOGIN_CODE_RATE_WINDOW_SECONDS
+    # We keep the counter in a single row per (key, window) by
+    # flooring `now` to the window start. This is a sliding
+    # approximation: a window of 60s means the counter resets at
+    # most 60s after the first attempt.
+    window_start = (now // window) * window
+    async with get_db() as db:
+        async def _bump(key: str) -> int:
+            await db.execute(
+                """INSERT INTO dashboard_login_attempts (key, window_start, count)
+                   VALUES (?, ?, 1)
+                   ON CONFLICT(key) DO UPDATE SET
+                       count = CASE
+                           WHEN dashboard_login_attempts.window_start = excluded.window_start
+                               THEN dashboard_login_attempts.count + 1
+                           ELSE 1
+                       END,
+                       window_start = excluded.window_start""",
+                (key, window_start),
+            )
+            cur = await db.execute(
+                "SELECT count FROM dashboard_login_attempts WHERE key = ?",
+                (key,),
+            )
+            row = await cur.fetchone()
+            return row[0] if row else 0
+
+        ip_key = f"ip:{client_host}"
+        global_key = "global:dashboard_login"
+        ip_count = await _bump(ip_key)
+        global_count = await _bump(global_key)
+        await db.commit()
+    if ip_count > LOGIN_CODE_MAX_ATTEMPTS_PER_IP:
+        return False, ip_count
+    if global_count > LOGIN_CODE_MAX_ATTEMPTS_GLOBAL:
+        return False, global_count
+    return True, ip_count
 
 
 # --- Cookie helpers ------------------------------------------------------
@@ -279,7 +353,7 @@ button:hover { background: #254a73; }
 <form id="login-form" method="post" action="/dashboard/login">
   <label for="code">Codi d'accés</label>
   <input type="text" id="code" name="code" autocomplete="off" autofocus
-         placeholder="XXXXXX" pattern="[A-F0-9]{{6}}" maxlength="6" required>
+         placeholder="XXXXXXXXXXXXXXXXXXXXXX" maxlength="64" required>
   <button type="submit">Entrar</button>
 </form>
 
@@ -454,27 +528,47 @@ async def dashboard_login_page() -> HTMLResponse:
 async def dashboard_login_submit(
     request: Request,
 ) -> JSONResponse:
-    """Browser-side submission. Body: {"code": "XXXXXX"}.
-    On success: Set-Cookie + 200. On failure: 401/403 with reason."""
+    """Browser-side submission. Body: {"code": "..."}.
+    On success: Set-Cookie + 200. On failure: 401/429 with reason.
+    Rate-limited per source IP and globally."""
     await _ensure_dashboard_tables()
+    client_host = request.client.host if request.client else "unknown"
     try:
         body = await request.json()
     except Exception:
+        # Even invalid body counts as a failed attempt
+        allowed, _ = await _check_and_record_login_attempt(client_host, success=False)
+        if not allowed:
+            return JSONResponse(
+                status_code=429,
+                content={"detail": "Massa intents. Torna-ho a provar mes tard."},
+            )
         raise HTTPException(status_code=400, detail="Cos JSON invalid")
-    code = (body or {}).get("code", "").strip().upper()
+    code = (body or {}).get("code", "").strip()
     if not code:
+        allowed, _ = await _check_and_record_login_attempt(client_host, success=False)
+        if not allowed:
+            return JSONResponse(
+                status_code=429,
+                content={"detail": "Massa intents. Torna-ho a provar mes tard."},
+            )
         raise HTTPException(status_code=400, detail="Codi requerit")
     agent_id = await _consume_login_code(code)
     if agent_id is None:
+        allowed, count = await _check_and_record_login_attempt(client_host, success=False)
+        if not allowed:
+            return JSONResponse(
+                status_code=429,
+                content={"detail": "Massa intents. Torna-ho a provar mes tard."},
+            )
         raise HTTPException(
             status_code=401,
             detail="Codi invalid, expirat o ja utilitzat",
         )
+    # Success — record a successful attempt (no rate limit penalty)
+    await _check_and_record_login_attempt(client_host, success=True)
     # Mint the session
     token, expires_at = await _create_session(agent_id)
-    # Build the JSON response and attach the Set-Cookie header
-    # directly. JSONResponse() doesn't expose set_cookie, so we
-    # use Response with the JSON body and call set_cookie on it.
     from starlette.responses import JSONResponse as _JR
     resp = _JR({
         "ok":          True,

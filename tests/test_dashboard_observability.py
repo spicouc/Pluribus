@@ -567,7 +567,21 @@ class DashboardObservabilityTests(unittest.TestCase):
         code = body["code"]
         self.assertNotEqual(code, KEY)
         self.assertNotIn(KEY, code)
-        self.assertLessEqual(len(code), 16)
+        self.assertLessEqual(len(code), 64)
+        # Verify code carries >= 128 bits of entropy (D1-SEC-10).
+        # token_urlsafe(16) produces 22 base64-url chars = 128 bits.
+        import base64
+        # Reconstruct the bytes from the urlsafe string (with padding
+        # stripped) and check that the original 16 bytes are present.
+        # urlsafe-base64 without padding: each char encodes 6 bits.
+        # For 16 bytes we expect a 22-char string.
+        try:
+            padded = code + "=" * (-len(code) % 4)
+            decoded = base64.urlsafe_b64decode(padded)
+            self.assertGreaterEqual(len(decoded) * 8, 128,
+                f"login code entropy {len(decoded) * 8} bits < 128")
+        except Exception as e:
+            self.fail(f"login code not decodeable as urlsafe base64: {e}")
 
         # 3. Browser-equivalent client WITHOUT X-API-Key submits the code
         c2 = self._fresh_client()
@@ -656,3 +670,86 @@ class DashboardObservabilityTests(unittest.TestCase):
         import time
         expected = int(time.time()) + SESSION_TTL_SECONDS
         self.assertLess(abs(body.get("expires_at", 0) - expected), 5)
+
+    # ====== D1-SEC-09..12: FINAL SECURITY CORRECTIVE =================
+    def test_d1_sec_09_login_code_rate_limit(self) -> None:
+        """Repeated invalid login attempts are rate-limited per IP.
+        After 5 failed attempts, the 6th returns 429 (Too Many Requests).
+        Successful logins are not counted against the limit."""
+        # Mint a code so we have a valid one to use later
+        r = self._client.post("/v1/dashboard/login-code", headers={"X-API-Key": KEY})
+        valid_code = r.json()["code"]
+
+        c = self._fresh_client()
+        # 5 failed attempts
+        for i in range(5):
+            r = c.post("/dashboard/login", json={"code": "WRONGCODE" + str(i)})
+            # Each may be 401 (invalid code) but NOT 429 yet
+            self.assertIn(r.status_code, (401, 429),
+                          f"attempt {i+1} unexpected status {r.status_code}: {r.text[:100]}")
+
+        # 6th attempt should be 429 (rate-limited)
+        r = c.post("/dashboard/login", json={"code": "STILLWRONG"})
+        # The 5th might have already triggered it; either way the
+        # rate limit must kick in somewhere around here.
+        self.assertIn(r.status_code, (429, 401),
+                      f"after 5+ failed attempts expected rate limit, got {r.status_code}: {r.text[:100]}")
+        # And the next one must definitely be 429
+        r = c.post("/dashboard/login", json={"code": "AGAIN"})
+        self.assertEqual(r.status_code, 429, f"expected 429, got {r.status_code}: {r.text[:100]}")
+
+    def test_d1_sec_10_login_code_entropy(self) -> None:
+        """Login code carries >= 128 bits of entropy."""
+        import base64
+        codes = set()
+        for _ in range(10):
+            r = self._client.post("/v1/dashboard/login-code", headers={"X-API-Key": KEY})
+            self.assertEqual(r.status_code, 200)
+            code = r.json()["code"]
+            codes.add(code)
+            # Decode the urlsafe base64 string
+            padded = code + "=" * (-len(code) % 4)
+            decoded = base64.urlsafe_b64decode(padded)
+            self.assertGreaterEqual(len(decoded) * 8, 128,
+                f"login code entropy {len(decoded) * 8} bits < 128 (code={code!r})")
+        # 10 codes must all be unique
+        self.assertEqual(len(codes), 10, "login codes collided — randomness broken")
+
+    def test_d1_sec_11_raw_code_not_persisted(self) -> None:
+        """The raw login code is never stored in the DB — only its SHA-256 digest."""
+        r = self._client.post("/v1/dashboard/login-code", headers={"X-API-Key": KEY})
+        raw_code = r.json()["code"]
+        # Inspect the database
+        import asyncio
+        from pluribus.db import get_db
+        async def _check():
+            async with get_db() as db:
+                cur = await db.execute("SELECT * FROM dashboard_login_codes")
+                rows = await cur.fetchall()
+                return rows
+        rows = asyncio.run(_check())
+        # No row may contain the raw code as a substring
+        for row in rows:
+            row_str = " ".join(str(c) for c in row)
+            self.assertNotIn(raw_code, row_str,
+                f"raw login code leaked into DB row: {row!r}")
+            # The code_hash must be a 64-hex string (SHA-256 digest)
+            # which is the standard format
+            code_hash = row[0]  # code_hash is the primary key
+            self.assertEqual(len(code_hash), 64, f"code_hash not 64-hex: {code_hash!r}")
+            self.assertTrue(all(c in "0123456789abcdef" for c in code_hash),
+                f"code_hash not hex: {code_hash!r}")
+
+    def test_d1_sec_12_api_key_normal_middleware_path(self) -> None:
+        """X-API-Key calls to /v1/dashboard/* go through the normal
+        global middleware (request.state.agent is set, rate-limited).
+        Verified indirectly: a valid X-API-Key succeeds; an invalid
+        one fails with 'Clau API invalida' (which is the normal
+        middleware's message), NOT 'Falta la capçalera X-API-Key'."""
+        # Valid X-API-Key: success
+        r = self._client.get("/v1/dashboard/summary", headers={"X-API-Key": KEY})
+        self.assertEqual(r.status_code, 200, r.text[:200])
+        # Invalid X-API-Key: the normal middleware path applies
+        r = self._client.get("/v1/dashboard/summary", headers={"X-API-Key": "wrong-key-12345678901234567890"})
+        self.assertEqual(r.status_code, 401, r.text[:200])
+        self.assertIn("Clau API inv", r.json().get("detail", "") or r.text)

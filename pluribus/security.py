@@ -193,52 +193,54 @@ def register_security_middleware(app: FastAPI) -> None:
     @app.middleware("http")
     async def api_key_auth_middleware(request: Request, call_next: Callable) -> Response:
         path = request.url.path
+        has_api_key = bool(request.headers.get("X-API-Key"))
+
         # Public surfaces: the dashboard HTML, the login page, the
-        # login form submission, and the dashboard data endpoints
-        # (which carry their own guard).
-        if path in {"/health", "/dashboard"} or \
-                path.startswith("/dashboard/") or \
-                path == "/v1/dashboard/login" or \
-                path.startswith("/v1/dashboard/"):
+        # login form submission. These never carry an X-API-Key and
+        # are not part of the API-key auth surface.
+        if path in {"/health", "/dashboard"} or path.startswith("/dashboard/"):
+            return await call_next(request)
+
+        # If the caller has an X-API-Key, run the normal API-key
+        # authentication (which also rate-limits). This applies to
+        # /v1/dashboard/login, /v1/dashboard/login-code, and any
+        # data endpoint called server-to-server.
+        if has_api_key:
+            api_key = request.headers.get("X-API-Key")
+            client_host = request.client.host if request.client else "unknown"
+            agent_found = await _authenticate_agent(api_key, client_host)
+            if agent_found is None:
+                return JSONResponse(status_code=401, content={"detail": "Clau API invàlida"})
+            if not _check_rate_limit(agent_found["id"]):
+                return JSONResponse(
+                    status_code=429,
+                    content={"detail": "Límit de peticions superat. Torna-ho a provar més tard."},
+                )
+            _record_request(agent_found["id"])
+            # Parse JSON columns so downstream handlers can use them
+            # as dicts/lists, not raw strings.
+            try:
+                if isinstance(agent_found.get("permissions"), str):
+                    agent_found["permissions"] = json.loads(agent_found["permissions"])
+            except Exception:
+                agent_found["permissions"] = {}
+            try:
+                if isinstance(agent_found.get("allowed_scopes"), str):
+                    agent_found["allowed_scopes"] = json.loads(agent_found["allowed_scopes"])
+            except Exception:
+                agent_found["allowed_scopes"] = []
+            request.state.agent = agent_found
+            return await call_next(request)
+
+        # No X-API-Key. If the path is one of the dashboard data
+        # endpoints or login endpoints, hand off to the per-route
+        # guard. The per-route guard accepts the HttpOnly session
+        # cookie. No other Pluribus endpoint is reachable without
+        # an X-API-Key.
+        if path == "/v1/dashboard/login" or path.startswith("/v1/dashboard/"):
             return await call_next(request)
 
         if path in ("/mcp", "/mcp/") and request.method == "GET":
             return await call_next(request)
 
-        api_key = request.headers.get("X-API-Key")
-        if not api_key:
-            return JSONResponse(status_code=401, content={"detail": "Falta la capçalera X-API-Key"})
-
-        client_host = request.client.host if request.client else "unknown"
-        agent_found = await _authenticate_agent(api_key, client_host)
-        if agent_found is None:
-            return JSONResponse(status_code=401, content={"detail": "Clau API invàlida"})
-
-        if not _check_rate_limit(agent_found["id"]):
-            return JSONResponse(
-                status_code=429,
-                content={"detail": "Límit de peticions superat. Torna-ho a provar més tard."},
-            )
-        _record_request(agent_found["id"])
-
-        try:
-            permissions = json.loads(agent_found["permissions"]) if isinstance(agent_found["permissions"], str) else agent_found["permissions"]
-            if not isinstance(permissions, dict):
-                raise TypeError("permissions must be an object")
-        except (json.JSONDecodeError, TypeError):
-            permissions = {"read": False, "write": False, "delete": False, "admin": False}
-
-        try:
-            allowed_scopes = json.loads(agent_found["allowed_scopes"]) if isinstance(agent_found["allowed_scopes"], str) else agent_found["allowed_scopes"]
-            if not isinstance(allowed_scopes, list):
-                raise TypeError("allowed_scopes must be a list")
-        except (json.JSONDecodeError, TypeError):
-            allowed_scopes = []
-
-        request.state.agent = {
-            "id": agent_found["id"],
-            "name": agent_found["name"],
-            "permissions": permissions,
-            "allowed_scopes": allowed_scopes,
-        }
-        return await call_next(request)
+        return JSONResponse(status_code=401, content={"detail": "Falta la capçalera X-API-Key"})
