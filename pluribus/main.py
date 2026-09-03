@@ -24,7 +24,10 @@ from pluribus.compact import compact_database
 from pluribus.config import settings
 from pluribus.dashboard import router as dashboard_router
 from pluribus.dashboard_observability import router as dashboard_observability_router
-from pluribus.dashboard_session import auth_router as dashboard_session_router
+from pluribus.dashboard_session import (
+    auth_router as dashboard_session_router,
+    login_router as dashboard_login_router,
+)
 from pluribus.db import get_db, init_db
 from pluribus.directives import router as directives_router
 from pluribus.directives_schema import init_directives_db
@@ -170,6 +173,10 @@ app.include_router(dashboard_router, dependencies=[Depends(dashboard_authorize)]
 # /v1/dashboard/*.
 app.include_router(dashboard_observability_router)
 app.include_router(dashboard_session_router)
+# Public login page + form submission at /dashboard/login. No
+# API key required on this path — the user pastes a one-time code
+# minted server-to-server via POST /v1/dashboard/login-code.
+app.include_router(dashboard_login_router)
 # Intercept MCP semantic/recall/sync/directive calls while delegating other tools.
 app.include_router(mcp_async_router, dependencies=[Depends(mcp_authorize)])
 app.include_router(mcp_router, dependencies=[Depends(mcp_authorize)])

@@ -540,3 +540,119 @@ class DashboardObservabilityTests(unittest.TestCase):
         self.assertEqual(r.status_code, 200, r.text[:200])
         j = r.json()
         self.assertIn("pluribus", j)
+
+    # ====== D1-E2E-02..07: HUMAN LOGIN FLOW (one-time code) ==========
+    def _fresh_client(self):
+        from fastapi.testclient import TestClient
+        return TestClient(self._client.app)
+
+    def test_d1_e2e_02_human_login_flow(self) -> None:
+        """Real human login flow: operator mints a one-time code via
+        X-API-Key, browser submits the code via POST /dashboard/login
+        and receives a session cookie. Then /v1/dashboard/* works
+        from the browser with NO X-API-Key."""
+        c = self._client
+
+        # 1. /dashboard/login page is public
+        r = c.get("/dashboard/login")
+        self.assertEqual(r.status_code, 200, r.text[:200])
+        self.assertIn("text/html", r.headers.get("content-type", ""))
+
+        # 2. Operator (server-to-server) mints a one-time code
+        r = c.post("/v1/dashboard/login-code", headers={"X-API-Key": KEY})
+        self.assertEqual(r.status_code, 200, r.text[:300])
+        body = r.json()
+        self.assertTrue(body.get("ok"))
+        self.assertIn("code", body)
+        code = body["code"]
+        self.assertNotEqual(code, KEY)
+        self.assertNotIn(KEY, code)
+        self.assertLessEqual(len(code), 16)
+
+        # 3. Browser-equivalent client WITHOUT X-API-Key submits the code
+        c2 = self._fresh_client()
+        r = c2.post("/dashboard/login", json={"code": code})
+        self.assertEqual(r.status_code, 200, r.text[:200])
+        cname = _cookie_name()
+        token = r.cookies.get(cname) if hasattr(r.cookies, "get") else None
+        if token is None:
+            sc = r.headers.get("set-cookie", "")
+            if cname + "=" in sc:
+                token = sc.split(cname + "=")[1].split(";")[0]
+        self.assertIsNotNone(token, f"login did not set {cname!r}")
+
+        # 4. Browser (fresh client) can now hit the dashboard
+        for path in ("/v1/dashboard/summary", "/v1/dashboard/agents",
+                     "/v1/dashboard/memory?limit=5", "/v1/dashboard/system"):
+            r = c2.get(path, cookies={cname: str(token)})
+            self.assertEqual(r.status_code, 200,
+                             f"{path} with cookie expected 200, got {r.status_code}: {r.text[:200]}")
+
+        # 5. /dashboard also loads
+        r = c2.get("/dashboard")
+        self.assertIn(r.status_code, (200, 307), f"GET /dashboard -> {r.status_code}")
+
+    def test_d1_e2e_03_one_time_code_rejected_on_reuse(self) -> None:
+        c = self._client
+        r = c.post("/v1/dashboard/login-code", headers={"X-API-Key": KEY})
+        code = r.json()["code"]
+        c2 = self._fresh_client()
+        r1 = c2.post("/dashboard/login", json={"code": code})
+        self.assertEqual(r1.status_code, 200)
+        c3 = self._fresh_client()
+        r2 = c3.post("/dashboard/login", json={"code": code})
+        self.assertEqual(r2.status_code, 401, r2.text[:200])
+
+    def test_d1_e2e_04_expired_code_rejected(self) -> None:
+        c = self._client
+        r = c.post("/v1/dashboard/login-code", headers={"X-API-Key": KEY})
+        code = r.json()["code"]
+        import asyncio
+        async def _expire():
+            from pluribus.db import get_db
+            from pluribus.dashboard_session import _hash_code
+            async with get_db() as db:
+                await db.execute(
+                    "UPDATE dashboard_login_codes SET expires_at = 0 WHERE code_hash = ?",
+                    (_hash_code(code),),
+                )
+                await db.commit()
+        asyncio.run(_expire())
+        c2 = self._fresh_client()
+        r = c2.post("/dashboard/login", json={"code": code})
+        self.assertEqual(r.status_code, 401, r.text[:200])
+
+    def test_d1_e2e_05_invalid_code_rejected(self) -> None:
+        c2 = self._fresh_client()
+        r = c2.post("/dashboard/login", json={"code": "DEADBE"})
+        self.assertEqual(r.status_code, 401, r.text[:200])
+        r = c2.post("/dashboard/login", json={"code": ""})
+        self.assertIn(r.status_code, (400, 401))
+
+    def test_d1_e2e_06_logout_invalidates_session(self) -> None:
+        c = self._client
+        r = c.post("/v1/dashboard/login-code", headers={"X-API-Key": KEY})
+        code = r.json()["code"]
+        c2 = self._fresh_client()
+        r = c2.post("/dashboard/login", json={"code": code})
+        cname = _cookie_name()
+        token = r.cookies.get(cname) if hasattr(r.cookies, "get") else None
+        if token is None:
+            sc = r.headers.get("set-cookie", "")
+            token = sc.split(cname + "=")[1].split(";")[0] if cname + "=" in sc else None
+        r = c2.post("/v1/dashboard/logout", cookies={cname: str(token)})
+        self.assertEqual(r.status_code, 200, r.text[:200])
+        r = c2.get("/v1/dashboard/summary", cookies={cname: str(token)})
+        self.assertEqual(r.status_code, 401, r.text[:200])
+
+    def test_d1_e2e_07_session_lifetime_fixed(self) -> None:
+        c = self._client
+        r = c.post("/v1/dashboard/login", headers={"X-API-Key": KEY})
+        self.assertEqual(r.status_code, 200, r.text[:200])
+        body = r.json()
+        from pluribus.dashboard_session import SESSION_TTL_SECONDS
+        self.assertEqual(body.get("ttl_seconds"), SESSION_TTL_SECONDS,
+                         f"session ttl_seconds={body.get('ttl_seconds')!r} != SESSION_TTL_SECONDS={SESSION_TTL_SECONDS}")
+        import time
+        expected = int(time.time()) + SESSION_TTL_SECONDS
+        self.assertLess(abs(body.get("expires_at", 0) - expected), 5)

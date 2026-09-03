@@ -192,20 +192,17 @@ async def _authenticate_agent(api_key: str, client_id: str = "unknown") -> dict 
 def register_security_middleware(app: FastAPI) -> None:
     @app.middleware("http")
     async def api_key_auth_middleware(request: Request, call_next: Callable) -> Response:
-        public_paths = {"/health", "/dashboard"}
-        if request.url.path in public_paths:
+        path = request.url.path
+        # Public surfaces: the dashboard HTML, the login page, the
+        # login form submission, and the dashboard data endpoints
+        # (which carry their own guard).
+        if path in {"/health", "/dashboard"} or \
+                path.startswith("/dashboard/") or \
+                path == "/v1/dashboard/login" or \
+                path.startswith("/v1/dashboard/"):
             return await call_next(request)
 
-        # /v1/dashboard/login accepts X-API-Key as part of the
-        # server-to-server handshake; the rest of the dashboard
-        # endpoints are guarded by dashboard_session_authorize which
-        # validates the HttpOnly cookie or X-API-Key. We bypass the
-        # X-API-Key check at this layer so the cookie path works.
-        if (request.url.path == "/v1/dashboard/login"
-                or request.url.path.startswith("/v1/dashboard/")):
-            return await call_next(request)
-
-        if request.url.path in ("/mcp", "/mcp/") and request.method == "GET":
+        if path in ("/mcp", "/mcp/") and request.method == "GET":
             return await call_next(request)
 
         api_key = request.headers.get("X-API-Key")
