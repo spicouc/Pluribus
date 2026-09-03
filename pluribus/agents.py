@@ -129,11 +129,30 @@ async def agent_heartbeat(request: Request, agent_id: str) -> None:
     body: dict[str, Any] = {}
     try:
         if request.headers.get("content-type", "").startswith("application/json"):
-            body = await request.json()
-            if not isinstance(body, dict):
-                raise ValueError("body must be a JSON object")
+            raw = await request.body()
+            if not raw:
+                # Empty body is allowed (heartbeat with no payload).
+                body = {}
+            else:
+                import json as _json
+                try:
+                    body = _json.loads(raw.decode("utf-8"))
+                except (ValueError, _json.JSONDecodeError) as exc:
+                    raise HTTPException(
+                        status_code=400,
+                        detail=f"Malformed JSON body: {exc}",
+                    )
+                if not isinstance(body, dict):
+                    raise HTTPException(
+                        status_code=422,
+                        detail="body must be a JSON object",
+                    )
+    except HTTPException:
+        raise
     except Exception:
-        body = {}
+        # Genuine error parsing the request — also reject, do not
+        # silently swallow.
+        raise HTTPException(status_code=400, detail="Could not parse request body")
 
     work_state_raw = body.get("work_state", "__OMIT__")
     if work_state_raw == "__OMIT__":
@@ -150,8 +169,26 @@ async def agent_heartbeat(request: Request, agent_id: str) -> None:
         # by update). Omit -> skip (preserves prior).
         ws_set = True
 
+    # current_blocker requires a separate "reported" flag so the
+    # dashboard can distinguish "agent never reported" (UNKNOWN)
+    # from "agent explicitly reported no blocker" (NONE).
+    cb_raw = body.get("current_blocker", "__OMIT__")
+    cb_set = False
+    cb_value: Optional[str] = None
+    if cb_raw == "__OMIT__":
+        pass  # skip — preserve both blocker and reported flag
+    else:
+        ok, normalized = validate_heartbeat_field("current_blocker", cb_raw)
+        if not ok:
+            raise HTTPException(
+                status_code=422,
+                detail="current_blocker invalid (type or length)",
+            )
+        cb_value = normalized  # None for empty string / null
+        cb_set = True
+
     extra: dict[str, str] = {}
-    for fld in ("current_task_id", "current_project", "current_blocker"):
+    for fld in ("current_task_id", "current_project"):
         raw = body.get(fld, "__OMIT__")
         if raw == "__OMIT__":
             continue  # skip -> preserve prior
@@ -172,6 +209,13 @@ async def agent_heartbeat(request: Request, agent_id: str) -> None:
         for k, v in extra.items():
             updates.append(f"{k} = ?")
             params.append(None if v == "" else v)
+        if cb_set:
+            # We always set both fields together: when the field is
+            # present in the request, the agent has explicitly
+            # reported (regardless of value).
+            updates.append("current_blocker = ?")
+            params.append(cb_value)
+            updates.append("current_blocker_reported = 1")
         params.append(agent_id)
         sql = (f"UPDATE agents SET {', '.join(updates)} "
                "WHERE id = ? AND is_active = 1")

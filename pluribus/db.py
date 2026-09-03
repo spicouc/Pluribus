@@ -58,10 +58,11 @@ async def _migrate_db() -> None:
         # memory. They overwrite on each heartbeat. Do NOT use them
         # as authoritative sources for past results — see directives.
         agent_telemetry_cols = {
-            "work_state":      "ALTER TABLE agents ADD COLUMN work_state TEXT DEFAULT 'UNKNOWN'",
-            "current_task_id": "ALTER TABLE agents ADD COLUMN current_task_id TEXT",
-            "current_project": "ALTER TABLE agents ADD COLUMN current_project TEXT",
-            "current_blocker": "ALTER TABLE agents ADD COLUMN current_blocker TEXT",
+            "work_state":               "ALTER TABLE agents ADD COLUMN work_state TEXT DEFAULT 'UNKNOWN'",
+            "current_task_id":          "ALTER TABLE agents ADD COLUMN current_task_id TEXT",
+            "current_project":          "ALTER TABLE agents ADD COLUMN current_project TEXT",
+            "current_blocker":          "ALTER TABLE agents ADD COLUMN current_blocker TEXT",
+            "current_blocker_reported": "ALTER TABLE agents ADD COLUMN current_blocker_reported INTEGER NOT NULL DEFAULT 0",
         }
         for col, sql in agent_telemetry_cols.items():
             if col not in agent_columns:

@@ -1052,7 +1052,7 @@ class DashboardObservabilityTests(unittest.TestCase):
         r = c.get("/v1/dashboard/agents", cookies=cookies)
         a = {x["identity"]: x for x in r.json()["agents"]}["d1-test-agent"]
         # None of the historical text became authoritative state
-        self.assertEqual(a["blocker"], "NONE")  # No current_blocker set
+        self.assertEqual(a["blocker"], "UNKNOWN")  # No reported current_blocker
         self.assertNotIn("xerrameca", (a["project"] or "").lower())
         self.assertEqual(a["last_result"], "UNKNOWN")
 
@@ -1105,37 +1105,54 @@ class DashboardObservabilityTests(unittest.TestCase):
         self.assertEqual(a["project"], "D2-B")
 
     def test_d2_16_blocker_distinguishes_none_from_unknown(self) -> None:
-        """blocker = NONE if the agent explicitly reported no blocker
-        (empty string). blocker = UNKNOWN if the agent has never
-        reported. blocker = <string> if reported."""
+        """D2-B corrective:
+        current_blocker_reported = 0 -> blocker = UNKNOWN (never reported)
+        current_blocker_reported = 1 + blocker NULL -> blocker = NONE
+        current_blocker_reported = 1 + blocker string -> blocker = string
+
+        Heartbeats WITHOUT a current_blocker field preserve the prior
+        reported flag (no inference from heartbeat itself)."""
         c = self._client
-        # Heartbeat with empty current_blocker -> NONE
-        c.patch("/v1/agents/d1-test-agent/heartbeat", headers={"X-API-Key": KEY},
-               json={"current_blocker": ""})
-        cookies = _login(c)
-        r = c.get("/v1/dashboard/agents", cookies=cookies)
-        a = {x["identity"]: x for x in r.json()["agents"]}["d1-test-agent"]
-        self.assertEqual(a["blocker"], "NONE")
-        # Clear the agent and check UNKNOWN
         import asyncio
-        async def _clear():
+        async def _reset():
             from pluribus.db import get_db
             async with get_db() as db:
                 await db.execute(
-                    "UPDATE agents SET last_active_at = NULL, current_blocker = NULL WHERE id = ?",
+                    "UPDATE agents SET current_blocker = NULL, "
+                    "current_blocker_reported = 0, last_active_at = NULL "
+                    "WHERE id = ?",
                     ("d1-test-agent",),
                 )
                 await db.commit()
-        asyncio.run(_clear())
+        asyncio.run(_reset())
+        cookies = _login(c)
+        r = c.get("/v1/dashboard/agents", cookies=cookies)
+        a = {x["identity"]: x for x in r.json()["agents"]}["d1-test-agent"]
+        # Never reported: blocker = UNKNOWN
+        self.assertEqual(a["blocker"], "UNKNOWN")
+
+        # Heartbeat WITHOUT current_blocker field (omitted) keeps
+        # reported = 0. The dashboard must still show UNKNOWN.
+        c.patch("/v1/agents/d1-test-agent/heartbeat", headers={"X-API-Key": KEY},
+               json={"work_state": "IDLE"})
         r = c.get("/v1/dashboard/agents", cookies=cookies)
         a = {x["identity"]: x for x in r.json()["agents"]}["d1-test-agent"]
         self.assertEqual(a["blocker"], "UNKNOWN")
-        # Now report an explicit blocker
+
+        # Heartbeat with empty current_blocker -> reported=1, blocker=NULL
+        c.patch("/v1/agents/d1-test-agent/heartbeat", headers={"X-API-Key": KEY},
+               json={"current_blocker": ""})
+        r = c.get("/v1/dashboard/agents", cookies=cookies)
+        a = {x["identity"]: x for x in r.json()["agents"]}["d1-test-agent"]
+        self.assertEqual(a["blocker"], "NONE")
+
+        # Heartbeat with explicit blocker string -> blocker = that string
         c.patch("/v1/agents/d1-test-agent/heartbeat", headers={"X-API-Key": KEY},
                json={"current_blocker": "API rate limited"})
         r = c.get("/v1/dashboard/agents", cookies=cookies)
         a = {x["identity"]: x for x in r.json()["agents"]}["d1-test-agent"]
         self.assertEqual(a["blocker"], "API rate limited")
+
 
     def test_d2_17_heartbeat_does_not_create_memory_fact(self) -> None:
         """D2 architectural invariant: heartbeats do not create
@@ -1177,3 +1194,187 @@ class DashboardObservabilityTests(unittest.TestCase):
                              f"server timestamp not in [before, after] window; diff={(last-before).total_seconds()}")
         self.assertLessEqual((after - last).total_seconds(), 5,
                              f"server timestamp not in [before, after] window; diff={(after-last).total_seconds()}")
+    def test_d2_19_heartbeat_without_blocker_remains_unknown(self) -> None:
+        """D2-B corrective: a heartbeat with no current_blocker field
+        keeps the prior reported flag. New agent with reported=0
+        stays UNKNOWN even after a heartbeat with only work_state."""
+        c = self._client
+        import asyncio
+        import bcrypt
+        new_key = "d2-19-key-CCCCCCCCCCCCCCCCCCC"
+        new_hash = bcrypt.hashpw(new_key.encode("utf-8"),
+                                 bcrypt.gensalt(rounds=4)).decode("utf-8")
+        from pluribus.api_keys import fingerprint_api_key
+        async def _seed():
+            from pluribus.db import get_db
+            async with get_db() as db:
+                await db.execute(
+                    "INSERT OR REPLACE INTO agents (id, name, api_key_hash, api_key_fingerprint, permissions, allowed_scopes, is_active) "
+                    "VALUES (?, ?, ?, ?, ?, ?, 1)",
+                    ("d2-19-agent", "d2-19", new_hash,
+                     fingerprint_api_key(new_key),
+                     json.dumps({"read": True}), json.dumps(["shared"])),
+                )
+                await db.commit()
+        asyncio.run(_seed())
+        # Heartbeat with only work_state — NO current_blocker
+        c.patch("/v1/agents/d2-19-agent/heartbeat", headers={"X-API-Key": new_key},
+               json={"work_state": "IDLE"})
+        cookies = _login(c)
+        r = c.get("/v1/dashboard/agents", cookies=cookies)
+        a = {x["identity"]: x for x in r.json()["agents"]}["d2-19-agent"]
+        self.assertEqual(a["blocker"], "UNKNOWN",
+                         "heartbeat without current_blocker must keep blocker=UNKNOWN")
+        # Now heartbeat with current_blocker: "" -> NONE
+        c.patch("/v1/agents/d2-19-agent/heartbeat", headers={"X-API-Key": new_key},
+               json={"current_blocker": ""})
+        r = c.get("/v1/dashboard/agents", cookies=cookies)
+        a = {x["identity"]: x for x in r.json()["agents"]}["d2-19-agent"]
+        self.assertEqual(a["blocker"], "NONE")
+        # And a real string
+        c.patch("/v1/agents/d2-19-agent/heartbeat", headers={"X-API-Key": new_key},
+               json={"current_blocker": "Waiting for CI"})
+        r = c.get("/v1/dashboard/agents", cookies=cookies)
+        a = {x["identity"]: x for x in r.json()["agents"]}["d2-19-agent"]
+        self.assertEqual(a["blocker"], "Waiting for CI")
+
+    def _seed_claimed_directives(self, agent_id, n: int) -> list[str]:
+        """Insert n claimed directives targeting agent_id. Returns
+        the list of directive IDs in deterministic order (claimed
+        DESC, created DESC, id DESC)."""
+        import asyncio
+        ids = [f"dir-{agent_id}-{i}" for i in range(n)]
+        async def _do():
+            from pluribus.db import get_db
+            from datetime import datetime, timezone, timedelta
+            base = datetime.now(timezone.utc)
+            async with get_db() as db:
+                for i, did in enumerate(ids):
+                    claimed = (base - timedelta(seconds=i)).strftime(
+                        "%Y-%m-%d %H:%M:%S")
+                    created = (base - timedelta(seconds=10 + i)).strftime(
+                        "%Y-%m-%d %H:%M:%S")
+                    await db.execute(
+                        """INSERT INTO directives
+                           (id, issuer_agent_id, target_agent_id, scope, action,
+                            arguments, required_capability, status, created_at,
+                            expires_at, claimed_at, claimed_by_agent_id)
+                           VALUES (?, ?, ?, ?, ?, ?, ?, 'claimed', ?, ?, ?, ?)""",
+                        (did, "issuer", agent_id, "shared", f"act_{i}", "{}",
+                         "test_cap", created,
+                         (base + timedelta(days=1)).strftime("%Y-%m-%d %H:%M:%S"),
+                         claimed, agent_id),
+                    )
+                await db.commit()
+        asyncio.run(_do())
+        return ids
+
+    def test_d2_20_single_claimed_is_current_task(self) -> None:
+        """D2-B corrective: with exactly one claimed directive, that
+        directive is the current_task."""
+        c = self._client
+        c.patch("/v1/agents/d1-test-agent/heartbeat", headers={"X-API-Key": KEY})
+        self._seed_claimed_directives("d1-test-agent", 1)
+        cookies = _login(c)
+        r = c.get("/v1/dashboard/agents", cookies=cookies)
+        a = {x["identity"]: x for x in r.json()["agents"]}["d1-test-agent"]
+        self.assertEqual(a["current_task"], "directive:dir-d1-test-agent-0")
+        self.assertEqual(a["claimed_directive_count"], 1)
+
+    def test_d2_21_multiple_claimed_without_explicit_task_is_unknown(self) -> None:
+        """D2-B corrective: with multiple claimed directives and no
+        valid explicit current_task_id, current_task = UNKNOWN. We
+        do NOT pick one arbitrarily."""
+        c = self._client
+        c.patch("/v1/agents/d1-test-agent/heartbeat", headers={"X-API-Key": KEY})
+        self._seed_claimed_directives("d1-test-agent", 2)
+        cookies = _login(c)
+        r = c.get("/v1/dashboard/agents", cookies=cookies)
+        a = {x["identity"]: x for x in r.json()["agents"]}["d1-test-agent"]
+        self.assertEqual(a["current_task"], "UNKNOWN")
+        self.assertEqual(a["current_task_id"], "UNKNOWN")
+        self.assertEqual(a["claimed_directive_count"], 2)
+
+    def test_d2_22_multiple_claimed_with_valid_explicit_task(self) -> None:
+        """D2-B corrective: with multiple claimed directives, an
+        explicit current_task_id that matches one of them picks
+        exactly that one."""
+        c = self._client
+        c.patch("/v1/agents/d1-test-agent/heartbeat", headers={"X-API-Key": KEY})
+        self._seed_claimed_directives("d1-test-agent", 3)
+        target = "dir-d1-test-agent-1"
+        c.patch("/v1/agents/d1-test-agent/heartbeat", headers={"X-API-Key": KEY},
+               json={"current_task_id": target})
+        cookies = _login(c)
+        r = c.get("/v1/dashboard/agents", cookies=cookies)
+        a = {x["identity"]: x for x in r.json()["agents"]}["d1-test-agent"]
+        self.assertEqual(a["current_task"], f"directive:{target}")
+        self.assertEqual(a["current_task_id"], target)
+        self.assertEqual(a["claimed_directive_count"], 3)
+
+    def test_d2_23_explicit_task_must_match_claimed_directive(self) -> None:
+        """D2-B corrective: an explicit current_task_id that does
+        not match any CURRENTLY CLAIMED directive is rejected.
+        Result: current_task = UNKNOWN."""
+        c = self._client
+        c.patch("/v1/agents/d1-test-agent/heartbeat", headers={"X-API-Key": KEY})
+        self._seed_claimed_directives("d1-test-agent", 1)
+        # Send a heartbeat with a bogus current_task_id
+        c.patch("/v1/agents/d1-test-agent/heartbeat", headers={"X-API-Key": KEY},
+               json={"current_task_id": "dir-bogus-nonexistent"})
+        cookies = _login(c)
+        r = c.get("/v1/dashboard/agents", cookies=cookies)
+        a = {x["identity"]: x for x in r.json()["agents"]}["d1-test-agent"]
+        # The single claimed directive still applies (rule 2)
+        self.assertEqual(a["current_task"], "directive:dir-d1-test-agent-0")
+        # current_task_id from heartbeat is ignored (not exposed)
+        self.assertEqual(a["current_task_id"], "dir-d1-test-agent-0")
+        # And add a pending directive + verify rule 1 still rejects non-claimed
+        import asyncio
+        async def _add_pending():
+            from pluribus.db import get_db
+            async with get_db() as db:
+                await db.execute(
+                    """INSERT INTO directives
+                       (id, issuer_agent_id, target_agent_id, scope, action,
+                        arguments, required_capability, status, expires_at)
+                       VALUES (?, ?, ?, ?, ?, ?, ?, 'pending', datetime('now', '+1 day'))""",
+                    ("dir-pending-bogus", "issuer", "d1-test-agent",
+                     "shared", "act", "{}", "test_cap"),
+                )
+                await db.commit()
+        asyncio.run(_add_pending())
+        # Send heartbeat pointing to the pending (not claimed) one
+        c.patch("/v1/agents/d1-test-agent/heartbeat", headers={"X-API-Key": KEY},
+               json={"current_task_id": "dir-pending-bogus"})
+        r = c.get("/v1/dashboard/agents", cookies=cookies)
+        a = {x["identity"]: x for x in r.json()["agents"]}["d1-test-agent"]
+        # The single claimed still wins
+        self.assertEqual(a["current_task"], "directive:dir-d1-test-agent-0")
+        # current_task_id from heartbeat is NOT applied (it was pending)
+        self.assertEqual(a["current_task_id"], "dir-d1-test-agent-0")
+
+    def test_d2_24_malformed_json_rejected(self) -> None:
+        """D2-B corrective: a heartbeat with Content-Type
+        application/json and an unparseable body must be REJECTED
+        (400 or 422). A plain heartbeat with no body must still work."""
+        c = self._client
+        # Plain heartbeat (no body) -> 204
+        r = c.patch("/v1/agents/d1-test-agent/heartbeat",
+                   headers={"X-API-Key": KEY})
+        self.assertEqual(r.status_code, 204, r.text[:200])
+        # Malformed JSON -> 400
+        r = c.patch("/v1/agents/d1-test-agent/heartbeat",
+                   headers={"X-API-Key": KEY, "Content-Type": "application/json"},
+                   content=b"{not-json")
+        self.assertIn(r.status_code, (400, 422),
+                      f"malformed JSON expected 400/422, got {r.status_code}: {r.text[:200]}")
+        # A valid heartbeat (after the bad one) still works
+        r = c.patch("/v1/agents/d1-test-agent/heartbeat",
+                   headers={"X-API-Key": KEY},
+                   json={"work_state": "WORKING"})
+        self.assertEqual(r.status_code, 204, r.text[:200])
+        cookies = _login(c)
+        r = c.get("/v1/dashboard/agents", cookies=cookies)
+        a = {x["identity"]: x for x in r.json()["agents"]}["d1-test-agent"]
+        self.assertEqual(a["work_state"], "WORKING")

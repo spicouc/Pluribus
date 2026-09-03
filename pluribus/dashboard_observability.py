@@ -244,29 +244,32 @@ async def dashboard_agents(_request: Request) -> dict[str, Any]:
         cur = await db.execute(
             """SELECT id, name, permissions, allowed_scopes, is_active,
                       last_active_at, work_state, current_task_id,
-                      current_project, current_blocker
+                      current_project, current_blocker,
+                      current_blocker_reported
                FROM agents ORDER BY name"""
         )
         rows = await cur.fetchall()
-        # Active CLAIMED directives per agent (current_task).
+        # Active CLAIMED directives per agent. Deterministic ordering
+        # so we can pick the right one (or detect ambiguity).
         cur = await db.execute(
-            """SELECT target_agent_id, id, action, created_at
+            """SELECT target_agent_id, id, action, claimed_at, created_at
                FROM directives
-               WHERE status = 'claimed'"""
+               WHERE status = 'claimed'
+               ORDER BY claimed_at DESC, created_at DESC, id DESC"""
         )
         claimed_rows = await cur.fetchall()
-        # PENDING directives per agent.
+        # PENDING directives per agent. Deterministic ordering.
         cur = await db.execute(
             """SELECT target_agent_id, id, action, created_at
                FROM directives
                WHERE status = 'pending'
-               ORDER BY created_at DESC"""
+               ORDER BY created_at DESC, id DESC"""
         )
         pending_rows = await cur.fetchall()
 
     claimed_by_agent: dict[str, list[tuple]] = {}
-    for tr, did, daction, dcreated in claimed_rows:
-        claimed_by_agent.setdefault(tr, []).append((did, daction, dcreated))
+    for tr, did, daction, dclaimed, dcreated in claimed_rows:
+        claimed_by_agent.setdefault(tr, []).append((did, daction, dclaimed, dcreated))
     pending_by_agent: dict[str, list[tuple]] = {}
     for tr, did, daction, dcreated in pending_rows:
         pending_by_agent.setdefault(tr, []).append((did, daction, dcreated))
@@ -275,7 +278,8 @@ async def dashboard_agents(_request: Request) -> dict[str, Any]:
     for row in rows:
         (agent_id, name, perms_json, scopes_json, is_active,
          last_active_at, work_state, current_task_id,
-         current_project, current_blocker) = row
+         current_project, current_blocker,
+         current_blocker_reported) = row
         try:
             perms = json.loads(perms_json) if perms_json else {}
         except Exception:
@@ -296,18 +300,30 @@ async def dashboard_agents(_request: Request) -> dict[str, Any]:
         last_reported_work_state = ws["last_reported_work_state"]
         telemetry_freshness = ws["telemetry_freshness"]
 
-        # current_task: ONLY from a CLAIMED directive or from
-        # current_task_id that matches a directive.
+        # current_task: authoritative rule per D2-B corrective.
+        #
+        # 1) If heartbeat current_task_id matches a currently
+        #    CLAIMED directive for this agent -> that directive.
+        # 2) Else if EXACTLY ONE claimed directive exists -> that one.
+        # 3) Else if ZERO claimed directives -> UNKNOWN.
+        # 4) Else (multiple claimed, no explicit valid current_task_id)
+        #    -> UNKNOWN. We do NOT arbitrarily choose.
         claimed = claimed_by_agent.get(agent_id, [])
         current_task = UNKNOWN
         current_task_id_val: Any = UNKNOWN
-        if current_task_id and any(d[0] == current_task_id for d in claimed):
-            current_task_id_val = current_task_id
-            current_task = f"directive:{current_task_id}"
-        elif claimed:
-            did, daction, dcreated = claimed[0]
-            current_task_id_val = did
-            current_task = f"directive:{did}"
+        claimed_directive_count = len(claimed)
+        if current_task_id:
+            match = next((d for d in claimed if d[0] == current_task_id), None)
+            if match is not None:
+                did, daction, dclaimed, dcreated = match
+                current_task_id_val = did
+                current_task = f"directive:{did}"
+        if current_task == UNKNOWN:
+            if claimed_directive_count == 1:
+                did, daction, dclaimed, dcreated = claimed[0]
+                current_task_id_val = did
+                current_task = f"directive:{did}"
+            # else: 0 or >1 without explicit -> stays UNKNOWN
 
         # pending_directive (D1 truthfulness — separate from current_task)
         pending = pending_by_agent.get(agent_id, [])
@@ -327,14 +343,17 @@ async def dashboard_agents(_request: Request) -> dict[str, Any]:
         # The directive scope lives in the directive row; we do not
         # mine it. Project = explicit agent telemetry.
         project = current_project if current_project else UNKNOWN
-        # blocker: explicit current_blocker. Documented semantics:
-        #   current_blocker == None or empty -> NONE
-        #   current_blocker set -> that string
-        #   never reported -> UNKNOWN
-        if current_blocker is None or current_blocker == "":
-            blocker = "NONE" if last_active_at else UNKNOWN
+        # blocker: explicit current_blocker. D2-B corrective semantics:
+        #   current_blocker_reported = 0 -> UNKNOWN (never reported)
+        #   current_blocker_reported = 1 + current_blocker IS NULL -> NONE
+        #   current_blocker_reported = 1 + current_blocker = string -> that string
+        if current_blocker_reported:
+            if current_blocker is None or current_blocker == "":
+                blocker = "NONE"
+            else:
+                blocker = current_blocker
         else:
-            blocker = current_blocker
+            blocker = UNKNOWN
 
         agents.append({
             "name":                    name,
@@ -348,6 +367,7 @@ async def dashboard_agents(_request: Request) -> dict[str, Any]:
             "work_state":              effective_work_state,
             "current_task":            current_task,
             "current_task_id":         current_task_id_val,
+            "claimed_directive_count": claimed_directive_count,
             "pending_directive":       pending_directive,
             "project":                 project,
             "blocker":                 blocker,
