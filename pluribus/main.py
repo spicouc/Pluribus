@@ -24,6 +24,7 @@ from pluribus.compact import compact_database
 from pluribus.config import settings
 from pluribus.dashboard import router as dashboard_router
 from pluribus.dashboard_observability import router as dashboard_observability_router
+from pluribus.dashboard_session import auth_router as dashboard_session_router
 from pluribus.db import get_db, init_db
 from pluribus.directives import router as directives_router
 from pluribus.directives_schema import init_directives_db
@@ -160,11 +161,15 @@ app.include_router(xerrameca_console_entry_router)
 app.include_router(admin_config_view_router, dependencies=[Depends(dashboard_authorize)])
 app.include_router(admin_config_router, dependencies=[Depends(dashboard_authorize)])
 app.include_router(dashboard_router, dependencies=[Depends(dashboard_authorize)])
-# D1 unified dashboard observability — narrow read-only endpoints that do NOT
-# require admin. We attach memory_authorize as the *only* guard so any
-# agent with `read` permission (or the browser session backing /dashboard)
-# can render the HOME / AGENTS / MEMORY / SYSTEM tabs.
-app.include_router(dashboard_observability_router, dependencies=memory_dependencies)
+# D1 unified dashboard observability — narrow read-only endpoints. Each
+# endpoint carries its own guard (dashboard_session_authorize) which
+# accepts either an HttpOnly session cookie (browser) or an X-API-Key
+# header (server-to-server, tests, CI). The router itself does NOT
+# inherit any global dependency because the previous memory_dependencies
+# guard was path-routed for /v1/memory/* and did NOT cover
+# /v1/dashboard/*.
+app.include_router(dashboard_observability_router)
+app.include_router(dashboard_session_router)
 # Intercept MCP semantic/recall/sync/directive calls while delegating other tools.
 app.include_router(mcp_async_router, dependencies=[Depends(mcp_authorize)])
 app.include_router(mcp_router, dependencies=[Depends(mcp_authorize)])

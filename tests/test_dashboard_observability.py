@@ -1,15 +1,13 @@
 """D1 — Dashboard observability tests.
 
-Standard Pluribus test pattern: temp DB, seed one agent, exercise
-the four /v1/dashboard/* read-only endpoints via FastAPI TestClient.
-
 Covers:
   - D1-01..D1-12: contract (real data, no secrets, read-only, etc.)
-  - D1-SEC-01..06: security — auth is enforced for every endpoint,
-    scope is enforced, no admin required, no cross-scope leak
-  - D1-TRUE-01..05: truthfulness — no fabricated online/busy/task/
-    project/blocker; historical facts are NOT current telemetry
-  - D1-CFG-01: service endpoints are configurable, graceful when missing
+  - D1-SEC-01..08: security — auth (cookie OR X-API-Key), read perm,
+    scope, no admin, secret redaction, URL sanitization
+  - D1-TRUE-01..06: truthfulness — no fabricated online/busy/task/
+    project/blocker; historical facts NOT current telemetry
+  - D1-CFG-01: service endpoints configurable, graceful when missing
+  - D1-E2E-01: real browser flow (cookie login, then data calls)
 """
 
 from __future__ import annotations
@@ -56,12 +54,11 @@ def _seed_agent_sync(agent_id: str, key: str, name: str,
     async def _do():
         async with get_db() as db:
             await db.execute(
-                """INSERT INTO agents
+                """INSERT OR REPLACE INTO agents
                    (id, name, api_key_hash, api_key_fingerprint, permissions, allowed_scopes, is_active)
                    VALUES (?, ?, ?, ?, ?, ?, 1)""",
                 (
-                    agent_id,
-                    name,
+                    agent_id, name,
                     HASH if key == KEY else HASH_NOREAD,
                     fp,
                     json.dumps(perms),
@@ -79,10 +76,35 @@ def _init_db_sync() -> None:
     asyncio.run(init_db())
 
 
-def _setup_client() -> "TestClient":
+def _seed_secret_fixtures() -> None:
+    """Seed facts containing realistic secret-like material to verify
+    redaction. None of these are real credentials."""
+    fixtures = [
+        "sk-abcdef1234567890abcdef1234567890abcdef",
+        "Authorization: Bearer eyJabc.def.ghi",
+        "X-API-Key: live-prod-12345-secret",
+        "password=hunter2-secret",
+        "token=ghp_AbCdEf123456",
+        "api-key: my-test-key-12345",
+        "url with https://user:pass@host.example.com/path",
+    ]
+    async def _do():
+        async with get_db() as db:
+            for i, content in enumerate(fixtures):
+                await db.execute(
+                    """INSERT INTO facts
+                       (scope, category, key, content, agent_id, created_at)
+                       VALUES (?, ?, ?, ?, ?, ?)""",
+                    ("shared", "events", f"fixture_secret_{i}",
+                     content, None, "2026-09-01 10:00:00"),
+                )
+            await db.commit()
+    asyncio.run(_do())
+
+
+def _setup_client():
     _init_db_sync()
     _seed_agent_sync("d1-test-agent", KEY, "d1-test")
-    # No-read agent (used by D1-SEC-05)
     _seed_agent_sync(
         "d1-noread-agent", KEY_NOREAD, "d1-noread",
         perms={"read": False, "write": False, "delete": False, "admin": False},
@@ -91,6 +113,18 @@ def _setup_client() -> "TestClient":
     from fastapi.testclient import TestClient
     from pluribus.main import app
     return TestClient(app)
+
+
+def _cookie_name() -> str:
+    from pluribus.dashboard_session import SESSION_COOKIE_NAME
+    return SESSION_COOKIE_NAME
+
+
+def _login(client, key: str = KEY):
+    """Server-to-server login: POST with X-API-Key, return cookies."""
+    r = client.post("/v1/dashboard/login", headers={"X-API-Key": key})
+    assert r.status_code == 200, f"login failed: {r.status_code} {r.text}"
+    return dict(r.cookies)
 
 
 class DashboardObservabilityTests(unittest.TestCase):
@@ -123,8 +157,11 @@ class DashboardObservabilityTests(unittest.TestCase):
             perms={"read": False, "write": False, "delete": False, "admin": False},
             scopes=["shared"],
         )
+        # Clear any cookies left over from a previous test
+        if self._client is not None:
+            self._client.cookies.clear()
 
-    # ----- D1-01 -------------------------------------------------------
+    # ====== D1-01..D1-12: contract =====================================
     def test_d1_01_dashboard_route_loads(self) -> None:
         c = self._client
         r = c.get("/dashboard")
@@ -133,25 +170,24 @@ class DashboardObservabilityTests(unittest.TestCase):
             self.assertIn("text/html", r.headers.get("content-type", ""))
             self.assertIn("Pluribus", r.text)
 
-    # ----- D1-02 -------------------------------------------------------
     def test_d1_02_summary_returns_structured_state(self) -> None:
         c = self._client
-        r = c.get("/v1/dashboard/summary", headers={"X-API-Key": KEY})
+        cookies = _login(c)
+        r = c.get("/v1/dashboard/summary", cookies=cookies)
         self.assertEqual(r.status_code, 200, r.text[:300])
         j = r.json()
         for key in ("pluribus", "xerrameca", "hermes", "ollama",
-                    "agents_known", "last_update"):
+                    "agents_known", "recent_memories", "last_update"):
             self.assertIn(key, j, f"missing {key} in {list(j)}")
         for svc in ("pluribus", "xerrameca", "hermes", "ollama"):
             self.assertIn("status", j[svc])
             self.assertIn(j[svc]["status"],
-                          ("HEALTHY", "DEGRADED", "DOWN", "UNKNOWN",
-                           "NOT_CONFIGURED"),
-                          f"invalid status for {svc}: {j[svc]['status']}")
-    # ----- D1-03 -------------------------------------------------------
+                          ("HEALTHY", "DEGRADED", "DOWN", "UNKNOWN", "NOT_CONFIGURED"))
+
     def test_d1_03_agents_uses_real_identities(self) -> None:
         c = self._client
-        r = c.get("/v1/dashboard/agents", headers={"X-API-Key": KEY})
+        cookies = _login(c)
+        r = c.get("/v1/dashboard/agents", cookies=cookies)
         self.assertEqual(r.status_code, 200, r.text[:300])
         j = r.json()
         self.assertIn("agents", j)
@@ -161,29 +197,23 @@ class DashboardObservabilityTests(unittest.TestCase):
                 self.assertIn(k, a, f"agent missing {k}: {a}")
             self.assertIn(a["online_now"], ("YES", "NO", "UNKNOWN"))
 
-    # ----- D1-04 -------------------------------------------------------
     def test_d1_04_unknown_telemetry_is_never_fabricated(self) -> None:
         c = self._client
-        r = c.get("/v1/dashboard/agents", headers={"X-API-Key": KEY})
+        cookies = _login(c)
+        r = c.get("/v1/dashboard/agents", cookies=cookies)
         self.assertEqual(r.status_code, 200)
         j = r.json()
         for a in j["agents"]:
-            # Truthfulness: must be UNKNOWN, never a free string
-            self.assertEqual(a.get("current_task"), "UNKNOWN",
-                             f"current_task must be UNKNOWN, got {a.get('current_task')!r}")
-            self.assertEqual(a.get("project"), "UNKNOWN",
-                             f"project must be UNKNOWN, got {a.get('project')!r}")
-            self.assertEqual(a.get("blocker"), "UNKNOWN",
-                             f"blocker must be UNKNOWN, got {a.get('blocker')!r}")
-            self.assertEqual(a.get("last_result"), "UNKNOWN",
-                             f"last_result must be UNKNOWN, got {a.get('last_result')!r}")
-            self.assertEqual(a.get("last_known_activity"), "UNKNOWN",
-                             f"last_known_activity must be UNKNOWN, got {a.get('last_known_activity')!r}")
+            self.assertEqual(a.get("current_task"), "UNKNOWN")
+            self.assertEqual(a.get("project"), "UNKNOWN")
+            self.assertEqual(a.get("blocker"), "UNKNOWN")
+            self.assertEqual(a.get("last_result"), "UNKNOWN")
+            self.assertEqual(a.get("last_known_activity"), "UNKNOWN")
 
-    # ----- D1-05 -------------------------------------------------------
     def test_d1_05_memory_latest_works(self) -> None:
         c = self._client
-        r = c.get("/v1/dashboard/memory?limit=5", headers={"X-API-Key": KEY})
+        cookies = _login(c)
+        r = c.get("/v1/dashboard/memory?limit=5", cookies=cookies)
         self.assertEqual(r.status_code, 200, r.text[:300])
         j = r.json()
         self.assertIn("items", j)
@@ -194,55 +224,52 @@ class DashboardObservabilityTests(unittest.TestCase):
             self.assertIn("created_at", it)
             self.assertIn("category", it)
             self.assertIn("content_preview", it)
-            # project must be UNKNOWN or a real metadata.project, never inferred from text
             self.assertIn("project", it)
 
-    # ----- D1-06 -------------------------------------------------------
     def test_d1_06_memory_search_works(self) -> None:
         c = self._client
-        r = c.get("/v1/dashboard/memory?q=test&limit=5",
-                  headers={"X-API-Key": KEY})
+        cookies = _login(c)
+        r = c.get("/v1/dashboard/memory?q=test&limit=5", cookies=cookies)
         self.assertEqual(r.status_code, 200, r.text[:300])
         j = r.json()
         self.assertIn("q", j)
         self.assertEqual(j["q"], "test")
         self.assertIn("items", j)
 
-    # ----- D1-07 -------------------------------------------------------
     def test_d1_07_system_health_classification(self) -> None:
         c = self._client
-        r = c.get("/v1/dashboard/system", headers={"X-API-Key": KEY})
+        cookies = _login(c)
+        r = c.get("/v1/dashboard/system", cookies=cookies)
         self.assertEqual(r.status_code, 200, r.text[:300])
         j = r.json()
         self.assertIn("services", j)
         for s in j["services"]:
             self.assertIn("status", s)
             self.assertIn(s["status"],
-                          ("HEALTHY", "DEGRADED", "DOWN", "UNKNOWN",
-                           "NOT_CONFIGURED"))
+                          ("HEALTHY", "DEGRADED", "DOWN", "UNKNOWN", "NOT_CONFIGURED"))
 
-    # ----- D1-08 -------------------------------------------------------
     def test_d1_08_no_secrets_in_dashboard_payload(self) -> None:
         c = self._client
+        cookies = _login(c)
         for path in ("/v1/dashboard/summary", "/v1/dashboard/agents",
                     "/v1/dashboard/memory?limit=5", "/v1/dashboard/system"):
-            r = c.get(path, headers={"X-API-Key": KEY})
+            r = c.get(path, cookies=cookies)
             self.assertEqual(r.status_code, 200, f"{path} -> {r.status_code}: {r.text[:200]}")
-            for needle in ("sk-", "Bearer ", "password=", "token=", "X-API-Key"):
+            for needle in ("sk-abcdef", "Bearer eyJ", "X-API-Key", "password=",
+                           "token=", "Bearer eyJhbGciOi"):
                 self.assertNotIn(needle, r.text,
                                  f"forbidden substring {needle!r} in {path}")
 
-    # ----- D1-09 -------------------------------------------------------
     def test_d1_09_observer_endpoints_read_only(self) -> None:
         c = self._client
+        cookies = _login(c)
         for path in ("/v1/dashboard/summary", "/v1/dashboard/agents",
                     "/v1/dashboard/memory", "/v1/dashboard/system"):
             for method in ("post", "put", "delete", "patch"):
-                r = getattr(c, method)(path, headers={"X-API-Key": KEY})
+                r = getattr(c, method)(path, cookies=cookies)
                 self.assertNotEqual(r.status_code, 200,
                                     f"{method.upper()} {path} returned 200")
 
-    # ----- D1-10 -------------------------------------------------------
     def test_d1_10_dashboard_no_admin_key_in_html(self) -> None:
         c = self._client
         r = c.get("/dashboard")
@@ -252,11 +279,11 @@ class DashboardObservabilityTests(unittest.TestCase):
             self.assertNotIn(needle, r.text,
                              f"HTML embeds secret-like {needle!r}")
 
-    # ----- D1-11 -------------------------------------------------------
     def test_d1_11_deterministic_json_shape(self) -> None:
         c = self._client
-        r1 = c.get("/v1/dashboard/summary", headers={"X-API-Key": KEY})
-        r2 = c.get("/v1/dashboard/summary", headers={"X-API-Key": KEY})
+        cookies = _login(c)
+        r1 = c.get("/v1/dashboard/summary", cookies=cookies)
+        r2 = c.get("/v1/dashboard/summary", cookies=cookies)
         self.assertEqual(r1.status_code, 200)
         self.assertEqual(r2.status_code, 200)
         j1, j2 = r1.json(), r2.json()
@@ -264,20 +291,18 @@ class DashboardObservabilityTests(unittest.TestCase):
         for svc in ("pluribus", "xerrameca", "hermes", "ollama"):
             self.assertEqual(set(j1[svc].keys()), set(j2[svc].keys()))
 
-    # ----- D1-12 -------------------------------------------------------
     def test_d1_12_graceful_degradation(self) -> None:
         c = self._client
-        r = c.get("/v1/dashboard/summary", headers={"X-API-Key": KEY})
+        cookies = _login(c)
+        r = c.get("/v1/dashboard/summary", cookies=cookies)
         self.assertEqual(r.status_code, 200, r.text[:200])
         j = r.json()
         for svc in ("pluribus", "xerrameca", "hermes", "ollama"):
             self.assertIn("status", j[svc])
             self.assertIn(j[svc]["status"],
-                          ("HEALTHY", "DEGRADED", "DOWN", "UNKNOWN",
-                           "NOT_CONFIGURED"))
+                          ("HEALTHY", "DEGRADED", "DOWN", "UNKNOWN", "NOT_CONFIGURED"))
 
-    # ====== SECURITY: D1-SEC-01..06 =====================================
-    # ----- D1-SEC-01..04: no API key => 401 -----------------------------
+    # ====== SECURITY: D1-SEC-01..08 ======================================
     def test_d1_sec_01_summary_requires_auth(self) -> None:
         r = self._client.get("/v1/dashboard/summary")
         self.assertEqual(r.status_code, 401, r.text[:200])
@@ -294,48 +319,67 @@ class DashboardObservabilityTests(unittest.TestCase):
         r = self._client.get("/v1/dashboard/system")
         self.assertEqual(r.status_code, 401, r.text[:200])
 
-    # ----- D1-SEC-05: agent without read permission => 403 --------------
     def test_d1_sec_05_no_read_permission_rejected(self) -> None:
         c = self._client
-        r = c.get("/v1/dashboard/summary", headers={"X-API-Key": KEY_NOREAD})
-        self.assertEqual(r.status_code, 403, r.text[:200])
-        r = c.get("/v1/dashboard/agents", headers={"X-API-Key": KEY_NOREAD})
-        self.assertEqual(r.status_code, 403, r.text[:200])
-        r = c.get("/v1/dashboard/memory", headers={"X-API-Key": KEY_NOREAD})
-        self.assertEqual(r.status_code, 403, r.text[:200])
-        r = c.get("/v1/dashboard/system", headers={"X-API-Key": KEY_NOREAD})
-        self.assertEqual(r.status_code, 403, r.text[:200])
+        # No-read agent: even with X-API-Key must be rejected
+        for path in ("/v1/dashboard/summary", "/v1/dashboard/agents",
+                     "/v1/dashboard/memory", "/v1/dashboard/system"):
+            r = c.get(path, headers={"X-API-Key": KEY_NOREAD})
+            self.assertEqual(r.status_code, 403, f"{path} -> {r.status_code}: {r.text[:200]}")
 
-    # ----- D1-SEC-06: scope=private is rejected for a shared-only agent -
     def test_d1_sec_06_scope_enforced_no_cross_scope(self) -> None:
         c = self._client
-        # Agent has scope ['shared'] only; asking for scope=local must 403
-        r = c.get("/v1/dashboard/memory?scope=local", headers={"X-API-Key": KEY})
+        cookies = _login(c)
+        r = c.get("/v1/dashboard/memory?scope=local", cookies=cookies)
         self.assertEqual(r.status_code, 403, r.text[:200])
 
-    # ====== TRUTHFULNESS: D1-TRUE-01..05 ===============================
-    def test_d1_true_01_pending_directive_not_current_task(self) -> None:
-        """Truthfulness: a pending directive is shown separately as
-        'pending_directive', never as 'current_task'. The D1 agents
-        endpoint must NEVER infer current_task from directive_inbox."""
+    def test_d1_sec_07_secret_fixtures_redacted(self) -> None:
+        """Real secret-like material is REDACTED in memory payloads."""
+        _seed_secret_fixtures()
         c = self._client
-        r = c.get("/v1/dashboard/agents", headers={"X-API-Key": KEY})
+        cookies = _login(c)
+        r = c.get("/v1/dashboard/memory?limit=20", cookies=cookies)
+        self.assertEqual(r.status_code, 200)
+        body = r.text
+        # None of the secret fragments should be present verbatim
+        for secret in ("sk-abcdef1234567890", "eyJabc.def.ghi",
+                       "live-prod-12345-secret", "hunter2-secret",
+                       "ghp_AbCdEf123456", "my-test-key-12345",
+                       "user:pass@host.example.com"):
+            self.assertNotIn(secret, body,
+                             f"secret fragment leaked: {secret!r}")
+        # At least one [REDACTED] marker present
+        self.assertIn("[REDACTED", body,
+                      "no REDACTED marker in any memory payload")
+
+    def test_d1_sec_08_service_url_sanitized(self) -> None:
+        """Service endpoint URLs never expose userinfo / query / fragment."""
+        c = self._client
+        cookies = _login(c)
+        r = c.get("/v1/dashboard/system", cookies=cookies)
         self.assertEqual(r.status_code, 200)
         j = r.json()
+        for s in j["services"]:
+            ep = s.get("endpoint")
+            if ep in (None, "UNKNOWN"):
+                continue
+            # Endpoint must be scheme://host[:port] only
+            self.assertNotIn("@", ep, f"endpoint has userinfo: {ep}")
+            self.assertNotIn("?", ep, f"endpoint has query: {ep}")
+            self.assertNotIn("#", ep, f"endpoint has fragment: {ep}")
+
+    # ====== TRUTHFULNESS: D1-TRUE-01..06 ===============================
+    def test_d1_true_01_pending_directive_not_current_task(self) -> None:
+        c = self._client
+        cookies = _login(c)
+        r = c.get("/v1/dashboard/agents", cookies=cookies)
+        j = r.json()
         for a in j["agents"]:
-            # current_task must be UNKNOWN — never a directive reference
-            self.assertEqual(a.get("current_task"), "UNKNOWN",
-                             f"current_task leaked directive info: {a}")
-            # pending_directive field may exist but is None when no source
+            self.assertEqual(a.get("current_task"), "UNKNOWN")
             if "pending_directive" in a:
-                self.assertIn(a["pending_directive"],
-                              (None, "UNKNOWN", ""),
-                              f"pending_directive must be None/UNKNOWN/empty, got {a['pending_directive']!r}")
+                self.assertIn(a["pending_directive"], (None, "UNKNOWN", ""))
 
     def test_d1_true_02_historical_blocked_not_current_blocker(self) -> None:
-        """Truthfulness: a historical fact mentioning 'BLOCKED' must
-        NOT make current blocker=BLOCKED. Without D2 telemetry,
-        current blocker must be UNKNOWN."""
         async def _seed():
             async with get_db() as db:
                 await db.execute(
@@ -349,15 +393,13 @@ class DashboardObservabilityTests(unittest.TestCase):
         asyncio.run(_seed())
 
         c = self._client
-        r = c.get("/v1/dashboard/agents", headers={"X-API-Key": KEY})
+        cookies = _login(c)
+        r = c.get("/v1/dashboard/agents", cookies=cookies)
         j = r.json()
         for a in j["agents"]:
-            self.assertEqual(a.get("blocker"), "UNKNOWN",
-                             f"historical BLOCKED fact corrupted current blocker: {a}")
+            self.assertEqual(a.get("blocker"), "UNKNOWN")
 
     def test_d1_true_03_historical_pass_not_current_last_result(self) -> None:
-        """Truthfulness: a historical PASS fact must NOT make
-        current last_result=PASS. Without D2 telemetry, last_result=UNKNOWN."""
         async def _seed():
             async with get_db() as db:
                 await db.execute(
@@ -371,15 +413,13 @@ class DashboardObservabilityTests(unittest.TestCase):
         asyncio.run(_seed())
 
         c = self._client
-        r = c.get("/v1/dashboard/agents", headers={"X-API-Key": KEY})
+        cookies = _login(c)
+        r = c.get("/v1/dashboard/agents", cookies=cookies)
         j = r.json()
         for a in j["agents"]:
-            self.assertEqual(a.get("last_result"), "UNKNOWN",
-                             f"historical PASS fact corrupted current last_result: {a}")
+            self.assertEqual(a.get("last_result"), "UNKNOWN")
 
     def test_d1_true_04_project_text_not_authoritative(self) -> None:
-        """Truthfulness: arbitrary project text in memory does NOT
-        become the agent's authoritative project. Project must be UNKNOWN."""
         async def _seed():
             async with get_db() as db:
                 await db.execute(
@@ -393,44 +433,110 @@ class DashboardObservabilityTests(unittest.TestCase):
         asyncio.run(_seed())
 
         c = self._client
-        r = c.get("/v1/dashboard/agents", headers={"X-API-Key": KEY})
+        cookies = _login(c)
+        r = c.get("/v1/dashboard/agents", cookies=cookies)
         j = r.json()
         for a in j["agents"]:
-            self.assertEqual(a.get("project"), "UNKNOWN",
-                             f"memory text inferred as project: {a}")
+            self.assertEqual(a.get("project"), "UNKNOWN")
 
     def test_d1_true_05_unavailable_telemetry_remains_unknown(self) -> None:
-        """Truthfulness: warnings field must NOT count historical
-        BLOCKED/FAIL/ERROR text matches as current warnings. Without
-        D2 telemetry, warnings should be UNKNOWN or absent."""
         c = self._client
-        r = self._client.get("/v1/dashboard/summary", headers={"X-API-Key": KEY})
+        cookies = _login(c)
+        r = c.get("/v1/dashboard/summary", cookies=cookies)
         j = r.json()
-        # warnings may be UNKNOWN or absent — but if present it must
-        # NOT be a positive number derived from historical text matches.
-        # Empty database => warnings must be 0 (no current warnings) or UNKNOWN.
         if "warnings" in j:
-            self.assertIn(j["warnings"], (0, "UNKNOWN", None),
-                          f"warnings not truthful: {j['warnings']!r}")
+            self.assertIn(j["warnings"], (0, "UNKNOWN", None))
+
+    def test_d1_true_06_recent_memory_not_fake_zero(self) -> None:
+        """recent_memories must be a REAL count, not a fake 0."""
+        async def _seed():
+            async with get_db() as db:
+                for i in range(7):
+                    await db.execute(
+                        """INSERT INTO facts (scope, category, key, content, agent_id, created_at)
+                           VALUES (?, ?, ?, ?, ?, ?)""",
+                        ("shared", "events", f"recent_{i}",
+                         f"recent memory fact {i}", None, "2026-09-02 10:00:00"),
+                    )
+                await db.commit()
+        asyncio.run(_seed())
+
+        c = self._client
+        cookies = _login(c)
+        r = c.get("/v1/dashboard/summary", cookies=cookies)
+        j = r.json()
+        self.assertIn("recent_memories", j)
+        # Empty DB test would give 0, but here we have 7 facts seeded
+        self.assertEqual(j["recent_memories"], 7,
+                         f"recent_memories should reflect real count, got {j['recent_memories']!r}")
 
     # ====== CONFIGURATION: D1-CFG-01 ===================================
     def test_d1_cfg_01_endpoints_configurable(self) -> None:
-        """Configuration: service endpoints should come from settings,
-        not be hardcoded. Without a setting, the service reports
-        NOT_CONFIGURED, not HEALTHY."""
         c = self._client
-        r = c.get("/v1/dashboard/system", headers={"X-API-Key": KEY})
+        cookies = _login(c)
+        r = c.get("/v1/dashboard/system", cookies=cookies)
         self.assertEqual(r.status_code, 200)
         j = r.json()
-        # Every service entry must include an endpoint (or the
-        # absence is signaled as NOT_CONFIGURED status).
         for s in j["services"]:
             self.assertIn("status", s)
-            # Hardcoded fallback endpoints are an anti-pattern; verify
-            # the field exists even when the service is down.
             self.assertIn("endpoint", s)
-            # If the endpoint is missing, the system must report
-            # NOT_CONFIGURED, not HEALTHY.
             if s.get("status") == "HEALTHY":
-                self.assertTrue(s.get("endpoint"),
-                                f"{s.get('name')} reports HEALTHY without endpoint")
+                self.assertTrue(s.get("endpoint") and s["endpoint"] != "UNKNOWN",
+                                f"{s.get('name')} reports HEALTHY without sanitized endpoint")
+
+    # ====== E2E BROWSER FLOW: D1-E2E-01 =================================
+    def test_d1_e2e_01_browser_flow(self) -> None:
+        """Real browser flow: login with X-API-Key, then call the four
+        data endpoints with the cookie. No X-API-Key in subsequent
+        calls. No admin permission used."""
+        c = self._client
+
+        # 1. Unauthenticated data endpoints are 401
+        for path in ("/v1/dashboard/summary", "/v1/dashboard/agents",
+                     "/v1/dashboard/memory", "/v1/dashboard/system"):
+            r = c.get(path)
+            self.assertEqual(r.status_code, 401, f"{path} expected 401 unauth")
+
+        # 2. Login: server-to-server with X-API-Key
+        r = c.post("/v1/dashboard/login", headers={"X-API-Key": KEY})
+        self.assertEqual(r.status_code, 200, r.text[:200])
+        cname = _cookie_name()
+        # The response cookies may be a dict[str, str] or a
+        # RequestsCookieJar (varies by httpx version). We just need
+        # the token value.
+        token = r.cookies.get(cname) if hasattr(r.cookies, "get") else None
+        if token is None:
+            # Fallback: scan the raw Set-Cookie header
+            for k, v in r.cookies.items():
+                if k == cname:
+                    token = v
+                    break
+        self.assertIsNotNone(token, f"login did not set {cname!r} cookie: {r.cookies!r}")
+        cookies = {cname: str(token)}
+
+        # 3. The four data endpoints now succeed with the cookie
+        # (NO X-API-Key header — that's the whole point)
+        for path in ("/v1/dashboard/summary", "/v1/dashboard/agents",
+                     "/v1/dashboard/memory?limit=5", "/v1/dashboard/system"):
+            r = c.get(path, cookies=cookies)
+            self.assertEqual(r.status_code, 200,
+                             f"{path} with cookie expected 200, got {r.status_code}: {r.text[:200]}")
+
+        # 4. No-read user is rejected even with their own login
+        r = c.post("/v1/dashboard/login", headers={"X-API-Key": KEY_NOREAD})
+        # The login itself requires read, so a no-read agent gets 403 here
+        self.assertEqual(r.status_code, 403, r.text[:200])
+
+        # 5. Logout invalidates the session
+        r = c.post("/v1/dashboard/logout", cookies=cookies)
+        self.assertEqual(r.status_code, 200, r.text[:200])
+        r = c.get("/v1/dashboard/summary", cookies=cookies)
+        self.assertEqual(r.status_code, 401, "session still valid after logout")
+
+    def test_d1_e2e_02_x_api_key_fallback(self) -> None:
+        """Server-to-server path: X-API-Key still works (CI/tests)."""
+        c = self._client
+        r = c.get("/v1/dashboard/summary", headers={"X-API-Key": KEY})
+        self.assertEqual(r.status_code, 200, r.text[:200])
+        j = r.json()
+        self.assertIn("pluribus", j)

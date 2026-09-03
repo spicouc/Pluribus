@@ -1,22 +1,26 @@
 """Read-only observability endpoints powering the unified Pluribus dashboard.
 
-These endpoints back the D1 4-tab dashboard (HOME / AGENTS / MEMORY / SYSTEM).
-They are intentionally narrow, side-effect free, and SECURITY-CRITICAL:
+Browser flow (D1):
+  1. Operator runs curl POST /v1/dashboard/login with X-API-Key,
+     receives a Set-Cookie: HttpOnly session token.
+  2. Operator opens the dashboard in a browser. The browser auto-
+     attaches the cookie to /v1/dashboard/* requests.
+  3. Endpoints never see the API key (cookie-only auth path).
 
-* All four endpoints are guarded by ``dashboard_observability_authorize``,
-  a dedicated guard that enforces:
-    - the request is authenticated (X-API-Key present and valid)
-    - the caller has the ``read`` permission
-    - the caller is allowed to read the requested scope
-    - never grants admin
-    - never mutates state
-  This is a defense-in-depth layer: the underlying
-  ``memory_authorize`` is path-routed and does NOT cover
-  ``/v1/dashboard/*``. See ``pluribus/authorization.py``.
-* Telemetry values that the system cannot compute are returned as the
-  literal string ``"UNKNOWN"`` — never fabricated from heuristic
-  string matches in historical memory.
-* No API keys, tokens, passwords or other secret material is exposed.
+Server-to-server / CI / tests: X-API-Key still works as a fallback.
+
+This file is intentionally narrow, side-effect free, and security-
+critical. All endpoints are guarded by ``dashboard_session_authorize``
+(``pluribus/dashboard_session.py``) which:
+  - requires an authenticated agent (cookie OR X-API-Key)
+  - requires the ``read`` permission
+  - enforces allowed scope on /memory
+  - never grants admin
+  - never mutates state
+
+Telemetry values that the system cannot compute are returned as the
+literal string ``"UNKNOWN"`` — never fabricated from heuristic
+string matches in historical memory.
 
 Endpoints:
     GET /v1/dashboard/summary   - agregated service health + counters
@@ -28,17 +32,17 @@ Endpoints:
 from __future__ import annotations
 
 import json
-import os
 import time
 from datetime import datetime, timezone
 from typing import Any
+from urllib.parse import urlparse
 
 import httpx
-from fastapi import APIRouter, Depends, HTTPException, Query, Request
+from fastapi import APIRouter, Depends, HTTPException, Query, Request, Response
 
-from pluribus.authorization import _require, _request_agent
 from pluribus.config import settings
 from pluribus.db import get_db
+from pluribus.dashboard_session import dashboard_session_authorize
 
 
 router = APIRouter(
@@ -52,81 +56,60 @@ router = APIRouter(
 UNKNOWN = "UNKNOWN"
 NOT_CONFIGURED = "NOT_CONFIGURED"
 
-# Tokens whose mere presence inside a fact means we must not expose the
-# body verbatim. Defense-in-depth on top of authorization.
-_REDACT_TOKENS = ("token", "password", "secret", "api_key")
-
-
-# --- Authorization guard (the only authz layer for this router) ---------
-
-
-async def dashboard_observability_authorize(request: Request) -> None:
-    """Dedicated authz guard for /v1/dashboard/*.
-
-    The standard ``memory_authorize`` is path-routed and does not
-    cover /v1/dashboard/*. This guard closes that gap: it requires
-    an authenticated agent, the ``read`` permission, and (for the
-    /memory endpoint) a scope the agent is allowed to read.
-
-    - Fails CLOSED (401 unauthenticated, 403 unauthorized)
-    - Never grants admin
-    - Never mutates state
-    """
-    agent = _request_agent(request)
-    if agent is None:
-        raise HTTPException(status_code=401, detail="Autenticacio requerida")
-
-    # Endpoint-level permission. We allow read on every dashboard
-    # endpoint. We explicitly do NOT check for admin — the dashboard
-    # is narrow read-only.
-    _require(agent, "read")
-
-    # Per-scope enforcement for /v1/dashboard/memory
-    if request.url.path.rstrip("/").startswith("/v1/dashboard/memory"):
-        requested_scope = request.query_params.get("scope", "shared")
-        allowed = set(agent.get("allowed_scopes", []) or [])
-        if requested_scope not in allowed:
-            raise HTTPException(
-                status_code=403,
-                detail=f"Scope '{requested_scope}' no autoritzat per a aquest agent",
-            )
+# Secret-like substrings: any of these in a memory fact triggers
+# REDACTED. Defense-in-depth on top of authorization.
+_SECRET_TOKENS = (
+    "token", "password", "secret", "api_key", "api-key",
+    "authorization", "bearer", "sk-", "ghp_", "x-api-key",
+    "x_api_key", "access_token", "refresh_token", "client_secret",
+    "private_key", "secret_key", "auth_token", "session_token",
+    "pass@",  # URL userinfo password (e.g. https://user:pass@host)
+    "x-auth", "x-token", "cookie:",
+)
 
 
 # --- Configuration-driven service endpoints ------------------------------
 
 
 def _service_endpoints() -> dict[str, str]:
-    """Resolve the SERVICE_ENDPOINTS dict from settings, with
-    graceful fallback.
+    """Resolve the SERVICE_ENDPOINTS dict from settings.
 
-    Pluribus (the dashboard host) is always included: we know where
-    we are. Xerrameca, Hermes, Ollama come from the Pluribus
-    settings if configured, otherwise an explicit NOT_CONFIGURED
-    sentinel is returned for them.
-
-    We DO NOT hardcode Tailscale IPs into the source — deployments
-    vary, and the canonical config lives in the Pluribus settings.
+    Pluribus (the dashboard host) is always included. The other
+    services are optional — if not configured they surface as
+    NOT_CONFIGURED in the UI. We DO NOT hardcode deployment-
+    specific Tailscale IPs into the source.
     """
     endpoints: dict[str, str] = {}
-    # Pluribus: we can derive from our own request
-    # (host header / forwarded host) when behind a tunnel, but for
-    # the in-process /dashboard access we use settings.PLURIBUS_BIND
-    # or a sensible default to the loopback.
     pluribus_url = getattr(settings, "PLURIBUS_DASHBOARD_BASE_URL", None) or \
         f"http://{getattr(settings, 'PLURIBUS_HOST', '127.0.0.1')}:{getattr(settings, 'PLURIBUS_PORT', 8790)}"
     endpoints["pluribus"] = pluribus_url
-
-    # Xerrameca, Hermes, Ollama are optional — if not configured they
-    # surface as NOT_CONFIGURED in the UI.
     for name, attr in (("xerrameca", "XERRAMECA_DASHBOARD_URL"),
                        ("hermes",    "HERMES_DASHBOARD_URL"),
                        ("ollama",    "OLLAMA_BASE_URL")):
         url = getattr(settings, attr, None)
         if url:
             endpoints[name] = url
-        # else: leave out — the /system endpoint reports NOT_CONFIGURED
-
     return endpoints
+
+
+def _sanitize_endpoint(url: str | None) -> str:
+    """Strip userinfo, query and fragment from a URL.
+
+    Browser displays scheme://host[:port] only. Never expose
+    credentials embedded in the URL.
+    """
+    if not url:
+        return UNKNOWN
+    try:
+        p = urlparse(url)
+    except Exception:
+        return UNKNOWN
+    if not p.scheme or not p.hostname:
+        return UNKNOWN
+    host = p.hostname
+    if p.port:
+        return f"{p.scheme}://{host}:{p.port}"
+    return f"{p.scheme}://{host}"
 
 
 # --- Helpers --------------------------------------------------------------
@@ -137,7 +120,6 @@ def _now_iso() -> str:
 
 
 def _classify(status: str, elapsed_ms: float | None, error: str | None) -> str:
-    """Map a probe outcome into a dashboard-friendly health label."""
     if error is not None:
         return "DOWN"
     if status.startswith("5"):
@@ -166,7 +148,6 @@ async def _probe(url: str, timeout: float = 2.5) -> dict[str, Any]:
 
 
 def _try_extract_version(body: str) -> str | None:
-    """Best-effort version extraction from common JSON shapes."""
     try:
         j = json.loads(body)
     except Exception:
@@ -179,11 +160,13 @@ def _try_extract_version(body: str) -> str | None:
 
 
 def _redact_content(content: str) -> str:
-    """Replace any token-bearing segment with [REDACTED]."""
+    """If any secret-like token appears, replace the whole content
+    with [REDACTED: ...]. Defense-in-depth; primary boundary is
+    authorization + scope."""
     if not content:
         return content
     lower = content.lower()
-    for tok in _REDACT_TOKENS:
+    for tok in _SECRET_TOKENS:
         if tok in lower:
             return "[REDACTED: contains secret-like material]"
     return content
@@ -192,9 +175,10 @@ def _redact_content(content: str) -> str:
 # --- /v1/dashboard/summary -----------------------------------------------
 
 
-@router.get("/summary", dependencies=[Depends(dashboard_observability_authorize)])
+@router.get("/summary", dependencies=[Depends(dashboard_session_authorize)])
 async def dashboard_summary(_request: Request) -> dict[str, Any]:
-    """Global health summary + counters. All unknown values are UNKNOWN."""
+    """Global health summary + counters. All unknown values are UNKNOWN
+    or computed cheaply from a real DB read (no fabricated numbers)."""
     endpoints = _service_endpoints()
     probes: dict[str, dict[str, Any]] = {}
     if "pluribus" in endpoints:
@@ -207,28 +191,32 @@ async def dashboard_summary(_request: Request) -> dict[str, Any]:
         else:
             probes[name] = {"status": NOT_CONFIGURED}
 
-    # agent count: read scope shared. We use a direct DB query so we
-    # don't depend on /v1/identity/peers being available.
     async with get_db() as db:
         cur = await db.execute("SELECT count(*) FROM agents WHERE is_active = 1")
         agents_known = (await cur.fetchone())[0]
+        # recent_memories is a real, cheap count from the shared scope
+        cur = await db.execute(
+            "SELECT count(*) FROM facts WHERE scope = 'shared' "
+            "AND deleted_at IS NULL"
+        )
+        recent_memories_count = (await cur.fetchone())[0]
 
     return {
-        "pluribus":   probes.get("pluribus",   {"status": UNKNOWN}),
-        "xerrameca":  probes.get("xerrameca",  {"status": NOT_CONFIGURED}),
-        "hermes":     probes.get("hermes",     {"status": NOT_CONFIGURED}),
-        "ollama":     probes.get("ollama",     {"status": NOT_CONFIGURED}),
-        "agents_known":   agents_known,
-        "recent_memories": 0,  # UNKNOWN until D2 telemetry
-        "warnings":        UNKNOWN,  # UNKNOWN: no current-state source
-        "last_update":     _now_iso(),
+        "pluribus":         probes.get("pluribus",   {"status": UNKNOWN}),
+        "xerrameca":        probes.get("xerrameca",  {"status": NOT_CONFIGURED}),
+        "hermes":           probes.get("hermes",     {"status": NOT_CONFIGURED}),
+        "ollama":           probes.get("ollama",     {"status": NOT_CONFIGURED}),
+        "agents_known":     agents_known,
+        "recent_memories":  recent_memories_count,
+        "warnings":         UNKNOWN,  # UNKNOWN: no current-state source
+        "last_update":      _now_iso(),
     }
 
 
 # --- /v1/dashboard/agents ------------------------------------------------
 
 
-@router.get("/agents", dependencies=[Depends(dashboard_observability_authorize)])
+@router.get("/agents", dependencies=[Depends(dashboard_session_authorize)])
 async def dashboard_agents(_request: Request) -> dict[str, Any]:
     """List known agents. ALL telemetry fields are UNKNOWN by default.
 
@@ -258,14 +246,14 @@ async def dashboard_agents(_request: Request) -> dict[str, Any]:
             "name":                name,
             "identity":            agent_id,
             "active_flag":         bool(is_active),
-            "online_now":          UNKNOWN,  # requires heartbeat (D2)
-            "last_known_activity": UNKNOWN,  # requires heartbeat
-            "current_task":        UNKNOWN,  # not derivable from memory
-            "pending_directive":   None,     # explicit field, None when none
-            "project":             UNKNOWN,  # not authoritative from text
-            "blocker":             UNKNOWN,  # not authoritative from text
-            "last_result":         UNKNOWN,  # not authoritative from text
-            "registered_at":       UNKNOWN,  # requires schema addition
+            "online_now":          UNKNOWN,
+            "last_known_activity": UNKNOWN,
+            "current_task":        UNKNOWN,
+            "pending_directive":   None,
+            "project":             UNKNOWN,
+            "blocker":             UNKNOWN,
+            "last_result":         UNKNOWN,
+            "registered_at":       UNKNOWN,
             "allowed_scopes":      scopes,
             "permissions":         perms,
         })
@@ -277,7 +265,7 @@ async def dashboard_agents(_request: Request) -> dict[str, Any]:
 # --- /v1/dashboard/memory ------------------------------------------------
 
 
-@router.get("/memory", dependencies=[Depends(dashboard_observability_authorize)])
+@router.get("/memory", dependencies=[Depends(dashboard_session_authorize)])
 async def dashboard_memory(
     request: Request,
     limit: int = Query(20, ge=1, le=200),
@@ -287,9 +275,6 @@ async def dashboard_memory(
     scope = request.query_params.get("scope", "shared")
 
     if q:
-        # FTS path — match the pattern used by /api/search in
-        # dashboard.py: JOIN facts with the contentless FTS table,
-        # then filter by scope at the facts row level.
         async with get_db() as db:
             cur = await db.execute(
                 """SELECT f.id, f.scope, f.category, f.key, f.content,
@@ -305,8 +290,9 @@ async def dashboard_memory(
     else:
         async with get_db() as db:
             cur = await db.execute(
-                """SELECT id, scope, category, key, content, agent_id, created_at, metadata
-                   FROM facts WHERE scope = ?
+                """SELECT id, scope, category, key, content, agent_id,
+                          created_at, metadata
+                   FROM facts WHERE scope = ? AND deleted_at IS NULL
                    ORDER BY created_at DESC LIMIT ?""",
                 (scope, limit),
             )
@@ -333,17 +319,19 @@ async def dashboard_memory(
             "project":          project,
         })
 
-    # Total count
     async with get_db() as db:
-        cur = await db.execute("SELECT count(*) FROM facts WHERE scope = ?", (scope,))
+        cur = await db.execute(
+            "SELECT count(*) FROM facts WHERE scope = ? AND deleted_at IS NULL",
+            (scope,),
+        )
         total = (await cur.fetchone())[0]
 
     return {
-        "items": items,
-        "total": total,
-        "limit": limit,
-        "q":    q,
-        "scope": scope,
+        "items":       items,
+        "total":       total,
+        "limit":       limit,
+        "q":           q,
+        "scope":       scope,
         "last_update": _now_iso(),
     }
 
@@ -351,10 +339,10 @@ async def dashboard_memory(
 # --- /v1/dashboard/system ------------------------------------------------
 
 
-@router.get("/system", dependencies=[Depends(dashboard_observability_authorize)])
+@router.get("/system", dependencies=[Depends(dashboard_session_authorize)])
 async def dashboard_system(_request: Request) -> dict[str, Any]:
-    """Per-service health. Services without a configured endpoint
-    surface as NOT_CONFIGURED, not HEALTHY."""
+    """Per-service health. Endpoints are sanitized: the UI never
+    sees userinfo / query / fragment of a configured URL."""
     endpoints = _service_endpoints()
     services: list[dict[str, Any]] = []
     last_check = _now_iso()
@@ -365,13 +353,11 @@ async def dashboard_system(_request: Request) -> dict[str, Any]:
             "name":        name,
             "status":      probe.get("status", UNKNOWN),
             "version":     probe.get("version", UNKNOWN),
-            "endpoint":    url,
+            "endpoint":    _sanitize_endpoint(url),
             "elapsed_ms":  probe.get("elapsed_ms"),
             "last_check":  last_check,
         })
 
-    # Surface any not-yet-discovered service as NOT_CONFIGURED so the
-    # UI can render a complete picture even when something is missing.
     canonical = {"pluribus", "xerrameca", "hermes", "ollama"}
     for name in canonical:
         if name not in endpoints:
@@ -379,7 +365,7 @@ async def dashboard_system(_request: Request) -> dict[str, Any]:
                 "name":       name,
                 "status":     NOT_CONFIGURED,
                 "version":    UNKNOWN,
-                "endpoint":   None,
+                "endpoint":   UNKNOWN,
                 "elapsed_ms": None,
                 "last_check": last_check,
             })
