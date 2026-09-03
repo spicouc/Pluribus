@@ -275,435 +275,271 @@ async def get_ollama_models() -> JSONResponse:
 
 @router.get("/dashboard", response_class=HTMLResponse)
 async def get_dashboard() -> HTMLResponse:
-    """Retorna un dashboard HTML complet amb Chart.js."""
+    """D1 unified observability dashboard (HOME / AGENTS / MEMORY / SYSTEM).
+
+    READ-ONLY. No API key in HTML. The browser fetches the four
+    /v1/dashboard/* read-only endpoints (no admin required, just any
+    agent with `read` permission) and renders the data. Auto-refresh
+    every 20 seconds. Unknown fields are explicitly shown as
+    `UNKNOWN` — we never fabricate online/busy/task/project/blocker.
+    """
     html = """<!DOCTYPE html>
 <html lang="ca">
 <head>
 <meta charset="UTF-8">
-<meta name="viewport" content="width=device-width, initial-scale=1.0">
-<title>Pluribus - Dashboard</title>
-<script defer src="https://cdn.jsdelivr.net/npm/chart.js@4.4.7/dist/chart.umd.min.js"></script>
-
+<meta name="viewport" content="width-fit, initial-scale=1.0">
+<title>Pluribus — Dashboard</title>
 <style>
 * { margin: 0; padding: 0; box-sizing: border-box; -webkit-tap-highlight-color: rgba(56, 189, 248, 0.2); }
 body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif; background: #0f172a; color: #e2e8f0; padding: 16px; }
-h1 { font-size: 1.6rem; margin-bottom: 20px; color: #38bdf8; display: flex; flex-wrap: wrap; justify-content: space-between; align-items: center; gap: 10px; }
-h2 { font-size: 1.1rem; margin-bottom: 12px; color: #94a3b8; }
-.grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(300px, 1fr)); gap: 16px; margin-bottom: 20px; }
-.card { background: #1e293b; border-radius: 12px; padding: 16px; border: 1px solid #334155; }
-.card canvas { max-height: 220px; width: 100% !important; }
-.counter-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(120px, 1fr)); gap: 10px; }
-.counter { background: #1e293b; border-radius: 8px; padding: 14px 10px; text-align: center; border: 1px solid #334155; }
-.counter .value { font-size: 1.6rem; font-weight: 700; color: #38bdf8; }
-.counter .label { font-size: 0.75rem; color: #64748b; margin-top: 4px; }
-.table-wrap { overflow-x: auto; -webkit-overflow-scrolling: touch; }
-table { width: 100%; border-collapse: collapse; font-size: 0.82rem; min-width: 500px; }
-th, td { padding: 8px 10px; text-align: left; border-bottom: 1px solid #334155; white-space: nowrap; }
-th { color: #94a3b8; font-weight: 600; }
+h1 { font-size: 1.4rem; margin-bottom: 16px; color: #38bdf8; }
+h2 { font-size: 1rem; margin: 0 0 10px 0; color: #94a3b8; }
+.tabs { display: flex; gap: 4px; border-bottom: 1px solid #334155; margin-bottom: 16px; flex-wrap: wrap; }
+.tab { padding: 10px 16px; cursor: pointer; color: #94a3b8; border: 1px solid transparent; border-radius: 6px 6px 0 0; user-select: none; min-height: 40px; }
+.tab:hover { color: #cbd5e1; background: #1e293b; }
+.tab.active { color: #38bdf8; background: #1e293b; border-color: #334155; border-bottom-color: #1e293b; }
+.tab .count { display: inline-block; margin-left: 6px; padding: 0 6px; background: #334155; color: #cbd5e1; border-radius: 10px; font-size: 0.75rem; }
+.tab.active .count { background: #0f172a; }
+.panel { display: none; }
+.panel.active { display: block; }
+.grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(260px, 1fr)); gap: 14px; margin-bottom: 14px; }
+.card { background: #1e293b; border-radius: 10px; padding: 14px; border: 1px solid #334155; }
+.card h3 { font-size: 0.85rem; color: #94a3b8; margin-bottom: 6px; font-weight: 600; text-transform: uppercase; letter-spacing: 0.04em; }
+.status { display: inline-block; padding: 3px 10px; border-radius: 4px; font-size: 0.85rem; font-weight: 600; }
+.status-HEALTHY { background: #166534; color: #86efac; }
+.status-DEGRADED { background: #92400e; color: #fcd34d; }
+.status-DOWN { background: #7f1d1d; color: #fca5a5; }
+.status-UNKNOWN, .status-NOT_CONFIGURED { background: #334155; color: #94a3b8; }
+.status-OK { background: #166534; color: #86efac; }
+.status-NONE, .status-PASS { background: #334155; color: #cbd5e1; }
+.status-FAIL, .status-BLOCKED { background: #7f1d1d; color: #fca5a5; }
+.kpi { font-size: 1.6rem; font-weight: 700; color: #38bdf8; }
+.kpi-sub { font-size: 0.75rem; color: #64748b; }
+table { width: 100%; border-collapse: collapse; font-size: 0.82rem; }
+th, td { padding: 8px 10px; text-align: left; border-bottom: 1px solid #334155; vertical-align: top; }
+th { color: #94a3b8; font-weight: 600; background: #0f172a; position: sticky; top: 0; }
 td { color: #cbd5e1; }
-tr:hover { background: #334155; }
-.status-badge { display: inline-block; padding: 2px 8px; border-radius: 4px; font-size: 0.7rem; font-weight: 600; }
-.status-ok { background: #166534; color: #86efac; }
-.status-deleted { background: #7f1d1d; color: #fca5a5; }
-.status-created { background: #1e3a5f; color: #93c5fd; }
-.btn { padding: 8px 14px; border-radius: 8px; font-size: 13px; cursor: pointer; border: 1px solid #334155; background: #1e293b; color: #e2e8f0; }
-.btn-primary { background: #1e3a5f; border-color: #3b82f6; color: #93c5fd; }
-.btn-danger { background: #5b1e1e; border-color: #ef4444; color: #fca5a5; }
-.btn-warn { background: #1e293b; border-color: #f59e0b; color: #fbbf24; }
-.btn-config { min-height: 44px; touch-action: manipulation; }
-input, select { background: #0f172a; border: 1px solid #334155; color: #e2e8f0; padding: 8px 10px; border-radius: 6px; font-size: 13px; width: 100%; }
-label { display: block; color: #94a3b8; font-size: 12px; margin-bottom: 4px; }
-.config-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 12px; margin-bottom: 14px; }
-.model-dropdown { display: none; position: absolute; top: 100%; left: 0; right: 0; z-index: 100; background: #1e293b; border: 1px solid #334155; border-radius: 0 0 8px 8px; max-height: 200px; overflow-y: auto; }
-.model-dropdown.show { display: block; }
-.model-dropdown .item { padding: 8px 12px; cursor: pointer; color: #cbd5e1; font-size: 13px; border-bottom: 1px solid #334155; }
-.model-dropdown .item:hover { background: #334155; color: #e2e8f0; }
-.model-dropdown .item:last-child { border-bottom: none; }
-.model-dropdown .loading, .model-dropdown .error { padding: 12px; text-align: center; color: #64748b; font-size: 13px; }
-.model-dropdown .error { color: #f87171; }
-.search-row { display: flex; gap: 8px; flex-wrap: wrap; }
+tr:hover td { background: #334155; }
+pre { background: #0f172a; padding: 8px; border-radius: 6px; overflow-x: auto; font-size: 0.78rem; color: #cbd5e1; margin: 0; }
+.muted { color: #64748b; }
+.search-row { display: flex; gap: 6px; margin-bottom: 10px; }
+.search-row input { background: #0f172a; border: 1px solid #334155; color: #e2e8f0; padding: 6px 10px; border-radius: 6px; font-size: 13px; flex: 1; }
+.search-row button { padding: 6px 12px; background: #1e3a5f; border: 1px solid #3b82f6; color: #93c5fd; border-radius: 6px; cursor: pointer; font-size: 13px; }
+footer { color: #64748b; font-size: 0.75rem; margin-top: 20px; text-align: center; }
+.loading { color: #64748b; padding: 20px; text-align: center; font-style: italic; }
 @media (max-width: 640px) {
   body { padding: 10px; }
-  h1 { font-size: 1.3rem; gap: 8px; text-align: center; }
-  h1 .btn { padding: 10px 16px; font-size: 14px; min-height: 44px; }
-  .counter-grid { grid-template-columns: repeat(2, 1fr); gap: 8px; }
-  .counter { padding: 12px 8px; }
-  .counter .value { font-size: 1.3rem; }
-  .grid { grid-template-columns: 1fr; gap: 12px; }
-  .config-grid { grid-template-columns: 1fr; }
-  .card { padding: 12px; }
-  .card canvas { max-height: 180px; }
-  table { font-size: 0.75rem; min-width: auto; }
-  th, td { padding: 8px 6px; }
-  .btn { padding: 12px 16px; font-size: 14px; }
-  .search-row { flex-direction: column; }
-  .search-row input { min-width: 100%; }
-}
-@media (max-width: 480px) {
-  .counter-grid { grid-template-columns: repeat(2, 1fr); gap: 6px; }
-  .counter { padding: 10px 6px; }
-  .counter .value { font-size: 1.1rem; }
-  .counter .label { font-size: 0.65rem; }
-  .card canvas { max-height: 150px; }
-}
-@media (max-width: 380px) {
-  .counter-grid { gap: 6px; }
-  h1 { font-size: 1.1rem; flex-direction: column; text-align: center; }
-  h1 .btn { font-size: 14px; padding: 10px 16px; width: 100%; }
-  th, td { padding: 5px 4px; font-size: 0.7rem; }
-  .counter { padding: 8px 4px; }
-  .counter .value { font-size: 1rem; }
-  .btn { font-size: 14px; padding: 10px 14px; }
-}
-@media (hover: none) and (pointer: coarse) {
-  .btn, input, select, button { min-height: 44px; }
-  .btn { padding: 12px 20px !important; font-size: 16px !important; }
-  input, select { font-size: 16px !important; }
-  .counter-grid { gap: 10px; }
-  .counter { padding: 14px 10px; }
-  .model-dropdown .item { padding: 12px 14px; font-size: 15px; }
-  h1 .btn { padding: 12px 20px !important; font-size: 16px !important; min-width: 120px; }
+  h1 { font-size: 1.1rem; }
+  .tab { padding: 8px 10px; font-size: 0.85rem; }
+  .grid { grid-template-columns: 1fr; }
+  th, td { padding: 6px 4px; font-size: 0.75rem; }
 }
 </style>
 </head>
 <body>
-<h1>🧠 Pluribus Dashboard
-  <button onclick="toggleSettings()" class="btn btn-config" style="padding:8px 16px;font-size:14px;">⚙️ Configuració</button>
-</h1>
 
-  <div class="counter-grid" id="counters">
-    <div class="counter"><div class="value" id="active-count">--</div><div class="label">Fets Actius</div></div>
-    <div class="counter"><div class="value" id="deleted-count">--</div><div class="label">Fets Eliminats</div></div>
-    <div class="counter"><div class="value" id="chunks-count">--</div><div class="label">Fragments</div></div>
-    <div class="counter"><div class="value" id="agents-count">--</div><div class="label">Agents</div></div>
-    <div class="counter"><div class="value" id="consolidated-count">--</div><div class="label">Consolidats</div></div>
-    <div class="counter"><div class="value" id="notion-count">--</div><div class="label">Notion Cache</div></div>
-    <div class="counter"><div class="value" id="ollama-status">--</div><div class="label">Ollama</div></div>
+<h1>Pluribus — Dashboard (D1 read-only)</h1>
+
+<nav class="tabs" id="tabs">
+  <div class="tab active" data-panel="home">HOME</div>
+  <div class="tab" data-panel="agents">AGENTS</div>
+  <div class="tab" data-panel="memory">MEMORY</div>
+  <div class="tab" data-panel="system">SYSTEM</div>
+</nav>
+
+<section class="panel active" id="panel-home">
+  <div class="grid" id="home-grid"><div class="loading">Carregant...</div></div>
+</section>
+
+<section class="panel" id="panel-agents">
+  <div id="agents-content"><div class="loading">Carregant...</div></div>
+</section>
+
+<section class="panel" id="panel-memory">
+  <div class="search-row">
+    <input type="text" id="memory-q" placeholder="Cerca a Pluribus memory...">
+    <button id="memory-search-btn">Cerca</button>
   </div>
+  <div id="memory-content"><div class="loading">Carregant...</div></div>
+</section>
 
-<div class="grid">
-  <div class="card"><h2>Fets per dia (7 dies)</h2><canvas id="chart-daily"></canvas></div>
-  <div class="card"><h2>Distribució per Agent</h2><canvas id="chart-agent"></canvas></div>
-  <div class="card"><h2>Per Categoria</h2><canvas id="chart-category"></canvas></div>
-  <div class="card" style="grid-column: 1 / -1;"><h2>Mida de la Base de Dades</h2><canvas id="chart-db-size" style="max-height: 150px;"></canvas></div>
-</div>
+<section class="panel" id="panel-system">
+  <div class="grid" id="system-grid"><div class="loading">Carregant...</div></div>
+</section>
 
-<div class="card" style="margin-bottom: 20px;">
-  <h2>🔍 Cerca de Fets</h2>
-  <div style="display:flex;gap:8px;flex-wrap:wrap;">
-    <input type="text" id="search-q" placeholder="Cerca per text..." style="flex:1;min-width:150px;">
-    <select id="search-cat" style="width:auto;min-width:120px;">
-      <option value="">Totes les categories</option>
-      <option value="sense">sense</option>
-      <option value="preferences">preferences</option>
-      <option value="profile">profile</option>
-      <option value="entities">entities</option>
-      <option value="events">events</option>
-      <option value="cases">cases</option>
-      <option value="patterns">patterns</option>
-    </select>
-    <button onclick="doSearch()" class="btn btn-primary">🔍 Cercar</button>
-  </div>
-  <div id="search-results" style="margin-top:12px;font-size:0.85rem;"></div>
-</div>
-
-<!-- Settings Panel -->
-<div id="settings-panel" class="card" style="margin-top: 20px; display: none;">
-  <h2 style="display:flex;justify-content:space-between;align-items:center;">
-    ⚙️ Configuració
-    <span onclick="toggleSettings()" style="cursor:pointer;color:#64748b;font-size:20px;">✕</span>
-  </h2>
-  <div id="config-loading" style="padding:20px;text-align:center;color:#64748b;">Carregant configuració...</div>
-  <div id="config-form" style="display:none;">
-    <div class="config-grid">
-      <div>
-        <label for="cfg-PLURIBUS_OLLAMA_BASE_URL">Ollama Base URL</label>
-        <input type="text" id="cfg-PLURIBUS_OLLAMA_BASE_URL" placeholder="http://localhost:11434">
-      </div>
-      <div>
-        <label for="cfg-PLURIBUS_CONSOLIDATION_MODEL">Model de consolidació
-          <button onclick="loadOllamaModels('cfg-PLURIBUS_CONSOLIDATION_MODEL')" class="btn" style="padding:2px 8px;font-size:11px;float:right;" title="Carregar models d'Ollama">🔄</button>
-        </label>
-        <div style="position:relative;">
-          <input type="text" id="cfg-PLURIBUS_CONSOLIDATION_MODEL" placeholder="llama3.2:3b" autocomplete="off" onfocus="showModelDropdown('cfg-PLURIBUS_CONSOLIDATION_MODEL')" onblur="setTimeout(()=>hideModelDropdown(),200)">
-          <div id="dropdown-cfg-PLURIBUS_CONSOLIDATION_MODEL" class="model-dropdown"></div>
-        </div>
-      </div>
-      <div>
-        <label for="cfg-PLURIBUS_OLLAMA_MODEL">Model d'embedding
-          <button onclick="loadOllamaModels('cfg-PLURIBUS_OLLAMA_MODEL')" class="btn" style="padding:2px 8px;font-size:11px;float:right;" title="Carregar models d'Ollama">🔄</button>
-        </label>
-        <div style="position:relative;">
-          <input type="text" id="cfg-PLURIBUS_OLLAMA_MODEL" placeholder="nomic-embed-text-v2-moe" autocomplete="off" onfocus="showModelDropdown('cfg-PLURIBUS_OLLAMA_MODEL')" onblur="setTimeout(()=>hideModelDropdown(),200)">
-          <div id="dropdown-cfg-PLURIBUS_OLLAMA_MODEL" class="model-dropdown"></div>
-        </div>
-      </div>
-      <div>
-        <label>Max Chunk Size / Overlap</label>
-        <div style="display:flex;gap:8px;">
-          <input type="number" id="cfg-MAX_CHUNK_SIZE" placeholder="500">
-          <input type="number" id="cfg-CHUNK_OVERLAP" placeholder="50">
-        </div>
-      </div>
-    </div>
-    <div id="config-status" style="color:#86efac;font-size:13px;margin-bottom:12px;display:none;"></div>
-    <div style="display:flex;gap:12px;flex-wrap:wrap;align-items:center;">
-      <button onclick="saveConfig(false)" class="btn btn-primary">💾 Guardar</button>
-      <button onclick="saveConfig(true)" class="btn btn-danger">💾 Guardar & Reiniciar</button>
-      <button onclick="restartPluribus()" class="btn btn-warn">🔄 Reiniciar Pluribus</button>
-      <span style="color:#64748b;font-size:12px;" id="config-info">Els canvis requereixen reinici</span>
-    </div>
-  </div>
-</div>
-
-<div class="card" style="margin-top: 20px;">
-  <h2>Últimes Accions d'Auditoria</h2>
-  <div class="table-wrap">
-    <table>
-      <thead><tr><th>ID</th><th>Agent</th><th>Acció</th><th>Tipus</th><th>Recurs</th><th>Timestamp</th></tr></thead>
-      <tbody id="audit-table"></tbody>
-    </table>
-  </div>
-</div>
+<footer id="footer">D1 · última actualització: <span id="last-update">—</span></footer>
 
 <script>
-// ========== ESTADÍSTIQUES ==========
-async function loadStats() {
+// ========== D1 UNIFIED OBSERVABILITY ==========
+// Read-only. The browser never receives an API key. The four endpoints
+// under /v1/dashboard/* accept any agent with `read` permission. We
+// do not need admin because the endpoints do not require it.
+
+const API = {
+  summary: '/v1/dashboard/summary',
+  agents:  '/v1/dashboard/agents',
+  memory:  '/v1/dashboard/memory',
+  system:  '/v1/dashboard/system',
+};
+
+function esc(s) {
+  if (s == null) return '';
+  return String(s).replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
+}
+
+function statusBadge(s) {
+  const t = (s || 'UNKNOWN').toUpperCase();
+  return `<span class="status status-${esc(t)}">${esc(t)}</span>`;
+}
+
+function statusFor(v) {
+  return statusBadge(v);
+}
+
+function panel(name) { return document.getElementById('panel-' + name); }
+
+async function fetchJson(path) {
+  const r = await fetch(path);
+  if (!r.ok) throw new Error(`${path} -> ${r.status}`);
+  return await r.json();
+}
+
+// ========== HOME ==========
+async function loadHome() {
+  const el = document.getElementById('home-grid');
+  el.innerHTML = '<div class="loading">Carregant...</div>';
   try {
-    const res = await fetch('/api/stats');
-    const data = await res.json();
-
-    document.getElementById('active-count').textContent = data.total_active;
-    document.getElementById('deleted-count').textContent = data.total_deleted;
-    document.getElementById('chunks-count').textContent = data.total_chunks;
-    document.getElementById('agents-count').textContent = data.total_agents;
-    document.getElementById('consolidated-count').textContent = data.total_consolidated || 0;
-    document.getElementById('notion-count').textContent = data.total_notion_cached || 0;
-    document.getElementById('ollama-status').textContent = data.ollama_connected ? '✓' : '✗';
-    document.getElementById('ollama-status').style.color = data.ollama_connected ? '#86efac' : '#fca5a5';
-
-    if (typeof Chart === 'undefined') {
-      document.querySelectorAll('canvas').forEach(c => c.style.display = 'none');
-    } else {
-    new Chart(document.getElementById('chart-daily'), {
-      type: 'bar',
-      data: {
-        labels: data.facts_last_7_days.map(d => d.date),
-        datasets: [{ label: 'Fets', data: data.facts_last_7_days.map(d => d.count), backgroundColor: '#38bdf8', borderRadius: 4 }]
-      },
-      options: { responsive: true, maintainAspectRatio: true, plugins: { legend: { display: false } },
-        scales: { y: { beginAtZero: true, ticks: { stepSize: 1, color: '#94a3b8' } }, x: { ticks: { color: '#94a3b8' } } } }
-    });
-
-    const agentColors = ['#38bdf8','#f472b6','#a78bfa','#34d399','#fbbf24','#fb923c','#f87171','#818cf8'];
-    new Chart(document.getElementById('chart-agent'), {
-      type: 'pie',
-      data: {
-        labels: data.facts_by_agent.map(a => a.agent_name),
-        datasets: [{ data: data.facts_by_agent.map(a => a.count), backgroundColor: agentColors.slice(0, data.facts_by_agent.length) }]
-      },
-      options: { responsive: true, maintainAspectRatio: true, plugins: { legend: { position: 'bottom', labels: { color: '#94a3b8' } } } }
-    });
-
-    const catColors = ['#fbbf24','#34d399','#818cf8','#f472b6','#fb923c','#f87171','#a78bfa'];
-    new Chart(document.getElementById('chart-category'), {
-      type: 'doughnut',
-      data: {
-        labels: data.facts_by_category.map(c => c.category),
-        datasets: [{ data: data.facts_by_category.map(c => c.count), backgroundColor: catColors.slice(0, data.facts_by_category.length) }]
-      },
-      options: { responsive: true, maintainAspectRatio: true, plugins: { legend: { position: 'bottom', labels: { color: '#94a3b8' } } } }
-    });
-
-    if (data.db_size_history.length > 0) {
-      new Chart(document.getElementById('chart-db-size'), {
-        type: 'line',
-        data: {
-          labels: data.db_size_history.map(d => d.date.substring(0, 10)),
-          datasets: [{ label: 'Mida (KB)', data: data.db_size_history.map(d => (d.size_bytes / 1024).toFixed(1)), borderColor: '#34d399', backgroundColor: 'rgba(52,211,153,0.1)', fill: true, tension: 0.3 }]
-        },
-        options: { responsive: true, maintainAspectRatio: true, plugins: { legend: { labels: { color: '#94a3b8' } } },
-          scales: { y: { beginAtZero: true, ticks: { color: '#94a3b8' } }, x: { ticks: { color: '#94a3b8' } } } }
-      });
+    const s = await fetchJson(API.summary);
+    const services = ['pluribus','xerrameca','hermes','ollama'];
+    let cards = '';
+    for (const svc of services) {
+      const info = s[svc] || {};
+      cards += `
+        <div class="card">
+          <h3>${esc(svc.toUpperCase())}</h3>
+          <p>${statusFor(info.status)}</p>
+          <p class="muted">${esc(info.version || 'UNKNOWN')} · ${esc(info.detail || '')}</p>
+        </div>`;
     }
-    }
-
-    const tbody = document.getElementById('audit-table');
-    data.last_10_audit.forEach(entry => {
-      const tr = document.createElement('tr');
-      const actionClass = entry.action === 'DELETE' ? 'status-deleted' : 'status-created';
-      tr.innerHTML = `<td>${entry.id}</td><td>${entry.agent_id ? entry.agent_id.substring(0,8)+'...' : '-'}</td>
-        <td><span class="status-badge ${actionClass}">${entry.action}</span></td>
-        <td>${entry.resource_type}</td><td>${entry.resource_id ? entry.resource_id.substring(0,8)+'...' : '-'}</td>
-        <td>${entry.timestamp}</td>`;
-      tbody.appendChild(tr);
-    });
-
-  } catch (err) {
-    document.querySelector('.counter-grid').innerHTML = '<p style="color:#f87171;">Error carregant estadístiques</p>';
+    cards += `
+      <div class="card"><h3>AGENTS</h3><p class="kpi">${esc(s.agents_known ?? 'UNKNOWN')}</p><p class="kpi-sub">registrats a Pluribus</p></div>
+      <div class="card"><h3>RECENT MEMORIES</h3><p class="kpi">${esc(s.recent_memories ?? 'UNKNOWN')}</p><p class="kpi-sub">últims al memory</p></div>
+      <div class="card"><h3>WARNINGS</h3><p class="kpi">${esc(s.warnings ?? 0)}</p><p class="kpi-sub">facts amb BLOCKED/FAIL</p></div>`;
+    el.innerHTML = cards;
+  } catch (e) {
+    el.innerHTML = `<div class="card">Error: ${esc(e.message)}</div>`;
   }
 }
 
-// ========== CONFIGURACIÓ ==========
-function toggleSettings() {
-  const panel = document.getElementById('settings-panel');
-  const isHidden = panel.style.display === 'none' || panel.style.display === '';
-  panel.style.display = isHidden ? 'block' : 'none';
-  if (isHidden) loadConfig();
-}
-
-async function loadConfig() {
-  document.getElementById('config-loading').style.display = 'block';
-  document.getElementById('config-form').style.display = 'none';
-  document.getElementById('config-status').style.display = 'none';
+// ========== AGENTS ==========
+async function loadAgents() {
+  const el = document.getElementById('agents-content');
+  el.innerHTML = '<div class="loading">Carregant...</div>';
   try {
-    const res = await fetch('/api/config');
-    const data = await res.json();
-    document.getElementById('cfg-PLURIBUS_OLLAMA_BASE_URL').value = data.PLURIBUS_OLLAMA_BASE_URL || data._OLLAMA_BASE_URL || '';
-    document.getElementById('cfg-PLURIBUS_CONSOLIDATION_MODEL').value = data.PLURIBUS_CONSOLIDATION_MODEL || data._CONSOLIDATION_MODEL || '';
-    document.getElementById('cfg-PLURIBUS_OLLAMA_MODEL').value = data.PLURIBUS_OLLAMA_MODEL || data._OLLAMA_MODEL || '';
-    document.getElementById('cfg-MAX_CHUNK_SIZE').value = data.MAX_CHUNK_SIZE || data._MAX_CHUNK_SIZE || '500';
-    document.getElementById('cfg-CHUNK_OVERLAP').value = data.CHUNK_OVERLAP || data._CHUNK_OVERLAP || '50';
-    document.getElementById('config-loading').style.display = 'none';
-    document.getElementById('config-form').style.display = 'block';
-  } catch (err) {
-    document.getElementById('config-loading').textContent = 'Error carregant configuració: ' + err.message;
+    const j = await fetchJson(API.agents);
+    const rows = (j.agents || []).map(a => {
+      const active = a.active_flag ? 'YES' : 'NO';
+      return `<tr>
+        <td><strong>${esc(a.name || '?')}</strong><br><span class="muted">${esc(a.identity || '')}</span></td>
+        <td>${statusBadge(active)}<br><span class="muted">registered</span></td>
+        <td>${statusBadge(a.online_now || 'UNKNOWN')}</td>
+        <td>${statusBadge(a.last_known_activity || 'UNKNOWN')}</td>
+        <td>${esc(a.current_task || 'UNKNOWN')}</td>
+        <td>${esc(a.project || 'UNKNOWN')}</td>
+        <td>${statusBadge(a.blocker || 'NONE')}</td>
+        <td>${statusBadge(a.last_result || 'UNKNOWN')}</td>
+      </tr>`;
+    }).join('');
+    el.innerHTML = `<table>
+      <thead><tr>
+        <th>NAME / IDENTITY</th><th>REGISTERED</th><th>ONLINE NOW</th>
+        <th>LAST ACTIVITY</th><th>CURRENT TASK</th><th>PROJECT</th>
+        <th>BLOCKER</th><th>LAST RESULT</th>
+      </tr></thead>
+      <tbody>${rows || '<tr><td colspan="8" class="muted">No agents</td></tr>'}</tbody>
+    </table>
+    <p class="muted" style="margin-top:10px;">${esc(j.count || 0)} agent(s) known. Active = Pluribus registered. Online = real-time presence (UNKNOWN unless a heartbeat source is available).</p>`;
+  } catch (e) {
+    el.innerHTML = `<div class="card">Error: ${esc(e.message)}</div>`;
   }
 }
 
-async function saveConfig(restart) {
-  const body = {};
-  const keys = ['PLURIBUS_OLLAMA_BASE_URL','PLURIBUS_CONSOLIDATION_MODEL','PLURIBUS_OLLAMA_MODEL','MAX_CHUNK_SIZE','CHUNK_OVERLAP'];
-  keys.forEach(k => {
-    const el = document.getElementById('cfg-'+k);
-    if (el) body[k] = el.value.trim();
-  });
-  if (restart) body._restart = true;
-
-  const status = document.getElementById('config-status');
-  status.style.display = 'block';
-  status.style.color = '#fbbf24';
-  status.textContent = 'Guardant...';
-
+// ========== MEMORY ==========
+async function loadMemory() {
+  const el = document.getElementById('memory-content');
+  el.innerHTML = '<div class="loading">Carregant...</div>';
+  const q = document.getElementById('memory-q').value.trim();
+  const url = API.memory + '?limit=20' + (q ? '&q=' + encodeURIComponent(q) : '');
   try {
-    const res = await fetch('/api/config/save', { method: 'POST', headers: {'Content-Type':'application/json'}, body: JSON.stringify(body) });
-    const data = await res.json();
-    status.textContent = data.message || 'Configuració guardada';
-    status.style.color = data.error ? '#f87171' : '#86efac';
-  } catch (err) {
-    status.textContent = 'Error: ' + err.message;
-    status.style.color = '#f87171';
+    const j = await fetchJson(url);
+    const rows = (j.items || []).map(it => `<tr>
+      <td><code>${esc(it.id ? it.id.slice(0, 8) : '?')}</code><br><span class="muted">${esc(it.created_at || '?')}</span></td>
+      <td>${esc(it.key || '(no-key)')}</td>
+      <td>${esc(it.category || '?')}</td>
+      <td>${esc(it.project || 'UNKNOWN')}</td>
+      <td>${esc(it.scope || '?')}</td>
+      <td><pre>${esc((it.content_preview || '').slice(0, 200))}</pre></td>
+    </tr>`).join('');
+    el.innerHTML = `<table>
+      <thead><tr><th>ID / TIME</th><th>KEY</th><th>CATEGORY</th><th>PROJECT</th><th>SCOPE</th><th>PREVIEW</th></tr></thead>
+      <tbody>${rows || '<tr><td colspan="6" class="muted">No facts</td></tr>'}</tbody>
+    </table>
+    <p class="muted" style="margin-top:10px;">${esc(j.total ?? '?')} total · showing ${esc(j.items ? j.items.length : 0)}${q ? ' · search: ' + esc(q) : ''}</p>`;
+  } catch (e) {
+    el.innerHTML = `<div class="card">Error: ${esc(e.message)}</div>`;
   }
 }
 
-async function restartPluribus() {
-  const status = document.getElementById('config-status');
-  status.style.display = 'block';
-  status.style.color = '#fbbf24';
-  status.textContent = 'Reiniciant...';
-
+// ========== SYSTEM ==========
+async function loadSystem() {
+  const el = document.getElementById('system-grid');
+  el.innerHTML = '<div class="loading">Carlegant...</div>';
   try {
-    const res = await fetch('/api/config/restart');
-    const data = await res.json();
-    status.textContent = data.message || 'Reiniciant Pluribus...';
-    status.style.color = '#86efac';
-  } catch (err) {
-    status.textContent = 'Error: ' + err.message;
-    status.style.color = '#f87171';
+    const j = await fetchJson(API.system);
+    const cards = (j.services || []).map(s => `
+      <div class="card">
+        <h3>${esc(s.name || '?')}</h3>
+        <p>${statusBadge(s.status || 'UNKNOWN')}</p>
+        <p class="muted">${esc(s.version || 'UNKNOWN version')}</p>
+        <p class="muted">${esc(s.endpoint || '')}</p>
+        <p class="muted">last check: ${esc(s.last_check || '?')}</p>
+      </div>`).join('');
+    el.innerHTML = cards || '<div class="card muted">No services discovered</div>';
+  } catch (e) {
+    el.innerHTML = `<div class="card">Error: ${esc(e.message)}</div>`;
   }
 }
 
-// ========== MODELS D'OLLAMA ==========
-let _modelsCache = [];
-
-async function loadOllamaModels(focusId) {
-  const dd = document.getElementById('dropdown-' + focusId);
-  if (!dd) return;
-  dd.innerHTML = '<div class="loading">⏳ Carregant...</div>';
-  dd.classList.add('show');
-  try {
-    const res = await fetch('/api/ollama/models');
-    const data = await res.json();
-    dd.innerHTML = '';
-    if (data.models && data.models.length) {
-      _modelsCache = data.models;
-      // Ordenar: els que comencin pel valor actual primer
-      let current = document.getElementById(focusId)?.value || '';
-      let sorted = [...data.models].sort((a, b) => {
-        if (current && a.startsWith(current) && !b.startsWith(current)) return -1;
-        if (current && b.startsWith(current) && !a.startsWith(current)) return 1;
-        return a.localeCompare(b);
-      });
-      sorted.forEach(m => {
-        const div = document.createElement('div');
-        div.className = 'item';
-        div.textContent = m;
-        div.onclick = () => selectModel(focusId, m);
-        dd.appendChild(div);
-      });
-    } else {
-      dd.innerHTML = '<div class="error">❌ Cap model trobat</div>';
-    }
-  } catch (err) {
-    dd.innerHTML = '<div class="error">❌ Error: ' + err.message + '</div>';
-  }
-}
-
-function showModelDropdown(fieldId) {
-  const dd = document.getElementById('dropdown-' + fieldId);
-  if (!dd) return;
-  // Si ja té models, mostra'ls; si no, carrega'ls
-  if (dd.children.length === 0) {
-    loadOllamaModels(fieldId);
-  } else {
-    dd.classList.add('show');
-  }
-}
-
-function hideModelDropdown() {
-  document.querySelectorAll('.model-dropdown').forEach(d => d.classList.remove('show'));
-}
-
-function selectModel(fieldId, model) {
-  document.getElementById(fieldId).value = model;
-  hideModelDropdown();
-}
-
-// ========== CERCA ==========
-async function doSearch() {
-  const q = document.getElementById('search-q').value.trim();
-  const cat = document.getElementById('search-cat').value;
-  const results = document.getElementById('search-results');
-  if (!q) { results.innerHTML = '<span style="color:#64748b;">Escriu un text per cercar</span>'; return; }
-  results.innerHTML = '<span style="color:#64748b;">Cercant...</span>';
-  try {
-    const res = await fetch('/api/search?q='+encodeURIComponent(q)+'&category='+encodeURIComponent(cat)+'&limit=20');
-    const data = await res.json();
-    if (data.error) { results.innerHTML = '<span style="color:#f87171;">Error: '+data.error+'</span>'; return; }
-    if (data.total === 0) { results.innerHTML = '<span style="color:#64748b;">Cap resultat per &quot;'+q+'&quot;</span>'; return; }
-    let html = '<div style="color:#94a3b8;margin-bottom:8px;">'+data.total+' resultats per &quot;'+q+'&quot;</div><div class="table-wrap"><table><thead><tr><th>ID</th><th>Categoria</th><th>Contingut</th><th>Data</th></tr></thead><tbody>';
-    data.results.forEach(r => {
-      const catBadge = r.category ? '<span class="status-badge" style="background:#1e3a5f;color:#93c5fd;">'+r.category+'</span>' : '-';
-      html += '<tr><td style="font-family:monospace;font-size:0.7rem;">'+r.id.substring(0,8)+'</td><td>'+catBadge+'</td><td style="white-space:normal;max-width:300px;">'+r.content_preview+'</td><td style="white-space:nowrap;">'+r.created_at.substring(0,10)+'</td></tr>';
-    });
-    html += '</tbody></table></div>';
-    results.innerHTML = html;
-  } catch (err) {
-    results.innerHTML = '<span style="color:#f87171;">Error: '+err.message+'</span>';
-  }
-}
-
-// Enter key triggers search
-document.addEventListener('DOMContentLoaded', function() {
-  document.getElementById('search-q').addEventListener('keydown', function(e) {
-    if (e.key === 'Enter') doSearch();
-  });
+// ========== TABS ==========
+document.getElementById('tabs').addEventListener('click', e => {
+  const tab = e.target.closest('.tab');
+  if (!tab) return;
+  const name = tab.dataset.panel;
+  document.querySelectorAll('.tab').forEach(t => t.classList.toggle('active', t === tab));
+  document.querySelectorAll('.panel').forEach(p => p.classList.toggle('active', p.id === 'panel-' + name));
+  if (name === 'agents') loadAgents();
+  else if (name === 'memory') loadMemory();
+  else if (name === 'system') loadSystem();
+  else loadHome();
 });
 
-// ========== AUTO-REFRESH ==========
-setInterval(loadStats, 30000);
+// ========== MEMORY SEARCH ==========
+document.getElementById('memory-search-btn').addEventListener('click', loadMemory);
+document.getElementById('memory-q').addEventListener('keydown', e => { if (e.key === 'Enter') loadMemory(); });
 
-loadStats();
+// ========== AUTO-REFRESH (20s) ==========
+async function refreshAll() {
+  await Promise.all([loadHome(), loadSystem()]);
+  // Update footer timestamp
+  const lu = document.getElementById('last-update');
+  if (lu) lu.textContent = new Date().toISOString();
+}
+
+refreshAll();
+setInterval(refreshAll, 20000);
+
+// Refresh MEMORY / AGENTS when their tab is opened (no global interval
+// to avoid hammering the server when nobody is looking).
 </script>
 </body>
 </html>"""
