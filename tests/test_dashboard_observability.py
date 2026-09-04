@@ -1313,24 +1313,33 @@ class DashboardObservabilityTests(unittest.TestCase):
         self.assertEqual(a["claimed_directive_count"], 3)
 
     def test_d2_23_explicit_task_must_match_claimed_directive(self) -> None:
-        """D2-B corrective: an explicit current_task_id that does
-        not match any CURRENTLY CLAIMED directive is rejected.
-        Result: current_task = UNKNOWN."""
+        """D2-B final corrective: an explicit current_task_id that
+        does NOT match a CURRENTLY CLAIMED directive for this agent
+        forces current_task = UNKNOWN. We do NOT fall back to
+        another claimed directive.
+
+        Scenarios:
+          A) one claimed + heartbeat with nonexistent task -> UNKNOWN
+          B) one claimed + one pending + heartbeat pointing to pending -> UNKNOWN
+          C) omitted current_task_id + one claimed -> that claimed
+             (fallback ONLY when no explicit reference is reported)
+        """
         c = self._client
+        import asyncio
+        # A) one claimed, heartbeat with bogus current_task_id
         c.patch("/v1/agents/d1-test-agent/heartbeat", headers={"X-API-Key": KEY})
         self._seed_claimed_directives("d1-test-agent", 1)
-        # Send a heartbeat with a bogus current_task_id
         c.patch("/v1/agents/d1-test-agent/heartbeat", headers={"X-API-Key": KEY},
                json={"current_task_id": "dir-bogus-nonexistent"})
         cookies = _login(c)
         r = c.get("/v1/dashboard/agents", cookies=cookies)
         a = {x["identity"]: x for x in r.json()["agents"]}["d1-test-agent"]
-        # The single claimed directive still applies (rule 2)
-        self.assertEqual(a["current_task"], "directive:dir-d1-test-agent-0")
-        # current_task_id from heartbeat is ignored (not exposed)
-        self.assertEqual(a["current_task_id"], "dir-d1-test-agent-0")
-        # And add a pending directive + verify rule 1 still rejects non-claimed
-        import asyncio
+        # Explicit invalid reference -> UNKNOWN. No fallback.
+        self.assertEqual(a["current_task"], "UNKNOWN")
+        self.assertEqual(a["current_task_id"], "UNKNOWN")
+
+        # B) one claimed + add a pending directive. Heartbeat points
+        # at the pending one. Pending != claimed. Result: UNKNOWN.
         async def _add_pending():
             from pluribus.db import get_db
             async with get_db() as db:
@@ -1344,15 +1353,44 @@ class DashboardObservabilityTests(unittest.TestCase):
                 )
                 await db.commit()
         asyncio.run(_add_pending())
-        # Send heartbeat pointing to the pending (not claimed) one
         c.patch("/v1/agents/d1-test-agent/heartbeat", headers={"X-API-Key": KEY},
                json={"current_task_id": "dir-pending-bogus"})
         r = c.get("/v1/dashboard/agents", cookies=cookies)
         a = {x["identity"]: x for x in r.json()["agents"]}["d1-test-agent"]
-        # The single claimed still wins
+        # Still UNKNOWN. Pending is NEVER current_task, and we do
+        # not fall back to the claimed when the reference is invalid.
+        self.assertEqual(a["current_task"], "UNKNOWN")
+        self.assertEqual(a["current_task_id"], "UNKNOWN")
+
+        # C) Heartbeat OMITS current_task_id. Fallback applies.
+        # First, remove the pending and clear the bogus heartbeat
+        # so the test only has the single claimed directive.
+        async def _cleanup():
+            from pluribus.db import get_db
+            async with get_db() as db:
+                await db.execute(
+                    "DELETE FROM directives WHERE id IN (?, ?)",
+                    ("dir-pending-bogus", "dir-d1-test-agent-0"),
+                )
+                await db.execute(
+                    "UPDATE agents SET current_task_id = NULL WHERE id = ?",
+                    ("d1-test-agent",),
+                )
+                await db.commit()
+        asyncio.run(_cleanup())
+        c.patch("/v1/agents/d1-test-agent/heartbeat", headers={"X-API-Key": KEY},
+               json={"work_state": "IDLE"})
+        # Re-seed exactly one claimed directive
+        self._seed_claimed_directives("d1-test-agent", 1)
+        # Heartbeat WITHOUT current_task_id
+        c.patch("/v1/agents/d1-test-agent/heartbeat", headers={"X-API-Key": KEY},
+               json={"work_state": "IDLE"})
+        r = c.get("/v1/dashboard/agents", cookies=cookies)
+        a = {x["identity"]: x for x in r.json()["agents"]}["d1-test-agent"]
+        # Omitted current_task_id with exactly one claimed: that claimed
         self.assertEqual(a["current_task"], "directive:dir-d1-test-agent-0")
-        # current_task_id from heartbeat is NOT applied (it was pending)
         self.assertEqual(a["current_task_id"], "dir-d1-test-agent-0")
+
 
     def test_d2_24_malformed_json_rejected(self) -> None:
         """D2-B corrective: a heartbeat with Content-Type

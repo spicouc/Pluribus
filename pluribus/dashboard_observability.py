@@ -300,30 +300,40 @@ async def dashboard_agents(_request: Request) -> dict[str, Any]:
         last_reported_work_state = ws["last_reported_work_state"]
         telemetry_freshness = ws["telemetry_freshness"]
 
-        # current_task: authoritative rule per D2-B corrective.
+        # current_task: authoritative rule per D2-B final corrective.
         #
-        # 1) If heartbeat current_task_id matches a currently
-        #    CLAIMED directive for this agent -> that directive.
-        # 2) Else if EXACTLY ONE claimed directive exists -> that one.
-        # 3) Else if ZERO claimed directives -> UNKNOWN.
-        # 4) Else (multiple claimed, no explicit valid current_task_id)
-        #    -> UNKNOWN. We do NOT arbitrarily choose.
+        # A) IF current_task_id was explicitly reported by heartbeat:
+        #    A1) IF it matches a currently CLAIMED directive for this
+        #        agent: current_task = that directive.
+        #    A2) ELSE: current_task = UNKNOWN, current_task_id = UNKNOWN.
+        #        DO NOT fall back to another claimed directive.
+        # B) IF NO explicit current_task_id is reported:
+        #    B1) IF exactly one CLAIMED directive: current_task = that.
+        #    B2) ELSE: current_task = UNKNOWN.
+        #
+        # pending_directive is a separate field. claimed_directive_count
+        # is exposed for diagnostics.
         claimed = claimed_by_agent.get(agent_id, [])
         current_task = UNKNOWN
         current_task_id_val: Any = UNKNOWN
         claimed_directive_count = len(claimed)
         if current_task_id:
+            # Explicit heartbeat reference. The agent told us what
+            # it's working on. If the reference is invalid (pending,
+            # completed, nonexistent, claimed for a different agent),
+            # we must NOT fall back. current_task = UNKNOWN.
             match = next((d for d in claimed if d[0] == current_task_id), None)
             if match is not None:
                 did, daction, dclaimed, dcreated = match
                 current_task_id_val = did
                 current_task = f"directive:{did}"
-        if current_task == UNKNOWN:
+            # else: stay UNKNOWN (explicit invalid reference)
+        else:
+            # No explicit reference. Fall back to single-claimed rule.
             if claimed_directive_count == 1:
                 did, daction, dclaimed, dcreated = claimed[0]
                 current_task_id_val = did
                 current_task = f"directive:{did}"
-            # else: 0 or >1 without explicit -> stays UNKNOWN
 
         # pending_directive (D1 truthfulness — separate from current_task)
         pending = pending_by_agent.get(agent_id, [])
