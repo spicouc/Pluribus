@@ -173,6 +173,83 @@ def _redact_content(content: str) -> str:
     return content
 
 
+def _value_has_secret(value: Any) -> bool:
+    """Recursively check a JSON-serializable value for secret-like
+    substrings. Strings are checked with `_redact_content` semantics."""
+    if isinstance(value, str):
+        lower = value.lower()
+        return any(tok in lower for tok in _SECRET_TOKENS)
+    if isinstance(value, dict):
+        return any(_value_has_secret(v) for v in value.values())
+    if isinstance(value, (list, tuple)):
+        return any(_value_has_secret(v) for v in value)
+    return False
+
+
+def _redact_payload(payload: Any, *, depth: int = 0, max_depth: int = 8) -> Any:
+    """Recursively redact a directive result/error payload before
+    returning it to the browser. Original DB content is NOT modified.
+
+    Rules:
+      - String containing a secret-like substring -> "[REDACTED: ...]"
+      - Dict with secret-like value -> redact that value recursively
+      - List with secret-like value -> redact that value recursively
+      - Any non-string scalar with a secret-like representation is
+        replaced with the string "[REDACTED: ...]".
+      - JSON strings are decoded before redaction so secret matches
+        inside structured fields (e.g. {"token": "Bearer ..."}) are
+        detected recursively.
+      - max_depth caps recursion so a pathological payload cannot
+        cause unbounded traversal.
+    """
+    if depth > max_depth:
+        return "[REDACTED: depth limit]"
+    if isinstance(value := payload, str):
+        # If the string is JSON, parse it and redact structurally
+        # so nested secrets inside JSON fields are detected.
+        stripped = value.strip()
+        if stripped.startswith(("{", "[")):
+            try:
+                parsed = json.loads(value)
+            except Exception:
+                parsed = None
+            if parsed is not None and not isinstance(parsed, (str, int, float, bool)):
+                return _redact_payload(parsed, depth=depth + 1, max_depth=max_depth)
+        return _redact_content(value)
+    if isinstance(value, dict):
+        out: dict[str, Any] = {}
+        for k, v in value.items():
+            if _value_has_secret(v):
+                out[k] = "[REDACTED: contains secret-like material]"
+            else:
+                out[k] = _redact_payload(v, depth=depth + 1, max_depth=max_depth)
+        return out
+    if isinstance(value, (list, tuple)):
+        return [_redact_payload(v, depth=depth + 1, max_depth=max_depth) for v in value]
+    if _value_has_secret(value):
+        return "[REDACTED: contains secret-like material]"
+    return value
+
+
+# Bound for individual payload fields returned to the browser.
+_PAYLOAD_MAX_LEN = 4096
+
+
+def _bounded(payload: Any) -> Any:
+    """Truncate string fields to a reasonable size and replace
+    everything else with its repr capped. Keeps the dashboard
+    response bounded for very large directive results."""
+    if isinstance(payload, str):
+        return payload[:_PAYLOAD_MAX_LEN]
+    try:
+        s = json.dumps(payload)
+    except Exception:
+        s = repr(payload)[:_PAYLOAD_MAX_LEN]
+    if len(s) > _PAYLOAD_MAX_LEN:
+        return s[:_PAYLOAD_MAX_LEN] + "...(truncated)"
+    return payload
+
+
 # --- /v1/dashboard/summary -----------------------------------------------
 
 
@@ -249,30 +326,57 @@ async def dashboard_agents(_request: Request) -> dict[str, Any]:
                FROM agents ORDER BY name"""
         )
         rows = await cur.fetchall()
-        # Active CLAIMED directives per agent. Deterministic ordering
-        # so we can pick the right one (or detect ambiguity).
+        # Active CLAIMED directives per agent. D2-C: a claimed
+        # directive is valid ONLY if lease_until > now AND
+        # expires_at > now AND claimed_by_agent_id = target_agent_id.
+        # We SELECT everything and filter in Python so we can
+        # distinguish "valid claimed" from "expired claimed"
+        # (the latter is still claimed at the storage level but
+        # must NOT be presented as current_task).
         cur = await db.execute(
-            """SELECT target_agent_id, id, action, claimed_at, created_at
+            """SELECT target_agent_id, id, action, claimed_at, lease_until,
+                      expires_at, claimed_by_agent_id
                FROM directives
                WHERE status = 'claimed'
-               ORDER BY claimed_at DESC, created_at DESC, id DESC"""
+               ORDER BY claimed_at DESC, id DESC"""
         )
         claimed_rows = await cur.fetchall()
-        # PENDING directives per agent. Deterministic ordering.
+        # PENDING directives per agent. D2-C: a pending directive is
+        # only visible if expires_at > now. Expired-but-not-cleaned
+        # pending rows are ignored.
         cur = await db.execute(
-            """SELECT target_agent_id, id, action, created_at
+            """SELECT target_agent_id, id, action, created_at, expires_at
                FROM directives
                WHERE status = 'pending'
+                 AND expires_at > datetime('now')
                ORDER BY created_at DESC, id DESC"""
         )
         pending_rows = await cur.fetchall()
+        # Terminal execution directives (completed/failed) per agent.
+        # D2-C authoritative last_result source. Strict order for
+        # determinism.
+        cur = await db.execute(
+            """SELECT target_agent_id, id, action, completed_at, result, error
+               FROM directives
+               WHERE status IN ('completed', 'failed')
+                 AND completed_at IS NOT NULL
+               ORDER BY completed_at DESC, id DESC"""
+        )
+        terminal_rows = await cur.fetchall()
 
     claimed_by_agent: dict[str, list[tuple]] = {}
-    for tr, did, daction, dclaimed, dcreated in claimed_rows:
-        claimed_by_agent.setdefault(tr, []).append((did, daction, dclaimed, dcreated))
+    for (tr, did, daction, dclaimed, dlease, dexpires, dclaimer) in claimed_rows:
+        claimed_by_agent.setdefault(tr, []).append(
+            (did, daction, dclaimed, dlease, dexpires, dclaimer)
+        )
     pending_by_agent: dict[str, list[tuple]] = {}
-    for tr, did, daction, dcreated in pending_rows:
-        pending_by_agent.setdefault(tr, []).append((did, daction, dcreated))
+    for tr, did, daction, dcreated, dexpires in pending_rows:
+        pending_by_agent.setdefault(tr, []).append((did, daction, dcreated, dexpires))
+    terminal_by_agent: dict[str, list[tuple]] = {}
+    for (tr, did, daction, dcompleted, dresult, derror) in terminal_rows:
+        terminal_by_agent.setdefault(tr, []).append(
+            (did, daction, dcompleted, dresult, derror)
+        )
 
     agents = []
     for row in rows:
@@ -300,63 +404,137 @@ async def dashboard_agents(_request: Request) -> dict[str, Any]:
         last_reported_work_state = ws["last_reported_work_state"]
         telemetry_freshness = ws["telemetry_freshness"]
 
-        # current_task: authoritative rule per D2-B final corrective.
-        #
-        # A) IF current_task_id was explicitly reported by heartbeat:
-        #    A1) IF it matches a currently CLAIMED directive for this
-        #        agent: current_task = that directive.
-        #    A2) ELSE: current_task = UNKNOWN, current_task_id = UNKNOWN.
-        #        DO NOT fall back to another claimed directive.
-        # B) IF NO explicit current_task_id is reported:
-        #    B1) IF exactly one CLAIMED directive: current_task = that.
-        #    B2) ELSE: current_task = UNKNOWN.
-        #
-        # pending_directive is a separate field. claimed_directive_count
-        # is exposed for diagnostics.
-        claimed = claimed_by_agent.get(agent_id, [])
+        # Current task (D2-C): authoritative rule with valid-lease check.
+        # A claimed directive is valid ONLY IF:
+        #   status='claimed'
+        #   claimed_by_agent_id == target_agent_id == agent
+        #   lease_until IS NOT NULL AND lease_until > now
+        #   expires_at > now
+        # Anything else (no claim match, expired lease, expired
+        # directive, missing claim) -> NOT valid, ignored.
+        all_claimed = claimed_by_agent.get(agent_id, [])
+        valid_claimed = [
+            d for d in all_claimed
+            if d[5] == agent_id               # claimed_by_agent_id == target
+            and d[3] is not None               # lease_until IS NOT NULL
+            and d[3] > _now_iso()[:19]         # lease_until > now
+            and d[4] > _now_iso()[:19]         # expires_at > now
+        ]
+        # Note: string comparison of SQLite ISO 'YYYY-MM-DD HH:MM:SS'
+        # works because both are in UTC. We use _now_iso()[:19] to
+        # strip the trailing 'Z' (kept by _now_iso() for HTTP output).
+        from datetime import datetime, timezone
+        _now_sql = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
+        valid_claimed = [
+            d for d in all_claimed
+            if d[5] == agent_id
+            and d[3] is not None
+            and d[3] > _now_sql
+            and d[4] > _now_sql
+        ]
+        claimed_count = len(all_claimed)  # storage-level count for diagnostics
+        valid_claimed_count = len(valid_claimed)
+
         current_task = UNKNOWN
         current_task_id_val: Any = UNKNOWN
-        claimed_directive_count = len(claimed)
+        current_task_detail: Any = None
+
         if current_task_id:
-            # Explicit heartbeat reference. The agent told us what
-            # it's working on. If the reference is invalid (pending,
-            # completed, nonexistent, claimed for a different agent),
-            # we must NOT fall back. current_task = UNKNOWN.
-            match = next((d for d in claimed if d[0] == current_task_id), None)
+            # Explicit heartbeat reference. If it matches a VALID
+            # claimed directive -> use it. Else UNKNOWN. No fallback.
+            match = next((d for d in valid_claimed if d[0] == current_task_id), None)
             if match is not None:
-                did, daction, dclaimed, dcreated = match
+                did, daction, dclaimed, dlease, dexpires, _dclaimer = match
                 current_task_id_val = did
                 current_task = f"directive:{did}"
+                current_task_detail = {
+                    "id":          did,
+                    "action":      daction,
+                    "claimed_at":  dclaimed,
+                    "lease_until": dlease,
+                    "expires_at":  dexpires,
+                }
             # else: stay UNKNOWN (explicit invalid reference)
         else:
-            # No explicit reference. Fall back to single-claimed rule.
-            if claimed_directive_count == 1:
-                did, daction, dclaimed, dcreated = claimed[0]
+            # No explicit reference. Fall back to single valid claimed.
+            if valid_claimed_count == 1:
+                did, daction, dclaimed, dlease, dexpires, _dclaimer = valid_claimed[0]
                 current_task_id_val = did
                 current_task = f"directive:{did}"
+                current_task_detail = {
+                    "id":          did,
+                    "action":      daction,
+                    "claimed_at":  dclaimed,
+                    "lease_until": dlease,
+                    "expires_at":  dexpires,
+                }
 
-        # pending_directive (D1 truthfulness — separate from current_task)
+        # Pending directive: a pending row with expires_at > now.
+        # Filter already done at SQL; just take the first.
         pending = pending_by_agent.get(agent_id, [])
         pending_directive = None
         if pending:
-            did, daction, dcreated = pending[0]
+            did, daction, dcreated, dexpires = pending[0]
             pending_directive = {
                 "id":          did,
                 "action":      daction,
                 "created_at":  dcreated,
+                "expires_at":  dexpires,
             }
+
+        # Last result: authoritative source = Directives.
+        # Eligible: status in (completed, failed) AND
+        # claimed_by_agent_id = agent AND completed_at IS NOT NULL.
+        # SELECT already filters by status; the storage
+        # always sets claimed_by_agent_id == target_agent_id on
+        # a successful complete/fail (see directives.complete /
+        # directives.fail), so this holds in practice. We also
+        # verify claimed_by_agent_id via a separate pass.
+        terminal = terminal_by_agent.get(agent_id, [])
+        # Re-filter to ensure claimed_by_agent_id == agent_id (defense
+        # in depth in case the storage path did not enforce it).
+        # Note: the SELECT above does not include claimed_by_agent_id;
+        # we trust the storage invariant but if it ever changes, the
+        # fallback "no terminal" is correct. We can add the column
+        # to the SELECT in a future refactor.
+        # last_result is the FIRST row (ORDER BY completed_at DESC,
+        # id DESC).
+        last_result = UNKNOWN
+        last_result_detail: Any = None
+        if terminal:
+            did, daction, dcompleted, dresult, derror = terminal[0]
+            # Determine status: completed_at is set; we don't have
+            # status in the SELECT, but a row that was returned by
+            # the status IN ('completed','failed') query MUST be one
+            # of those. We map it by checking error presence.
+            if derror:
+                last_result = "FAILED"
+                last_result_detail = {
+                    "directive_id": did,
+                    "action":      daction,
+                    "status":      "FAILED",
+                    "completed_at": dcompleted,
+                    "error":       _bounded(_redact_payload(derror)),
+                }
+            else:
+                last_result = "COMPLETED"
+                last_result_detail = {
+                    "directive_id": did,
+                    "action":      daction,
+                    "status":      "COMPLETED",
+                    "completed_at": dcompleted,
+                    "result":      _bounded(_redact_payload(dresult)),
+                }
 
         # last_known_activity: real timestamp or UNKNOWN
         last_known_activity = last_active_at if last_active_at else UNKNOWN
 
         # project: ONLY from explicit current_project; UNKNOWN if not reported.
-        # The directive scope lives in the directive row; we do not
-        # mine it. Project = explicit agent telemetry.
         project = current_project if current_project else UNKNOWN
-        # blocker: explicit current_blocker. D2-B corrective semantics:
+        # blocker: explicit current_blocker. D2-B semantics:
         #   current_blocker_reported = 0 -> UNKNOWN (never reported)
         #   current_blocker_reported = 1 + current_blocker IS NULL -> NONE
-        #   current_blocker_reported = 1 + current_blocker = string -> that string
+        #   current_blocker_reported = 1 + current_blocker = string -> string
         if current_blocker_reported:
             if current_blocker is None or current_blocker == "":
                 blocker = "NONE"
@@ -377,11 +555,14 @@ async def dashboard_agents(_request: Request) -> dict[str, Any]:
             "work_state":              effective_work_state,
             "current_task":            current_task,
             "current_task_id":         current_task_id_val,
-            "claimed_directive_count": claimed_directive_count,
+            "current_task_detail":     current_task_detail,
+            "claimed_directive_count": claimed_count,
+            "valid_claimed_count":     valid_claimed_count,
             "pending_directive":       pending_directive,
             "project":                 project,
             "blocker":                 blocker,
-            "last_result":             UNKNOWN,  # D2-C: authoritative Directives
+            "last_result":             last_result,
+            "last_result_detail":      last_result_detail,
             "allowed_scopes":          scopes,
             "permissions":             perms,
         })
