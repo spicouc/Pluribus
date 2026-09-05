@@ -59,13 +59,31 @@ NOT_CONFIGURED = "NOT_CONFIGURED"
 
 # Secret-like substrings: any of these in a memory fact triggers
 # REDACTED. Defense-in-depth on top of authorization.
+# Substring tokens used by _redact_content to detect VALUE-side
+# secrets. Only well-defined prefix/separator forms are listed here
+# (e.g. "bearer ", "sk-", "password=") so that a value containing
+# "tokenization" or "ok" is NOT auto-redacted as a side effect of
+# substring matching. KEY-based secret detection (e.g. {"api_key":
+# "..."}) is handled separately by `_key_is_secret` and uses an
+# exact normalized match against `_SECRET_KEYS`.
 _SECRET_TOKENS = (
-    "token", "password", "secret", "api_key", "api-key",
-    "authorization", "bearer", "sk-", "ghp_", "x-api-key",
-    "x_api_key", "access_token", "refresh_token", "client_secret",
-    "private_key", "secret_key", "auth_token", "session_token",
-    "pass@",  # URL userinfo password (e.g. https://user:pass@host)
-    "x-auth", "x-token", "cookie:",
+    "bearer ",            # header prefix
+    "sk-",                # OpenAI / Anthropic style key
+    "pk-",                # public key marker (paired with sk-)
+    "rk-",                # refresh / restricted key
+    "ghp_", "gho_", "ghu_", "ghs_", "ghr_",  # GitHub PATs
+    "xox[abprs]-",        # Slack token prefix
+    "xoxa-", "xoxb-", "xoxp-", "xoxr-", "xoxs-",
+    "password=", "passwd=", "pwd=",  # URL query form
+    "token=",                # URL query form (e.g. ?token=...)
+    "api_key=", "apikey=", "api-key=",  # URL query form
+    "secret=", "client_secret=",
+    "authorization:",    # header form
+    "x-api-key:",         # header form
+    "api-key:",           # header form, lower-case
+    "x-auth-token:",
+    "x-token:",
+    "pass@",              # URL userinfo password
 )
 
 
@@ -173,12 +191,40 @@ def _redact_content(content: str) -> str:
     return content
 
 
+_SECRET_KEYS: tuple[str, ...] = (
+    "api_key", "api-key", "apikey",
+    "token", "access_token", "refresh_token", "auth_token", "session_token",
+    "password", "passwd", "pwd",
+    "secret", "client_secret", "private_key", "secret_key",
+    "authorization", "auth",
+    "cookie", "set_cookie",
+)
+
+_PLACEHOLDER = "[REDACTED: secret-like material]"
+
+
+def _key_is_secret(key: Any) -> bool:
+    """True if a dict key is a secret-like name (case-insensitive,
+    normalized). Matches `api_key`, `Api-Key`, `PASSWORD`, etc.
+
+    Negative controls: `status`, `message`, `note` are NOT matched.
+    This is an exact normalized match against the curated list,
+    NOT a substring search, so a key like `tokenization_status`
+    is NOT redacted.
+    """
+    if not isinstance(key, str):
+        return False
+    norm = key.strip().lower().replace("-", "_")
+    return norm in _SECRET_KEYS
+
+
 def _value_has_secret(value: Any) -> bool:
     """Recursively check a JSON-serializable value for secret-like
-    substrings. Strings are checked with `_redact_content` semantics."""
+    substrings in its content. Used for VALUES of non-secret keys
+    (so e.g. `Authorization: Bearer xxx` in a header is still
+    caught even though the key is just `Authorization`)."""
     if isinstance(value, str):
-        lower = value.lower()
-        return any(tok in lower for tok in _SECRET_TOKENS)
+        return _redact_content(value) != value
     if isinstance(value, dict):
         return any(_value_has_secret(v) for v in value.values())
     if isinstance(value, (list, tuple)):
@@ -190,20 +236,27 @@ def _redact_payload(payload: Any, *, depth: int = 0, max_depth: int = 8) -> Any:
     """Recursively redact a directive result/error payload before
     returning it to the browser. Original DB content is NOT modified.
 
-    Rules:
-      - String containing a secret-like substring -> "[REDACTED: ...]"
-      - Dict with secret-like value -> redact that value recursively
-      - List with secret-like value -> redact that value recursively
-      - Any non-string scalar with a secret-like representation is
-        replaced with the string "[REDACTED: ...]".
-      - JSON strings are decoded before redaction so secret matches
-        inside structured fields (e.g. {"token": "Bearer ..."}) are
-        detected recursively.
-      - max_depth caps recursion so a pathological payload cannot
-        cause unbounded traversal.
+    Rules (defense in depth):
+      1) DICT: a key that matches a secret-like name (case-insensitive)
+         -> redact its value to the placeholder regardless of content.
+         This catches {"api_key": "innocent-looking-value"}.
+      2) DICT: a non-secret-key whose VALUE contains a secret-like
+         substring -> redact that value.
+      3) STRING: a top-level or nested string that contains a
+         secret-like substring is replaced with the placeholder.
+      4) JSON string: parsed first so nested secret-keys inside
+         {"client_secret": "..."} are caught.
+      5) LIST/TUPLE: each element is redacted recursively.
+      6) Negative controls: normal text containing substrings like
+         "tokenization complete" or "ok" is NOT auto-redacted because
+         the secret-key detection is exact-match on key names; only
+         VALUE-side detection uses substring matching, and only for
+         known secret patterns.
+      7) max_depth caps recursion so a pathological payload cannot
+         cause unbounded traversal.
     """
     if depth > max_depth:
-        return "[REDACTED: depth limit]"
+        return _PLACEHOLDER
     if isinstance(value := payload, str):
         # If the string is JSON, parse it and redact structurally
         # so nested secrets inside JSON fields are detected.
@@ -219,15 +272,20 @@ def _redact_payload(payload: Any, *, depth: int = 0, max_depth: int = 8) -> Any:
     if isinstance(value, dict):
         out: dict[str, Any] = {}
         for k, v in value.items():
-            if _value_has_secret(v):
-                out[k] = "[REDACTED: contains secret-like material]"
+            if _key_is_secret(k):
+                # Secret-like key -> ALWAYS redact value, regardless
+                # of its content. This is the authoritative fix.
+                out[k] = _PLACEHOLDER
+            elif _value_has_secret(v):
+                # Non-secret key whose VALUE looks like a secret.
+                out[k] = _PLACEHOLDER
             else:
                 out[k] = _redact_payload(v, depth=depth + 1, max_depth=max_depth)
         return out
     if isinstance(value, (list, tuple)):
         return [_redact_payload(v, depth=depth + 1, max_depth=max_depth) for v in value]
     if _value_has_secret(value):
-        return "[REDACTED: contains secret-like material]"
+        return _PLACEHOLDER
     return value
 
 
@@ -353,10 +411,14 @@ async def dashboard_agents(_request: Request) -> dict[str, Any]:
         )
         pending_rows = await cur.fetchall()
         # Terminal execution directives (completed/failed) per agent.
-        # D2-C authoritative last_result source. Strict order for
-        # determinism.
+        # D2-C authoritative last_result source. We SELECT `status`
+        # and `claimed_by_agent_id` directly so the last_result value
+        # comes from the database status, not from inferring
+        # 'failed' from error presence. ORDER BY completed_at DESC,
+        # id DESC for determinism.
         cur = await db.execute(
-            """SELECT target_agent_id, id, action, completed_at, result, error
+            """SELECT target_agent_id, id, action, status, completed_at,
+                      result, error, claimed_by_agent_id
                FROM directives
                WHERE status IN ('completed', 'failed')
                  AND completed_at IS NOT NULL
@@ -373,9 +435,9 @@ async def dashboard_agents(_request: Request) -> dict[str, Any]:
     for tr, did, daction, dcreated, dexpires in pending_rows:
         pending_by_agent.setdefault(tr, []).append((did, daction, dcreated, dexpires))
     terminal_by_agent: dict[str, list[tuple]] = {}
-    for (tr, did, daction, dcompleted, dresult, derror) in terminal_rows:
+    for (tr, did, daction, dstatus, dcompleted, dresult, derror, dclaimer) in terminal_rows:
         terminal_by_agent.setdefault(tr, []).append(
-            (did, daction, dcompleted, dresult, derror)
+            (did, daction, dstatus, dcompleted, dresult, derror, dclaimer)
         )
 
     agents = []
@@ -413,24 +475,19 @@ async def dashboard_agents(_request: Request) -> dict[str, Any]:
         # Anything else (no claim match, expired lease, expired
         # directive, missing claim) -> NOT valid, ignored.
         all_claimed = claimed_by_agent.get(agent_id, [])
-        valid_claimed = [
-            d for d in all_claimed
-            if d[5] == agent_id               # claimed_by_agent_id == target
-            and d[3] is not None               # lease_until IS NOT NULL
-            and d[3] > _now_iso()[:19]         # lease_until > now
-            and d[4] > _now_iso()[:19]         # expires_at > now
-        ]
-        # Note: string comparison of SQLite ISO 'YYYY-MM-DD HH:MM:SS'
-        # works because both are in UTC. We use _now_iso()[:19] to
-        # strip the trailing 'Z' (kept by _now_iso() for HTTP output).
+        # Compute server-now ONCE for the whole agent (used by both
+        # the valid_claimed filter and any future per-row time
+        # checks). We use a 19-char SQLite-format string because
+        # the stored lease_until / expires_at columns are formatted
+        # as 'YYYY-MM-DD HH:MM:SS' (UTC).
         from datetime import datetime, timezone
         _now_sql = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
         valid_claimed = [
             d for d in all_claimed
-            if d[5] == agent_id
-            and d[3] is not None
-            and d[3] > _now_sql
-            and d[4] > _now_sql
+            if d[5] == agent_id               # claimed_by_agent_id == target
+            and d[3] is not None              # lease_until IS NOT NULL
+            and d[3] > _now_sql               # lease_until > now
+            and d[4] > _now_sql               # expires_at > now
         ]
         claimed_count = len(all_claimed)  # storage-level count for diagnostics
         valid_claimed_count = len(valid_claimed)
@@ -485,46 +542,46 @@ async def dashboard_agents(_request: Request) -> dict[str, Any]:
         # Last result: authoritative source = Directives.
         # Eligible: status in (completed, failed) AND
         # claimed_by_agent_id = agent AND completed_at IS NOT NULL.
-        # SELECT already filters by status; the storage
-        # always sets claimed_by_agent_id == target_agent_id on
-        # a successful complete/fail (see directives.complete /
-        # directives.fail), so this holds in practice. We also
-        # verify claimed_by_agent_id via a separate pass.
+        # We SELECT `status` and `claimed_by_agent_id` directly so
+        # the last_result value comes from the database, not from
+        # inferring 'failed' from error presence. We also verify
+        # claimed_by_agent_id == agent_id (defense in depth: the
+        # storage path always sets it on a successful complete/fail,
+        # but if it ever diverges, the row is dropped here).
         terminal = terminal_by_agent.get(agent_id, [])
-        # Re-filter to ensure claimed_by_agent_id == agent_id (defense
-        # in depth in case the storage path did not enforce it).
-        # Note: the SELECT above does not include claimed_by_agent_id;
-        # we trust the storage invariant but if it ever changes, the
-        # fallback "no terminal" is correct. We can add the column
-        # to the SELECT in a future refactor.
-        # last_result is the FIRST row (ORDER BY completed_at DESC,
-        # id DESC).
         last_result = UNKNOWN
         last_result_detail: Any = None
-        if terminal:
-            did, daction, dcompleted, dresult, derror = terminal[0]
-            # Determine status: completed_at is set; we don't have
-            # status in the SELECT, but a row that was returned by
-            # the status IN ('completed','failed') query MUST be one
-            # of those. We map it by checking error presence.
-            if derror:
-                last_result = "FAILED"
-                last_result_detail = {
-                    "directive_id": did,
-                    "action":      daction,
-                    "status":      "FAILED",
-                    "completed_at": dcompleted,
-                    "error":       _bounded(_redact_payload(derror)),
-                }
-            else:
+        # Find the first row in storage order (already DESC by
+        # completed_at, id) that has the right claimer.
+        for row in terminal:
+            did, daction, dstatus, dcompleted, dresult, derror, dclaimer = row
+            if dclaimer != agent_id:
+                # Wrong claimer -> ignore as last_result. The
+                # authoritative invariant says terminal rows have
+                # claimed_by_agent_id == target_agent_id == agent_id;
+                # this guard catches any storage-path deviation.
+                continue
+            if dstatus == "completed":
                 last_result = "COMPLETED"
                 last_result_detail = {
                     "directive_id": did,
-                    "action":      daction,
-                    "status":      "COMPLETED",
+                    "action":       daction,
+                    "status":       "completed",
                     "completed_at": dcompleted,
-                    "result":      _bounded(_redact_payload(dresult)),
+                    "result":       _bounded(_redact_payload(dresult)),
                 }
+            elif dstatus == "failed":
+                last_result = "FAILED"
+                last_result_detail = {
+                    "directive_id": did,
+                    "action":       daction,
+                    "status":       "failed",
+                    "completed_at": dcompleted,
+                    "error":        _bounded(_redact_payload(derror)),
+                }
+            # else: should not happen because the SQL filters to
+            # status IN (completed, failed), but be defensive.
+            break  # first valid row wins
 
         # last_known_activity: real timestamp or UNKNOWN
         last_known_activity = last_active_at if last_active_at else UNKNOWN
