@@ -13,10 +13,18 @@ Security model:
   - POST /assign is guarded by ``dashboard_control_authorize``
     (read+write via the existing ``_require`` semantics; cookie OR
     X-API-Key, fresh agent row at request time, no implicit admin).
+  - Auth-source binding: a VALID session cookie selects the cookie
+    identity (``request.state.auth_method = "cookie"``); the X-API-Key
+    is consulted ONLY when no valid cookie is present
+    (``auth_method = "api_key"``).
   - Browser (cookie) mutations additionally require a same-origin
-    ``Origin`` header (CSRF defence). Server-to-server calls with an
-    X-API-Key header are exempt from the Origin check.
-  - POST /assign requires an ``application/json`` content type.
+    ``Origin`` header (CSRF defence). The Origin exemption applies ONLY
+    to VALIDATED API-key auth (``auth_method == "api_key"``) — never to
+    the mere presence of an X-API-Key header, so a bogus key next to a
+    valid cookie cannot convert cookie auth into an API-key exemption.
+  - POST /assign requires an ``application/json`` content type; the
+    check runs as a route dependency BEFORE body parsing so a non-JSON
+    body answers 415 instead of a misleading 422.
   - GET /options is read-only and guarded by ``dashboard_session_authorize``;
     it returns an advisory capability/target model for the UI only.
     The server re-validates everything at mutation time.
@@ -78,14 +86,33 @@ def _scope_list(value: Any) -> list[str]:
     return []
 
 
+def _require_json_content_type(request: Request) -> None:
+    """Reject non-JSON bodies BEFORE FastAPI parses them (415, not 422).
+
+    Runs as a route dependency: FastAPI resolves route dependencies
+    before body reading/validation, so a ``text/plain`` body that is not
+    valid JSON answers the documented 415 contract.
+    """
+    content_type = (request.headers.get("content-type") or "").lower()
+    if "application/json" not in content_type:
+        raise HTTPException(status_code=415, detail="Content-Type ha de ser application/json")
+
+
 def _assert_browser_origin(request: Request) -> None:
     """CSRF/origin protection for browser (cookie) mutations.
 
-    Server-to-server calls carry an X-API-Key header and are exempt.
-    Browser calls carry no API key, so we demand a same-origin Origin
-    header: scheme AND netloc must match ``request.base_url``.
+    Auth-source precedence (D3-B): a VALID session cookie selects the
+    cookie identity and ``request.state.auth_method == "cookie"``; the
+    X-API-Key is consulted only when no valid cookie is present
+    (``auth_method == "api_key"``).
+
+    The Origin exemption applies ONLY to validated API-key auth. A bogus
+    X-API-Key header next to a valid cookie NEVER converts cookie auth
+    into an API-key exemption — cookie requests always demand a
+    same-origin ``Origin`` header (scheme AND netloc must match
+    ``request.base_url``).
     """
-    if request.headers.get("X-API-Key"):
+    if getattr(request.state, "auth_method", None) == "api_key":
         return
     origin = request.headers.get("Origin")
     if not origin:
@@ -104,6 +131,7 @@ async def dashboard_assign(
     request: Request,
     body: DashboardAssignRequest,
     agent: dict[str, Any] = Depends(dashboard_control_authorize),
+    _content_type: None = Depends(_require_json_content_type),
 ) -> DirectiveResponse:
     """Assign a directive from the dashboard (safe, idempotent).
 
@@ -113,9 +141,6 @@ async def dashboard_assign(
     idempotency replay → 200/409, audit CREATE). The /options payload
     the UI renders is purely advisory.
     """
-    content_type = (request.headers.get("content-type") or "").lower()
-    if "application/json" not in content_type:
-        raise HTTPException(status_code=415, detail="Content-Type ha de ser application/json")
     _assert_browser_origin(request)
     return await create_directive_for_actor(agent, body)
 

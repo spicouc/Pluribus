@@ -7,6 +7,12 @@ Covers:
     cookie protection, content-type contract (implemented), audit,
     no-memory-facts, telemetry untouched, pending != current_task,
     grant revocation, legacy POST /v1/directives compatibility.
+  - test_d3b_25..31 (D3-B corrective): REAL concurrent idempotency
+    (identical → both 201 same id; conflicting → {201, 409}),
+    TTL in the idempotency signature (different ttl → 409),
+    auth-source binding (cookie + bogus key never bypasses Origin,
+    pure validated API key exempt from Origin, cookie identity beats
+    a different actor's valid key), non-JSON content type → 415.
 
 Scaffold mirrors test_dashboard_observability.py: fresh temp DB_PATH
 set BEFORE importing pluribus, bcrypt hashes precomputed at import
@@ -21,6 +27,8 @@ import os
 import tempfile
 import unittest
 import uuid
+from concurrent.futures import ThreadPoolExecutor
+from datetime import datetime as _dt
 from pathlib import Path
 from unittest.mock import patch
 
@@ -530,3 +538,182 @@ class DashboardControlTests(unittest.TestCase):
             _db_rows("SELECT COUNT(*) AS n FROM facts")[0]["n"],
             0,
         )
+
+    # ====== test_d3b_25..31 (D3-B corrective) =========================
+
+    def test_d3b_25_concurrent_identical_assign(self) -> None:
+        """Two SIMULTANEOUS identical POSTs never double-create.
+
+        Both requests race past the fast-path SELECT; the loser's INSERT
+        hits the partial UNIQUE idx_directives_idempotency and the
+        IntegrityError handler replays the winner atomically → both
+        201 with the SAME directive id and exactly one row per key.
+        """
+        _grant_success_path()
+        c = self._client
+
+        def _post(payload: dict):
+            return c.post(_ASSIGN_URL, json=payload, headers=_hdr(KEY_OP))
+
+        with ThreadPoolExecutor(max_workers=2) as pool:
+            for i in range(5):
+                body = _assign_body(idempotency_key=f"d3b-conc-ident-{i:04d}")
+                f1 = pool.submit(_post, body)
+                f2 = pool.submit(_post, body)
+                r1 = f1.result()  # propagates any uncaught exception
+                r2 = f2.result()
+                self.assertEqual(r1.status_code, 201, r1.text[:300])
+                self.assertEqual(r2.status_code, 201, r2.text[:300])
+                self.assertEqual(r1.json()["id"], r2.json()["id"])
+        rows = _db_rows("SELECT COUNT(*) AS n FROM directives")
+        self.assertEqual(rows[0]["n"], 5, "one directive per idempotency key")
+
+    def test_d3b_26_concurrent_conflicting_assign(self) -> None:
+        """Simultaneous POSTs sharing a key with DIFFERENT payloads.
+
+        Exactly one request wins (201); the loser answers 409 — via the
+        fast-path replay check or via the IntegrityError race handler.
+        Never 500/422, and only one row per contested key.
+        """
+        _grant_success_path()
+        c = self._client
+
+        def _post(payload: dict):
+            return c.post(_ASSIGN_URL, json=payload, headers=_hdr(KEY_OP))
+
+        with ThreadPoolExecutor(max_workers=2) as pool:
+            for i in range(3):
+                key = f"d3b-conc-conf-{i:04d}"
+                f1 = pool.submit(
+                    _post,
+                    _assign_body(idempotency_key=key, action="d3b.run"),
+                )
+                f2 = pool.submit(
+                    _post,
+                    _assign_body(idempotency_key=key, action="d3b.run.other"),
+                )
+                statuses = {f1.result().status_code, f2.result().status_code}
+                self.assertEqual(statuses, {201, 409})
+        rows = _db_rows("SELECT COUNT(*) AS n FROM directives")
+        self.assertEqual(rows[0]["n"], 3, "one directive per contested key")
+
+    def test_d3b_27_ttl_difference_conflicts(self) -> None:
+        """TTL is part of the idempotency signature.
+
+        Same key+payload but a different ttl_seconds → 409, never a
+        silent replay of a differently-scoped lifetime. The stored row
+        keeps the ORIGINAL exact TTL (created_at == expires_at from the
+        same server clock).
+        """
+        _grant_success_path()
+        c = self._client
+        key = "d3b-ttl-diff-0001"
+        r1 = c.post(
+            _ASSIGN_URL,
+            json=_assign_body(idempotency_key=key, ttl_seconds=3600),
+            headers=_hdr(KEY_OP),
+        )
+        self.assertEqual(r1.status_code, 201, r1.text[:300])
+        r2 = c.post(
+            _ASSIGN_URL,
+            json=_assign_body(idempotency_key=key, ttl_seconds=7200),
+            headers=_hdr(KEY_OP),
+        )
+        self.assertEqual(r2.status_code, 409, r2.text[:300])
+        rows = _db_rows("SELECT id, created_at, expires_at FROM directives")
+        self.assertEqual(len(rows), 1)
+        row = rows[0]
+        ttl = (
+            _dt.strptime(row["expires_at"], "%Y-%m-%d %H:%M:%S")
+            - _dt.strptime(row["created_at"], "%Y-%m-%d %H:%M:%S")
+        ).total_seconds()
+        self.assertEqual(int(ttl), 3600)
+
+    def test_d3b_28_cookie_plus_bogus_api_key_does_not_bypass_origin(self) -> None:
+        """A bogus X-API-Key next to a VALID session cookie changes nothing.
+
+        The middleware must NOT answer 401 early (dashboard route with a
+        session cookie present): the request reaches the per-route guard,
+        which authenticates the COOKIE (auth_method="cookie") — a failed
+        key never becomes an API-key Origin exemption → missing/foreign
+        Origin answers 403 and nothing is created.
+        """
+        _grant_success_path()
+        c = self._client
+        _login(c, KEY_OP)  # stores the session cookie in the client jar
+        hdrs = {"X-API-Key": "d3b-bogus-key-zzzzzzzzzzzzzzzzzzzzzzzzzz"}
+        r1 = c.post(_ASSIGN_URL, json=_assign_body(), headers=hdrs)
+        self.assertEqual(r1.status_code, 403, r1.text[:300])
+        r2 = c.post(
+            _ASSIGN_URL,
+            json=_assign_body(),
+            headers={**hdrs, "Origin": "http://evil.example"},
+        )
+        self.assertEqual(r2.status_code, 403, r2.text[:300])
+        rows = _db_rows("SELECT id FROM directives")
+        self.assertEqual(len(rows), 0)
+
+    def test_d3b_29_pure_valid_api_key_origin_exempt(self) -> None:
+        """Server-to-server call: valid key, NO cookie, NO Origin → 201.
+
+        The Origin exemption applies ONLY to validated API-key auth
+        (auth_method == "api_key"), so a pure key call needs no Origin.
+        """
+        _grant_success_path()
+        c = self._client
+        r = c.post(_ASSIGN_URL, json=_assign_body(), headers=_hdr(KEY_OP))
+        self.assertEqual(r.status_code, 201, r.text[:300])
+        rows = _db_rows("SELECT id FROM directives")
+        self.assertEqual(len(rows), 1)
+
+    def test_d3b_30_mixed_different_identities_safe(self) -> None:
+        """Cookie identity beats a DIFFERENT actor's valid API key.
+
+        d3b-op session cookie + VALID d3b-admin X-API-Key + missing or
+        foreign Origin → 403. Precedence verified: a valid session
+        cookie SELECTS the cookie identity (auth_method="cookie"); the
+        X-API-Key is only consulted when no valid cookie exists, so the
+        valid admin key NEVER converts this request into an API-key
+        Origin exemption (no silent identity switch, no CSRF bypass).
+        """
+        _grant_success_path()
+        c = self._client
+        _login(c, KEY_OP)  # valid d3b-op session cookie
+        hdrs = {"X-API-Key": KEY_ADMIN}  # valid key of a DIFFERENT actor
+        r1 = c.post(_ASSIGN_URL, json=_assign_body(), headers=hdrs)
+        self.assertEqual(r1.status_code, 403, r1.text[:300])
+        r2 = c.post(
+            _ASSIGN_URL,
+            json=_assign_body(),
+            headers={**hdrs, "Origin": "http://evil.example"},
+        )
+        self.assertEqual(r2.status_code, 403, r2.text[:300])
+        rows = _db_rows("SELECT id FROM directives")
+        self.assertEqual(len(rows), 0)
+
+    def test_d3b_31_non_json_content_type_rejected(self) -> None:
+        """Non-JSON content type on /assign → 415 (never 422/500).
+
+        The content-type check runs as a route dependency resolved
+        BEFORE body parsing/validation, so even a text/plain body that
+        is not valid JSON answers the documented 415 contract and
+        nothing is created.
+        """
+        _grant_success_path()
+        c = self._client
+        # raw non-JSON body under text/plain
+        r1 = c.post(
+            _ASSIGN_URL,
+            content="this is not json",
+            headers={**_hdr(KEY_OP), "Content-Type": "text/plain"},
+        )
+        self.assertEqual(r1.status_code, 415, r1.text[:300])
+        # valid JSON payload but WRONG content type → still 415
+        r2 = c.post(
+            _ASSIGN_URL,
+            content=json.dumps(_assign_body()),
+            headers={**_hdr(KEY_OP), "Content-Type": "text/plain"},
+        )
+        self.assertEqual(r2.status_code, 415, r2.text[:300])
+        rows = _db_rows("SELECT id FROM directives")
+        self.assertEqual(len(rows), 0)
