@@ -649,3 +649,20 @@ async def dashboard_session_authorize(
             )
 
     return agent
+
+
+async def dashboard_control_authorize(
+    request: Request,
+    cookie_token: Optional[str] = Cookie(default=None, alias=SESSION_COOKIE_NAME),
+) -> dict[str, Any]:
+    """Authorization for browser-driven dashboard CONTROL calls (D3-B).
+
+    Same mechanism as ``dashboard_session_authorize`` (cookie OR
+    X-API-Key, fresh agent row loaded at request time, never implicit
+    admin) but additionally requires the ``write`` permission via the
+    existing ``_require`` semantics — an admin bypasses the explicit
+    permission check but a plain cookie session never gains admin.
+    """
+    agent = await dashboard_session_authorize(request, cookie_token)
+    _require(agent, "write")
+    return agent

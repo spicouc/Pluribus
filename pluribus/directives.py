@@ -325,9 +325,18 @@ async def list_directive_grants(request: Request, agent_id: str) -> list[Directi
     ]
 
 
-@router.post("", status_code=201, response_model=DirectiveResponse)
-async def create_directive(request: Request, body: DirectiveCreateRequest) -> DirectiveResponse:
-    caller = _caller(request)
+async def create_directive_for_actor(
+    caller: dict[str, Any],
+    body: DirectiveCreateRequest,
+) -> DirectiveResponse:
+    """Servei compartit i autoritatiu de creació de directives.
+
+    Usat tant per POST /v1/directives (agent→agent) com per l'endpoint
+    D3-B de control del dashboard (POST /v1/dashboard/control/assign),
+    de manera que TOTA la lògica de negoci viu en un sol lloc:
+    checks de scope de l'emissor, existència/activitat del destinatari,
+    grants de delegació i d'execució, replay d'idempotència i audit.
+    """
     _assert_scope(caller, body.scope)
     target = await _agent_record(body.target_agent_id)
     if not _json_dict(target.get("permissions")).get("admin", False):
@@ -354,7 +363,7 @@ async def create_directive(request: Request, body: DirectiveCreateRequest) -> Di
         async with get_db() as db:
             cursor = await db.execute(
                 """SELECT * FROM directives
-                   WHERE issuer_agent_id = ? AND idempotency_key = ?""",
+                  WHERE issuer_agent_id = ? AND idempotency_key = ?""",
                 (caller["id"], body.idempotency_key),
             )
             existing = await cursor.fetchone()
@@ -374,9 +383,9 @@ async def create_directive(request: Request, body: DirectiveCreateRequest) -> Di
     async with get_db() as db:
         cursor = await db.execute(
             """INSERT INTO directives(
-                   issuer_agent_id, target_agent_id, scope, action, arguments,
-                   required_capability, idempotency_key, expires_at
-               ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
+                  issuer_agent_id, target_agent_id, scope, action, arguments,
+                  required_capability, idempotency_key, expires_at
+              ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
             (
                 caller["id"],
                 body.target_agent_id,
@@ -408,6 +417,12 @@ async def create_directive(request: Request, body: DirectiveCreateRequest) -> Di
         )
         await db.commit()
     return _row_to_response(row)
+
+
+@router.post("", status_code=201, response_model=DirectiveResponse)
+async def create_directive(request: Request, body: DirectiveCreateRequest) -> DirectiveResponse:
+    """Endpoint REST original — comportament idèntic (backward-compatible)."""
+    return await create_directive_for_actor(_caller(request), body)
 
 
 @router.get("/inbox", response_model=list[DirectiveResponse])
