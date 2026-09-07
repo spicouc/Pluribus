@@ -352,6 +352,7 @@ footer { color: #64748b; font-size: 0.75rem; margin-top: 20px; text-align: cente
 </section>
 
 <section class="panel" id="panel-agents">
+  <div id="assign-form"></div>
   <div id="agents-content"><div class="loading">Carregant...</div></div>
 </section>
 
@@ -380,6 +381,9 @@ const API = {
   agents:  '/v1/dashboard/agents',
   memory:  '/v1/dashboard/memory',
   system:  '/v1/dashboard/system',
+  // D3-B safe assign control (mutations require write + same-origin).
+  options: '/v1/dashboard/control/options',
+  assign:  '/v1/dashboard/control/assign',
 };
 
 function esc(s) {
@@ -464,6 +468,157 @@ async function loadAgents() {
   }
 }
 
+// ========== D3-B ASSIGN (control) ==========
+// Safe assign from the dashboard: creates a DIRECTIVE through the shared
+// control plane (status=pending; the agent claims it later). No second
+// task system, no Memory facts, no work_state/current_task mutation.
+// The server requires read+write, a same-origin browser request, JSON
+// content-type and an idempotency key, so a double-click can never
+// create a duplicate.
+let assignIdemKey = null;
+
+function assignRegenKey() {
+  if (window.crypto && typeof crypto.randomUUID === 'function') {
+    assignIdemKey = crypto.randomUUID();
+  } else {
+    assignIdemKey = 'd3b-' + Date.now() + '-' + Math.random().toString(36).slice(2, 12);
+  }
+}
+
+function assignRenderForm(data) {
+  const el = document.getElementById('assign-form');
+  const targets = (data.targets || []).map(t =>
+    `<option value="${esc(t.agent_id)}">${esc(t.name)} (${esc(t.agent_id)})</option>`
+  ).join('');
+  const scopes = (data.allowed_scopes || []).map(s =>
+    `<option value="${esc(s)}">${esc(s)}</option>`
+  ).join('');
+  const caps = (data.capabilities || []).map(c =>
+    `<option value="${esc(c)}">${esc(c)}</option>`
+  ).join('');
+  const noTargets = !targets;
+  const noCaps = !caps;
+  const darkSel = 'background:#0f172a;border:1px solid #334155;color:#e2e8f0;padding:5px 8px;border-radius:6px;';
+  el.innerHTML = `
+    <div class="card" style="margin-bottom:14px;background:#0f172a;border:1px solid #334155;">
+      <h3 style="margin-top:0;color:#38bdf8;font-size:1rem;">ASSIGNAR TASCA (directiva)</h3>
+      <div style="display:flex;flex-wrap:wrap;gap:10px;align-items:flex-end;">
+        <div>
+          <span class="muted" style="display:block;font-size:0.7rem;margin-bottom:3px;">TARGET</span>
+          <select id="as-target" style="${darkSel}"${noTargets ? ' disabled' : ''}>
+            ${targets || '<option value="">(cap target disponible)</option>'}
+          </select>
+        </div>
+        <div>
+          <span class="muted" style="display:block;font-size:0.7rem;margin-bottom:3px;">SCOPE</span>
+          <select id="as-scope" style="${darkSel}">${scopes || '<option value="shared">shared</option>'}</select>
+        </div>
+        <div>
+          <span class="muted" style="display:block;font-size:0.7rem;margin-bottom:3px;">ACTION</span>
+          <input type="text" id="as-action" value="d3b.run" placeholder="d3b.run"
+                 style="${darkSel};width:130px;" />
+        </div>
+        <div>
+          <span class="muted" style="display:block;font-size:0.7rem;margin-bottom:3px;">CAPABILITY</span>
+          <select id="as-capability" style="${darkSel}"${noCaps ? ' disabled' : ''}>
+            ${caps || '<option value="">(cap delegable)</option>'}
+          </select>
+        </div>
+        <div>
+          <span class="muted" style="display:block;font-size:0.7rem;margin-bottom:3px;">TTL (s)</span>
+          <input type="number" id="as-ttl" value="3600" min="60" max="86400"
+                 style="${darkSel};width:90px;" />
+        </div>
+        <div>
+          <span class="muted" style="display:block;font-size:0.7rem;margin-bottom:3px;">ARGUMENTS (JSON)</span>
+          <textarea id="as-args" rows="1" style="${darkSel};width:180px;resize:vertical;">{}</textarea>
+        </div>
+        <button id="as-submit" style="background:#1e3a5f;border:1px solid #3b82f6;color:#93c5fd;padding:7px 14px;border-radius:6px;cursor:pointer;"
+                ${noTargets || noCaps ? ' disabled' : ''}>Assignar tasca</button>
+      </div>
+      <div id="as-result" class="muted" style="margin-top:8px;font-size:0.85rem;"></div>
+    </div>`;
+}
+
+function assignBindForm() {
+  const btn = document.getElementById('as-submit');
+  const out = document.getElementById('as-result');
+  if (!btn) return;
+  const regen = () => assignRegenKey();
+  ['as-target', 'as-scope', 'as-action', 'as-capability', 'as-ttl', 'as-args'].forEach(id => {
+    const f = document.getElementById(id);
+    if (f) f.addEventListener('input', regen);
+    if (f && f.tagName === 'SELECT') f.addEventListener('change', regen);
+  });
+  btn.addEventListener('click', async () => {
+    if (!assignIdemKey) assignRegenKey();
+    const argsText = document.getElementById('as-args').value.trim() || '{}';
+    let args = {};
+    try {
+      args = JSON.parse(argsText);
+    } catch (e) {
+      out.textContent = 'ERROR: arguments no és JSON vàlid';
+      out.style.color = '#fca5a5';
+      return;
+    }
+    const ttl = parseInt(document.getElementById('as-ttl').value, 10);
+    const payload = {
+      target_agent_id: document.getElementById('as-target').value,
+      scope: document.getElementById('as-scope').value,
+      action: document.getElementById('as-action').value.trim(),
+      arguments: args,
+      required_capability: document.getElementById('as-capability').value,
+      ttl_seconds: Number.isFinite(ttl) ? ttl : 3600,
+      idempotency_key: assignIdemKey,
+    };
+    btn.disabled = true;
+    try {
+      const r = await fetch(API.assign, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(payload),
+      });
+      if (!r.ok) {
+        let detail = 'HTTP ' + r.status;
+        try {
+          const j = await r.json();
+          if (j && j.detail) detail = r.status + ' ' + (typeof j.detail === 'string' ? j.detail : JSON.stringify(j.detail));
+        } catch (e) { /* keep status-only detail */ }
+        out.textContent = 'ERROR: ' + detail;
+        out.style.color = '#fca5a5';
+      } else {
+        const j = await r.json();
+        out.textContent = 'OK directive ' + j.id + ' · status ' + j.status + ' → ' + esc(payload.target_agent_id);
+        out.style.color = '#86efac';
+        assignRegenKey();
+        loadAgents();
+      }
+    } catch (e) {
+      out.textContent = 'ERROR: ' + (e.message || e);
+      out.style.color = '#fca5a5';
+    } finally {
+      btn.disabled = false;
+    }
+  });
+}
+
+async function loadAssignForm() {
+  const el = document.getElementById('assign-form');
+  el.innerHTML = '';
+  let data;
+  try {
+    const r = await fetch(API.options);
+    if (!r.ok) return;  // 401/403 or unknown: never render the form
+    data = await r.json();
+  } catch (e) {
+    return;
+  }
+  if (!data || !data.can_assign) return;  // read-only viewer: no form, no fake buttons
+  assignRegenKey();
+  assignRenderForm(data);
+  assignBindForm();
+}
+
 // ========== MEMORY ==========
 async function loadMemory() {
   const el = document.getElementById('memory-content');
@@ -517,7 +672,7 @@ document.getElementById('tabs').addEventListener('click', e => {
   const name = tab.dataset.panel;
   document.querySelectorAll('.tab').forEach(t => t.classList.toggle('active', t === tab));
   document.querySelectorAll('.panel').forEach(p => p.classList.toggle('active', p.id === 'panel-' + name));
-  if (name === 'agents') loadAgents();
+  if (name === 'agents') { loadAgents(); loadAssignForm(); }
   else if (name === 'memory') loadMemory();
   else if (name === 'system') loadSystem();
   else loadHome();
