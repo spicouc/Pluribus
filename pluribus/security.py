@@ -210,6 +210,20 @@ def register_security_middleware(app: FastAPI) -> None:
             client_host = request.client.host if request.client else "unknown"
             agent_found = await _authenticate_agent(api_key, client_host)
             if agent_found is None:
+                # Mixed browser/server credentials (D3-B): a FAILED
+                # X-API-Key must not short-circuit a dashboard request
+                # that also carries a session cookie. Hand it to the
+                # per-route guard, which resolves auth-source precedence:
+                # a valid cookie wins (cookie identity → Origin check),
+                # and a bogus key next to a cookie never becomes an
+                # API-key Origin exemption. Without a session cookie the
+                # key failure stays an immediate 401.
+                from pluribus.dashboard_session import SESSION_COOKIE_NAME
+                has_session_cookie = SESSION_COOKIE_NAME in (request.headers.get("cookie") or "")
+                if has_session_cookie and (
+                    path == "/v1/dashboard/login" or path.startswith("/v1/dashboard/")
+                ):
+                    return await call_next(request)
                 return JSONResponse(status_code=401, content={"detail": "Clau API invàlida"})
             if not _check_rate_limit(agent_found["id"]):
                 return JSONResponse(

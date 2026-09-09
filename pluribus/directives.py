@@ -8,6 +8,7 @@ Pluribus coordinates directives but never executes shell/code itself.
 from __future__ import annotations
 
 import json
+import sqlite3
 from datetime import datetime, timedelta, timezone
 from typing import Any
 
@@ -172,6 +173,58 @@ def _future_sql(seconds: int) -> str:
     return (datetime.now(timezone.utc) + timedelta(seconds=seconds)).strftime("%Y-%m-%d %H:%M:%S")
 
 
+def _ttl_times(seconds: int) -> tuple[str, str]:
+    """Return (created_at, expires_at) from the SAME server clock.
+
+    Both are stored as ``%Y-%m-%d %H:%M:%S`` UTC text so that
+    ``expires_at - created_at == ttl_seconds`` EXACTLY for new rows.
+    Exactness is what makes the effective TTL a deterministic part of
+    the idempotency signature (D3-B corrective).
+    """
+    now = datetime.now(timezone.utc)
+    created_at = now.strftime("%Y-%m-%d %H:%M:%S")
+    expires_at = (now + timedelta(seconds=seconds)).strftime("%Y-%m-%d %H:%M:%S")
+    return created_at, expires_at
+
+
+def _row_ttl_seconds(row: Any) -> int | None:
+    """Deterministic effective TTL (seconds) of a stored directive row.
+
+    Computed as ``expires_at - created_at`` on the stored UTC text
+    timestamps. Rows written by the current code are exact; unparseable
+    legacy timestamps yield None (never equal to any requested TTL).
+    """
+    try:
+        created = datetime.strptime(str(row["created_at"]), "%Y-%m-%d %H:%M:%S")
+        expires = datetime.strptime(str(row["expires_at"]), "%Y-%m-%d %H:%M:%S")
+    except (TypeError, ValueError):
+        return None
+    return int(round((expires - created).total_seconds()))
+
+
+def _same_directive_semantics(
+    row: Any,
+    body: DirectiveCreateRequest,
+    arguments_json: str,
+) -> bool:
+    """Semantic equality between a stored row and a request payload.
+
+    Compares target/scope/action/required_capability/arguments AND the
+    effective TTL (expires_at - created_at), so a retry that asks for a
+    different ttl_seconds is a CONFLICT, never a silent replay (D3-B).
+    """
+    ttl_original = _row_ttl_seconds(row)
+    return (
+        ttl_original is not None
+        and ttl_original == body.ttl_seconds
+        and row["target_agent_id"] == body.target_agent_id
+        and row["scope"] == body.scope
+        and row["action"] == body.action
+        and row["required_capability"] == body.required_capability
+        and row["arguments"] == arguments_json
+    )
+
+
 def _row_to_response(row: Any) -> DirectiveResponse:
     data = dict(row)
     raw_result = data.get("result")
@@ -325,9 +378,18 @@ async def list_directive_grants(request: Request, agent_id: str) -> list[Directi
     ]
 
 
-@router.post("", status_code=201, response_model=DirectiveResponse)
-async def create_directive(request: Request, body: DirectiveCreateRequest) -> DirectiveResponse:
-    caller = _caller(request)
+async def create_directive_for_actor(
+    caller: dict[str, Any],
+    body: DirectiveCreateRequest,
+) -> DirectiveResponse:
+    """Servei compartit i autoritatiu de creació de directives.
+
+    Usat tant per POST /v1/directives (agent→agent) com per l'endpoint
+    D3-B de control del dashboard (POST /v1/dashboard/control/assign),
+    de manera que TOTA la lògica de negoci viu en un sol lloc:
+    checks de scope de l'emissor, existència/activitat del destinatari,
+    grants de delegació i d'execució, replay d'idempotència i audit.
+    """
     _assert_scope(caller, body.scope)
     target = await _agent_record(body.target_agent_id)
     if not _json_dict(target.get("permissions")).get("admin", False):
@@ -350,64 +412,94 @@ async def create_directive(request: Request, body: DirectiveCreateRequest) -> Di
         )
 
     arguments_json = json.dumps(body.arguments, sort_keys=True, separators=(",", ":"))
+
     if body.idempotency_key:
         async with get_db() as db:
             cursor = await db.execute(
                 """SELECT * FROM directives
-                   WHERE issuer_agent_id = ? AND idempotency_key = ?""",
+                  WHERE issuer_agent_id = ? AND idempotency_key = ?""",
                 (caller["id"], body.idempotency_key),
             )
             existing = await cursor.fetchone()
         if existing:
-            same = (
-                existing["target_agent_id"] == body.target_agent_id
-                and existing["scope"] == body.scope
-                and existing["action"] == body.action
-                and existing["required_capability"] == body.required_capability
-                and existing["arguments"] == arguments_json
-            )
-            if not same:
+            if not _same_directive_semantics(existing, body, arguments_json):
                 raise HTTPException(status_code=409, detail="idempotency_key reutilitzada amb una directiva diferent")
             return _row_to_response(existing)
 
-    expires_at = _future_sql(body.ttl_seconds)
-    async with get_db() as db:
-        cursor = await db.execute(
-            """INSERT INTO directives(
-                   issuer_agent_id, target_agent_id, scope, action, arguments,
-                   required_capability, idempotency_key, expires_at
-               ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
-            (
+    created_at, expires_at = _ttl_times(body.ttl_seconds)
+    try:
+        async with get_db() as db:
+            cursor = await db.execute(
+                """INSERT INTO directives(
+                      issuer_agent_id, target_agent_id, scope, action, arguments,
+                      required_capability, idempotency_key, created_at, expires_at
+                  ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                (
+                    caller["id"],
+                    body.target_agent_id,
+                    body.scope,
+                    body.action,
+                    arguments_json,
+                    body.required_capability,
+                    body.idempotency_key,
+                    created_at,
+                    expires_at,
+                ),
+            )
+            rowid = cursor.lastrowid
+            cursor = await db.execute("SELECT * FROM directives WHERE rowid = ?", (rowid,))
+            row = await cursor.fetchone()
+            await log_audit(
+                db,
                 caller["id"],
-                body.target_agent_id,
-                body.scope,
-                body.action,
-                arguments_json,
-                body.required_capability,
-                body.idempotency_key,
-                expires_at,
-            ),
-        )
-        rowid = cursor.lastrowid
-        cursor = await db.execute("SELECT * FROM directives WHERE rowid = ?", (rowid,))
-        row = await cursor.fetchone()
-        await log_audit(
-            db,
-            caller["id"],
-            "CREATE",
-            "directive",
-            resource_id=row["id"],
-            payload=json.dumps(
-                {
-                    "target_agent_id": body.target_agent_id,
-                    "scope": body.scope,
-                    "action": body.action,
-                    "required_capability": body.required_capability,
-                }
-            ),
-        )
-        await db.commit()
+                "CREATE",
+                "directive",
+                resource_id=row["id"],
+                payload=json.dumps(
+                    {
+                        "target_agent_id": body.target_agent_id,
+                        "scope": body.scope,
+                        "action": body.action,
+                        "required_capability": body.required_capability,
+                    }
+                ),
+            )
+            await db.commit()
+    except sqlite3.IntegrityError:
+        # A real concurrent race on idx_directives_idempotency
+        # (issuer_agent_id, idempotency_key): the fast-path SELECT above
+        # was empty for BOTH requests, so both tried to INSERT and the
+        # loser hit the partial UNIQUE index. The failed INSERT aborted
+        # this connection's transaction and the context manager closed
+        # the connection, so the re-check below runs on a FRESH, clean
+        # connection that sees the winner's committed row.
+        if not body.idempotency_key:
+            # Partial UNIQUE index never matches NULL keys: this error
+            # cannot be an idempotency race — surface the real failure.
+            raise
+        async with get_db() as db:
+            cursor = await db.execute(
+                """SELECT * FROM directives
+                  WHERE issuer_agent_id = ? AND idempotency_key = ?""",
+                (caller["id"], body.idempotency_key),
+            )
+            existing = await cursor.fetchone()
+        if existing is None:
+            # No row exists for this issuer+key → the IntegrityError did
+            # NOT come from the idempotency race. Re-raise the original
+            # error instead of hiding a genuine failure.
+            raise
+        if _same_directive_semantics(existing, body, arguments_json):
+            # Atomic replay: the concurrent identical request won.
+            return _row_to_response(existing)
+        raise HTTPException(status_code=409, detail="idempotency_key reutilitzada amb una directiva diferent")
     return _row_to_response(row)
+
+
+@router.post("", status_code=201, response_model=DirectiveResponse)
+async def create_directive(request: Request, body: DirectiveCreateRequest) -> DirectiveResponse:
+    """Endpoint REST original — comportament idèntic (backward-compatible)."""
+    return await create_directive_for_actor(_caller(request), body)
 
 
 @router.get("/inbox", response_model=list[DirectiveResponse])

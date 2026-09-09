@@ -23,6 +23,7 @@ from pluribus.authorization import (
 from pluribus.compact import compact_database
 from pluribus.config import settings
 from pluribus.dashboard import router as dashboard_router
+from pluribus.dashboard_control import router as dashboard_control_router
 from pluribus.dashboard_observability import router as dashboard_observability_router
 from pluribus.dashboard_session import (
     auth_router as dashboard_session_router,
@@ -172,6 +173,10 @@ app.include_router(dashboard_router, dependencies=[Depends(dashboard_authorize)]
 # guard was path-routed for /v1/memory/* and did NOT cover
 # /v1/dashboard/*.
 app.include_router(dashboard_observability_router)
+# D3-B dashboard control — endpoints amb guard propi
+# (dashboard_control_authorize per a mutations / dashboard_session_authorize
+# per a lectura). El router NO hereta cap dependència global.
+app.include_router(dashboard_control_router)
 app.include_router(dashboard_session_router)
 # Public login page + form submission at /dashboard/login. No
 # API key required on this path — the user pastes a one-time code

@@ -595,9 +595,17 @@ async def dashboard_session_authorize(
 
     Session lifetime is FIXED at SESSION_TTL_SECONDS (30 min). We do
     not extend on activity.
+
+    Auth-source binding (D3-B): the effective identity source is
+    recorded on ``request.state.auth_method`` as ``"cookie"`` or
+    ``"api_key"``. A VALID session cookie always wins — the X-API-Key
+    is only consulted when no valid cookie is present. Endpoint guards
+    (e.g. the Origin/CSRF check) must key on this marker, never on the
+    mere presence of an X-API-Key header.
     """
     x_api_key = request.headers.get("X-API-Key")
     agent = None
+    auth_method = None
 
     if cookie_token:
         sess = await _lookup_session(cookie_token)
@@ -615,6 +623,7 @@ async def dashboard_session_authorize(
                     "permissions": json.loads(row[2]) if row[2] else {},
                     "allowed_scopes": json.loads(row[3]) if row[3] else [],
                 }
+                auth_method = "cookie"
             else:
                 await _delete_session(cookie_token)
 
@@ -623,6 +632,7 @@ async def dashboard_session_authorize(
         client_host = request.client.host if request.client else "unknown"
         agent = await _authenticate_agent(x_api_key, client_host)
         if agent is not None:
+            auth_method = "api_key"
             try:
                 if isinstance(agent.get("permissions"), str):
                     agent["permissions"] = json.loads(agent["permissions"])
@@ -637,6 +647,7 @@ async def dashboard_session_authorize(
     if agent is None:
         raise HTTPException(status_code=401, detail="Autenticacio requerida")
 
+    request.state.auth_method = auth_method
     _require(agent, "read")
 
     if request.url.path.rstrip("/").startswith("/v1/dashboard/memory"):
@@ -648,4 +659,21 @@ async def dashboard_session_authorize(
                 detail=f"Scope '{requested_scope}' no autoritzat per a aquest agent",
             )
 
+    return agent
+
+
+async def dashboard_control_authorize(
+    request: Request,
+    cookie_token: Optional[str] = Cookie(default=None, alias=SESSION_COOKIE_NAME),
+) -> dict[str, Any]:
+    """Authorization for browser-driven dashboard CONTROL calls (D3-B).
+
+    Same mechanism as ``dashboard_session_authorize`` (cookie OR
+    X-API-Key, fresh agent row loaded at request time, never implicit
+    admin) but additionally requires the ``write`` permission via the
+    existing ``_require`` semantics — an admin bypasses the explicit
+    permission check but a plain cookie session never gains admin.
+    """
+    agent = await dashboard_session_authorize(request, cookie_token)
+    _require(agent, "write")
     return agent
