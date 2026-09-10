@@ -48,8 +48,10 @@ from pluribus.dashboard_session import (
 )
 from pluribus.db import get_db
 from pluribus.directives import (
+    DashboardCancelRequest,
     DirectiveCreateRequest,
     DirectiveResponse,
+    cancel_directive_for_actor,
     create_directive_for_actor,
 )
 from pluribus.validation import validate_identifier
@@ -143,6 +145,35 @@ async def dashboard_assign(
     """
     _assert_browser_origin(request)
     return await create_directive_for_actor(agent, body)
+
+
+@router.post("/{directive_id}/cancel", response_model=DirectiveResponse)
+async def dashboard_cancel(
+    request: Request,
+    directive_id: str,
+    body: DashboardCancelRequest,
+    agent: dict[str, Any] = Depends(dashboard_control_authorize),
+    _content_type: None = Depends(_require_json_content_type),
+) -> DirectiveResponse:
+    """Cancel a directive from the dashboard (D3-C canonical safe cancel).
+
+    Security contract, identical to D3-B ASSIGN:
+      - ``dashboard_control_authorize``: read+write via the existing
+        ``_require`` semantics (cookie OR X-API-Key, fresh agent row at
+        request time, no implicit admin) — a read-only session is 403
+        BEFORE any business logic runs.
+      - ``_require_json_content_type`` runs as a route dependency, so a
+        non-JSON body answers 415 before parsing (never a misleading 422).
+      - ``_assert_browser_origin``: cookie-backed browser mutations
+        demand a same-origin ``Origin`` header; only VALIDATED API-key
+        auth is exempt (auth-source binding preserved).
+    ``cancel_directive_for_actor`` then re-validates EVERYTHING at
+    mutation time (404, issuer-or-admin 403, scope re-check 403, replay
+    200/409, stale expected_status 409, atomic transition 409) and writes
+    exactly one audit row per EFFECTIVE cancellation.
+    """
+    _assert_browser_origin(request)
+    return await cancel_directive_for_actor(agent, directive_id, body)
 
 
 @router.get("/options")
