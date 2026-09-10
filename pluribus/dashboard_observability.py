@@ -352,8 +352,65 @@ async def dashboard_summary(_request: Request) -> dict[str, Any]:
 # --- /v1/dashboard/agents ------------------------------------------------
 
 
-@router.get("/agents", dependencies=[Depends(dashboard_session_authorize)])
-async def dashboard_agents(_request: Request) -> dict[str, Any]:
+def _caller_is_admin(agent: dict[str, Any]) -> bool:
+    """True if the authenticated caller carries the admin permission.
+
+    ``dashboard_session_authorize`` returns parsed dicts/lists, but the
+    JSON columns are tolerated as raw strings too (defensive, same
+    normalization the directives module uses)."""
+    perms = agent.get("permissions") or {}
+    if isinstance(perms, str):
+        try:
+            perms = json.loads(perms)
+        except Exception:
+            perms = {}
+    return bool(perms.get("admin", False)) if isinstance(perms, dict) else False
+
+
+def _caller_scopes(agent: dict[str, Any]) -> set[str]:
+    """Allowed scopes of the authenticated caller as a set of strings."""
+    scopes = agent.get("allowed_scopes") or []
+    if isinstance(scopes, str):
+        try:
+            scopes = json.loads(scopes)
+        except Exception:
+            scopes = []
+    if not isinstance(scopes, list):
+        return set()
+    return {s for s in scopes if isinstance(s, str)}
+
+
+def _can_cancel(
+    *,
+    status: Any,
+    issuer_agent_id: Any,
+    scope: Any,
+    caller_id: Any,
+    caller_is_admin: bool,
+    caller_scopes: set[str],
+) -> bool:
+    """Authoritative server-side CANCEL permission (D3-C).
+
+    True ONLY when ALL hold:
+      1) the directive is still cancellable (status pending/claimed);
+      2) the caller is the issuer OR an admin;
+      3) the directive scope is permitted for the caller (admins pass).
+    The browser only paints this value; it never computes it.
+    """
+    if status not in ("pending", "claimed"):
+        return False
+    if not (caller_is_admin or caller_id == issuer_agent_id):
+        return False
+    if caller_is_admin:
+        return True
+    return scope in caller_scopes
+
+
+@router.get("/agents")
+async def dashboard_agents(
+    _request: Request,
+    agent: dict[str, Any] = Depends(dashboard_session_authorize),
+) -> dict[str, Any]:
     """List known agents with D2-B telemetry where authoritative
     sources exist.
 
@@ -371,6 +428,15 @@ async def dashboard_agents(_request: Request) -> dict[str, Any]:
       - last_result: UNKNOWN (D2-C will provide authoritative
         source via Directives)
       - active_flag is_admin / is_active, not presence
+      - current_task_detail / pending_directive: D3-C adds the
+        authoritative ``issuer_agent_id`` and ``can_cancel`` fields.
+        ``can_cancel`` is computed HERE from the authenticated caller
+        (issuer-or-admin + scope) — the UI only paints it.
+      - cancelled directives are INVISIBLE by construction:
+        ``current_task`` filters status='claimed', ``pending_directive``
+        filters status='pending' and ``last_result`` filters
+        status IN ('completed','failed'), so the terminal 'cancelled'
+        state can never surface as current work or as a result.
 
     No heuristic inference. No memory-text mining. No historical
     PASS/BLOCKED strings interpreted as current state.
@@ -393,7 +459,7 @@ async def dashboard_agents(_request: Request) -> dict[str, Any]:
         # must NOT be presented as current_task).
         cur = await db.execute(
             """SELECT target_agent_id, id, action, claimed_at, lease_until,
-                      expires_at, claimed_by_agent_id
+                      expires_at, claimed_by_agent_id, issuer_agent_id, scope
                FROM directives
                WHERE status = 'claimed'
                ORDER BY claimed_at DESC, id DESC"""
@@ -403,7 +469,8 @@ async def dashboard_agents(_request: Request) -> dict[str, Any]:
         # only visible if expires_at > now. Expired-but-not-cleaned
         # pending rows are ignored.
         cur = await db.execute(
-            """SELECT target_agent_id, id, action, created_at, expires_at
+            """SELECT target_agent_id, id, action, created_at, expires_at,
+                      issuer_agent_id, scope
                FROM directives
                WHERE status = 'pending'
                  AND expires_at > datetime('now')
@@ -426,19 +493,30 @@ async def dashboard_agents(_request: Request) -> dict[str, Any]:
         )
         terminal_rows = await cur.fetchall()
 
+    # D3-C: the claimer + issuer + scope of each claimed/pending row are
+    # carried through so ``can_cancel`` can be evaluated per caller.
     claimed_by_agent: dict[str, list[tuple]] = {}
-    for (tr, did, daction, dclaimed, dlease, dexpires, dclaimer) in claimed_rows:
+    for (tr, did, daction, dclaimed, dlease, dexpires,
+         dclaimer, dissuer, dscope) in claimed_rows:
         claimed_by_agent.setdefault(tr, []).append(
-            (did, daction, dclaimed, dlease, dexpires, dclaimer)
+            (did, daction, dclaimed, dlease, dexpires, dclaimer, dissuer, dscope)
         )
     pending_by_agent: dict[str, list[tuple]] = {}
-    for tr, did, daction, dcreated, dexpires in pending_rows:
-        pending_by_agent.setdefault(tr, []).append((did, daction, dcreated, dexpires))
+    for tr, did, daction, dcreated, dexpires, dissuer, dscope in pending_rows:
+        pending_by_agent.setdefault(tr, []).append(
+            (did, daction, dcreated, dexpires, dissuer, dscope)
+        )
     terminal_by_agent: dict[str, list[tuple]] = {}
     for (tr, did, daction, dstatus, dcompleted, dresult, derror, dclaimer) in terminal_rows:
         terminal_by_agent.setdefault(tr, []).append(
             (did, daction, dstatus, dcompleted, dresult, derror, dclaimer)
         )
+
+    # D3-C: the authenticated caller is the authority for can_cancel.
+    # Computed once per request (not per agent/directive).
+    caller_id = agent.get("id")
+    caller_is_admin = _caller_is_admin(agent)
+    caller_scopes = _caller_scopes(agent)
 
     agents = []
     for row in rows:
@@ -501,29 +579,51 @@ async def dashboard_agents(_request: Request) -> dict[str, Any]:
             # claimed directive -> use it. Else UNKNOWN. No fallback.
             match = next((d for d in valid_claimed if d[0] == current_task_id), None)
             if match is not None:
-                did, daction, dclaimed, dlease, dexpires, _dclaimer = match
+                (did, daction, dclaimed, dlease, dexpires,
+                 _dclaimer, d_issuer, d_scope) = match
                 current_task_id_val = did
                 current_task = f"directive:{did}"
                 current_task_detail = {
-                    "id":          did,
-                    "action":      daction,
-                    "claimed_at":  dclaimed,
-                    "lease_until": dlease,
-                    "expires_at":  dexpires,
+                    "id":              did,
+                    "status":          "claimed",
+                    "action":          daction,
+                    "claimed_at":      dclaimed,
+                    "lease_until":     dlease,
+                    "expires_at":      dexpires,
+                    "issuer_agent_id": d_issuer,
+                    "can_cancel":      _can_cancel(
+                        status="claimed",
+                        issuer_agent_id=d_issuer,
+                        scope=d_scope,
+                        caller_id=caller_id,
+                        caller_is_admin=caller_is_admin,
+                        caller_scopes=caller_scopes,
+                    ),
                 }
             # else: stay UNKNOWN (explicit invalid reference)
         else:
             # No explicit reference. Fall back to single valid claimed.
             if valid_claimed_count == 1:
-                did, daction, dclaimed, dlease, dexpires, _dclaimer = valid_claimed[0]
+                (did, daction, dclaimed, dlease, dexpires,
+                 _dclaimer, d_issuer, d_scope) = valid_claimed[0]
                 current_task_id_val = did
                 current_task = f"directive:{did}"
                 current_task_detail = {
-                    "id":          did,
-                    "action":      daction,
-                    "claimed_at":  dclaimed,
-                    "lease_until": dlease,
-                    "expires_at":  dexpires,
+                    "id":              did,
+                    "status":          "claimed",
+                    "action":          daction,
+                    "claimed_at":      dclaimed,
+                    "lease_until":     dlease,
+                    "expires_at":      dexpires,
+                    "issuer_agent_id": d_issuer,
+                    "can_cancel":      _can_cancel(
+                        status="claimed",
+                        issuer_agent_id=d_issuer,
+                        scope=d_scope,
+                        caller_id=caller_id,
+                        caller_is_admin=caller_is_admin,
+                        caller_scopes=caller_scopes,
+                    ),
                 }
 
         # Pending directive: a pending row with expires_at > now.
@@ -531,12 +631,22 @@ async def dashboard_agents(_request: Request) -> dict[str, Any]:
         pending = pending_by_agent.get(agent_id, [])
         pending_directive = None
         if pending:
-            did, daction, dcreated, dexpires = pending[0]
+            did, daction, dcreated, dexpires, d_issuer, d_scope = pending[0]
             pending_directive = {
-                "id":          did,
-                "action":      daction,
-                "created_at":  dcreated,
-                "expires_at":  dexpires,
+                "id":              did,
+                "status":          "pending",
+                "action":          daction,
+                "created_at":      dcreated,
+                "expires_at":      dexpires,
+                "issuer_agent_id": d_issuer,
+                "can_cancel":      _can_cancel(
+                    status="pending",
+                    issuer_agent_id=d_issuer,
+                    scope=d_scope,
+                    caller_id=caller_id,
+                    caller_is_admin=caller_is_admin,
+                    caller_scopes=caller_scopes,
+                ),
             }
 
         # Last result: authoritative source = Directives.

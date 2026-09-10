@@ -101,10 +101,17 @@ CREATE TABLE IF NOT EXISTS embedding_cache (
     created_at TEXT DEFAULT (datetime('now'))
 );
 
+-- D3-C (audit corrective): canonical action set = the 5 legacy actions
+-- (CREATE/READ/UPDATE/DELETE/SEARCH) preserved verbatim + RECALL + the
+-- directive lifecycle (CLAIM/COMPLETE/FAIL/REJECT/CANCEL). SQLite cannot
+-- ALTER a CHECK in place: pre-existing tables are rebuilt by
+-- pluribus/db.py::_migrate_audit_log_actions().
 CREATE TABLE IF NOT EXISTS audit_log (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     agent_id TEXT REFERENCES agents(id),
-    action TEXT NOT NULL,
+    action TEXT NOT NULL
+        CHECK (action IN ('CREATE','READ','UPDATE','DELETE','SEARCH',
+                          'RECALL','CLAIM','COMPLETE','FAIL','REJECT','CANCEL')),
     resource_type TEXT NOT NULL,
     resource_id TEXT,
     payload TEXT,

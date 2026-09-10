@@ -325,6 +325,11 @@ pre { background: #0f172a; padding: 8px; border-radius: 6px; overflow-x: auto; f
 .search-row { display: flex; gap: 6px; margin-bottom: 10px; }
 .search-row input { background: #0f172a; border: 1px solid #334155; color: #e2e8f0; padding: 6px 10px; border-radius: 6px; font-size: 13px; flex: 1; }
 .search-row button { padding: 6px 12px; background: #1e3a5f; border: 1px solid #3b82f6; color: #93c5fd; border-radius: 6px; cursor: pointer; font-size: 13px; }
+.cancel-warning { color: #fcd34d; font-size: 0.78rem; margin: 0 0 8px 0; }
+.cancel-box { display: inline-flex; gap: 6px; align-items: center; }
+.cancel-reason { background: #0f172a; border: 1px solid #334155; color: #e2e8f0; padding: 5px 8px; border-radius: 6px; font-size: 0.78rem; width: 130px; }
+.cancel-btn { background: #3f1d1d; border: 1px solid #ef4444; color: #fca5a5; padding: 5px 10px; border-radius: 6px; cursor: pointer; font-size: 0.78rem; white-space: nowrap; }
+.cancel-btn:disabled { opacity: 0.5; cursor: default; }
 footer { color: #64748b; font-size: 0.75rem; margin-top: 20px; text-align: center; }
 .loading { color: #64748b; padding: 20px; text-align: center; font-style: italic; }
 @media (max-width: 640px) {
@@ -353,6 +358,8 @@ footer { color: #64748b; font-size: 0.75rem; margin-top: 20px; text-align: cente
 
 <section class="panel" id="panel-agents">
   <div id="assign-form"></div>
+  <div id="cancel-warning" class="cancel-warning">Cancel·lar retira la directiva de Pluribus. No atura forçosament un procés que ja s'estigui executant a l'agent.</div>
+  <div id="cancel-result" class="muted" style="margin:0 0 10px 0;font-size:0.85rem;"></div>
   <div id="agents-content"><div class="loading">Carregant...</div></div>
 </section>
 
@@ -384,6 +391,8 @@ const API = {
   // D3-B safe assign control (mutations require write + same-origin).
   options: '/v1/dashboard/control/options',
   assign:  '/v1/dashboard/control/assign',
+  // D3-C safe cancel control (server-authoritative `can_cancel` gate).
+  cancel:  '/v1/dashboard/control/{id}/cancel',
 };
 
 function esc(s) {
@@ -452,15 +461,16 @@ async function loadAgents() {
         <td>${esc(a.project || 'UNKNOWN')}</td>
         <td>${statusBadge(a.blocker || 'NONE')}</td>
         <td>${statusBadge(a.last_result || 'UNKNOWN')}</td>
+        <td>${cancelCell(a.current_task_detail, 'claimed')}${cancelCell(a.pending_directive, 'pending')}</td>
       </tr>`;
     }).join('');
     el.innerHTML = `<table>
       <thead><tr>
         <th>NAME / IDENTITY</th><th>REGISTERED</th><th>ONLINE NOW</th>
         <th>LAST ACTIVITY</th><th>CURRENT TASK</th><th>PROJECT</th>
-        <th>BLOCKER</th><th>LAST RESULT</th>
+        <th>BLOCKER</th><th>LAST RESULT</th><th>ACTION</th>
       </tr></thead>
-      <tbody>${rows || '<tr><td colspan="8" class="muted">No agents</td></tr>'}</tbody>
+      <tbody>${rows || '<tr><td colspan="9" class="muted">No agents</td></tr>'}</tbody>
     </table>
     <p class="muted" style="margin-top:10px;">${esc(j.count || 0)} agent(s) known. Active = Pluribus registered. Online = real-time presence (UNKNOWN unless a heartbeat source is available).</p>`;
   } catch (e) {
@@ -619,6 +629,97 @@ async function loadAssignForm() {
   assignBindForm();
 }
 
+// ========== D3-C CANCEL (control) ==========
+// Safe CANCEL of a directive. The gate is EXCLUSIVAMENT the
+// authoritative `can_cancel` boolean computed by the server
+// (issuer-or-admin + scope + legal state): the browser never decides
+// legality and paints NO actionable control when the server says
+// false/absent.
+// CANCEL retira la directiva de Pluribus; NO atura cap procés del
+// sistema operatiu (no kill). Credencials = cookie de sessió
+// same-origin; cap API key arriba mai a aquesta pàgina.
+const CANCEL_WARNING = "Cancel·lar retira la directiva de Pluribus. No atura forçosament un procés que ja s'estigui executant a l'agent.";
+
+function cancelWarning() { return CANCEL_WARNING; }
+
+function cancelCell(d, fallbackExpected) {
+  // Gating autoritatiu del servidor: sense can_cancel===true no hi ha
+  // cap control accionable. Cap heurística local de legalitat.
+  if (!d || d.can_cancel !== true) return '';
+  const expected = d.status || fallbackExpected || '';
+  const rid = esc(d.id);
+  return `<span class="cancel-box">` +
+    `<input type="text" class="cancel-reason" data-cancel-for="${rid}" placeholder="motiu (obligatori)" />` +
+    `<button class="cancel-btn" data-cancel-id="${rid}" data-cancel-status="${esc(expected)}">CANCEL·LAR</button>` +
+    `</span>`;
+}
+
+function cancelErrorMessage(status) {
+  if (status === 403) return 'No autoritzat per cancel·lar aquesta directiva.';
+  if (status === 404) return 'Directiva no trobada.';
+  if (status === 409) return "L'estat ha canviat (conflicte). Recarrega; la directiva ja no és cancel·lable.";
+  if (status === 415) return 'Petició no vàlida (cal JSON).';
+  if (status === 422) return "Falta el motiu o l'estat esperat no és vàlid.";
+  return 'HTTP ' + status;
+}
+
+function cancelOut(text, ok) {
+  const out = document.getElementById('cancel-result');
+  if (!out) return;
+  out.textContent = text;
+  out.style.color = ok ? '#86efac' : '#fca5a5';
+}
+
+async function cancelDirective(id, expectedStatus, reason, btn) {
+  btn.disabled = true;  // idempotència visual: evita el doble clic
+  try {
+    const r = await fetch(API.cancel.replace('{id}', encodeURIComponent(id)), {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ reason: reason, expected_status: expectedStatus }),
+    });
+    if (r.ok) {
+      let j = {};
+      try { j = await r.json(); } catch (e) { j = {}; }
+      cancelOut('OK directiva ' + (j.id || id) + ' · status ' + (j.status || 'cancelled'), true);
+    } else {
+      cancelOut('ERROR: ' + cancelErrorMessage(r.status), false);
+    }
+  } catch (e) {
+    cancelOut('ERROR: ' + (e.message || e), false);
+  } finally {
+    btn.disabled = false;
+    // Refresc de l'estat SEMPRE (èxit i error): el servidor és l'autoritat.
+    loadAgents();
+  }
+}
+
+function cancelBind() {
+  const el = document.getElementById('agents-content');
+  if (!el || el.dataset.cancelBound === '1') return;
+  el.dataset.cancelBound = '1';
+  // Delegació: la taula es re-pinta a cada loadAgents().
+  el.addEventListener('click', e => {
+    const btn = e.target.closest('.cancel-btn');
+    if (!btn) return;
+    const id = btn.getAttribute('data-cancel-id') || '';
+    const expectedStatus = btn.getAttribute('data-cancel-status') || '';
+    const box = btn.closest('.cancel-box');
+    const input = box ? box.querySelector('.cancel-reason') : null;
+    // Motiu obligatori: buit -> no s'envia res, error local.
+    const reason = input ? input.value.trim() : '';
+    if (!reason) {
+      cancelOut("ERROR: el motiu és obligatori (petició no enviada).", false);
+      return;
+    }
+    // Confirmació obligatòria; warning explícit quan l'estat és claimed.
+    let msg = 'Cancel·lar la directiva ' + id + ' (motiu: ' + reason + ')?';
+    if (expectedStatus === 'claimed') msg += ' — ' + cancelWarning();
+    if (!window.confirm(msg)) return;
+    cancelDirective(id, expectedStatus, reason, btn);
+  });
+}
+
 // ========== MEMORY ==========
 async function loadMemory() {
   const el = document.getElementById('memory-content');
@@ -677,6 +778,10 @@ document.getElementById('tabs').addEventListener('click', e => {
   else if (name === 'system') loadSystem();
   else loadHome();
 });
+
+// ========== D3-C CANCEL BINDING ==========
+// Delegació d'esdeveniments als controls CANCEL de la taula d'agents.
+cancelBind();
 
 // ========== MEMORY SEARCH ==========
 document.getElementById('memory-search-btn').addEventListener('click', loadMemory);
