@@ -33,7 +33,7 @@ import logging
 import os
 from typing import Any, Optional
 
-import numpy as np
+from pluribus._numpy_fallback import np
 
 from pluribus.config import settings
 from pluribus.embedding import embedding_service

@@ -35,7 +35,7 @@ import logging
 import sqlite3
 from typing import Any, Optional
 
-import numpy as np
+from pluribus._numpy_fallback import np
 
 from pluribus.config import settings
 

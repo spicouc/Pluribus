@@ -12,7 +12,7 @@ import math
 from datetime import datetime, timezone
 from typing import Any
 
-import numpy as np
+from pluribus._numpy_fallback import np
 from fastapi import APIRouter, HTTPException, Request
 from pydantic import BaseModel, Field, field_validator
 

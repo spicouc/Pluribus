@@ -322,7 +322,7 @@ async def _tool_search_semantic(args: dict[str, Any], id_: Any) -> JSONResponse:
         return _error(-32602, "query is required", id_)
 
     try:
-        import numpy as np
+        from pluribus._numpy_fallback import np
         query_vec = embedding_service.get_embedding(query, "query: ")
 
         async with get_db() as db:

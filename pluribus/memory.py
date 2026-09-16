@@ -9,7 +9,7 @@ from __future__ import annotations
 import json
 from typing import Any, Optional
 
-import numpy as np
+from pluribus._numpy_fallback import np
 from fastapi import APIRouter, BackgroundTasks, Depends, HTTPException, Query, Request
 from starlette.responses import JSONResponse
 

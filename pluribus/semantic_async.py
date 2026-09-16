@@ -5,7 +5,7 @@ from __future__ import annotations
 import json
 from typing import Any
 
-import numpy as np
+from pluribus._numpy_fallback import np
 from fastapi import APIRouter, Depends, Request
 
 from pluribus.audit import log_audit
