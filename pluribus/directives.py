@@ -10,7 +10,7 @@ from __future__ import annotations
 import json
 import sqlite3
 from datetime import datetime, timedelta, timezone
-from typing import Any
+from typing import Any, Literal
 
 from fastapi import APIRouter, HTTPException, Query, Request
 from pydantic import BaseModel, Field, field_validator
@@ -91,6 +91,21 @@ class DirectiveRejectRequest(BaseModel):
     reason: str = Field(default="rejected", min_length=1, max_length=4096)
 
 
+class DashboardCancelRequest(BaseModel):
+    """Body of a dashboard CANCEL (D3-C canonical safe cancel).
+
+    ``expected_status`` is the optimistic-concurrency guard the caller
+    observed in the UI: if the stored status moved on (claim, complete,
+    fail, reject, expiry) the mutation is a 409, never a silent win.
+    ``reason`` doubles as the idempotency signature: replaying the SAME
+    reason by the SAME actor is a 200 replay; a different reason (or a
+    different actor) is a 409 conflict.
+    """
+
+    reason: str = Field(min_length=1, max_length=4096)
+    expected_status: Literal["pending", "claimed"]
+
+
 class DirectiveResponse(BaseModel):
     id: str
     issuer_agent_id: str
@@ -109,6 +124,9 @@ class DirectiveResponse(BaseModel):
     completed_at: str | None = None
     result: dict[str, Any] | None = None
     error: str | None = None
+    cancelled_at: str | None = None
+    cancelled_by_agent_id: str | None = None
+    cancellation_reason: str | None = None
 
 
 class DirectiveGrantResponse(BaseModel):
@@ -246,6 +264,9 @@ def _row_to_response(row: Any) -> DirectiveResponse:
         completed_at=data.get("completed_at"),
         result=_json_dict(raw_result) if raw_result is not None else None,
         error=data.get("error"),
+        cancelled_at=data.get("cancelled_at"),
+        cancelled_by_agent_id=data.get("cancelled_by_agent_id"),
+        cancellation_reason=data.get("cancellation_reason"),
     )
 
 
@@ -502,6 +523,114 @@ async def create_directive(request: Request, body: DirectiveCreateRequest) -> Di
     return await create_directive_for_actor(_caller(request), body)
 
 
+async def cancel_directive_for_actor(
+    caller: dict[str, Any],
+    directive_id: str,
+    body: DashboardCancelRequest,
+) -> DirectiveResponse:
+    """Servei autoritatiu i atòmic de cancel·lació (D3-C CANONICAL SAFE CANCEL).
+
+    Compartit per l'endpoint del dashboard (POST
+    /v1/dashboard/control/{directive_id}/cancel) i, si calgués, per
+    qualsevol altre camí: TOTA la lògica viu aquí, mai al router.
+
+    Cicle de vida: ``pending -> cancelled`` i ``claimed -> cancelled``.
+    CANCEL ≠ REJECT (no mata cap procés del sistema operatiu: és la
+    retirada de la directiva) i els terminals són immutables.
+
+    Ordre EXACTE de comprovacions:
+      1) validació de l'identificador,
+      2) existència (404),
+      3) autorització issuer-or-admin (403),
+      4) revalidació de l'scope ACTUAL de la fila (403),
+      5) replay idempotent (200 sense audit nou) o replay conflictiu (409),
+      6) expected_status obsolet / estat terminal immutable (409),
+      7) transició atòmica amb comprovació de ``rowcount`` (409 si no guanya),
+      8) audit NOMÉS si la transició s'ha convertit en estat real (rowcount==1),
+      9) retorn de la fila refrescada.
+
+    Prohibit en aquest camí: cap escriptura a Memory (``facts``), cap
+    escriptura a telemetria d'agents (work_state / current_task_id /
+    current_project / current_blocker) ni cap escriptura a
+    ``directive_grants``.
+    """
+    directive_id = validate_identifier(directive_id, "directive_id")
+    row = await _fetch_directive(directive_id)
+
+    # 3) Només l'emissor de la directiva (o un admin) pot cancel·lar-la.
+    if caller["id"] != row["issuer_agent_id"] and not _is_admin(caller):
+        raise HTTPException(
+            status_code=403,
+            detail="Només l'emissor de la directiva o un admin poden cancel·lar-la",
+        )
+
+    # 4) L'scope s'ha de revalidar contra l'estat ACTUAL de la fila:
+    #    un canvi de scopes de l'agent des de la creació no s'ignora.
+    _assert_scope(caller, row["scope"])
+
+    # 5) Replay idempotent. Un segon POST idèntic (mateix actor, mateixa
+    #    reason) retorna 200 amb la fila existent i SENSE audit nou.
+    #    Qualsevol altra combinació és un conflicte: no es reescriu
+    #    mai una cancel·lació aliena ni s'hi afegeix audit.
+    if row["status"] == "cancelled":
+        if (
+            row["cancelled_by_agent_id"] == caller["id"]
+            and row["cancellation_reason"] == body.reason
+        ):
+            return _row_to_response(row)
+        raise HTTPException(
+            status_code=409,
+            detail="Directiva ja cancel·lada (replay conflictiu)",
+        )
+
+    # 6) Guarda optimista: si l'estat ha canviat des que el client el va
+    #    llegir (claim/complete/fail/reject/expire) la cancel·lació és
+    #    409. Els estats terminals són immutables i queden coberts aquí.
+    if row["status"] != body.expected_status:
+        raise HTTPException(
+            status_code=409,
+            detail="Directiva no cancel·lable (estat inesperat)",
+        )
+
+    # 7) Transició atòmica: exactament UN guanyador. La condició
+    #    ``status`` de l'UPDATE és autoritativa; un perdedor de la cursa
+    #    rep rowcount 0 → rollback → 409 (mai un 200 fals).
+    async with get_db() as db:
+        cursor = await db.execute(
+            """UPDATE directives
+                  SET status = 'cancelled',
+                      cancelled_at = ?,
+                      cancelled_by_agent_id = ?,
+                      cancellation_reason = ?,
+                      completed_at = datetime('now')
+                WHERE id = ? AND status = ?
+                  AND status IN ('pending','claimed')""",
+            (
+                _now_sql(),
+                caller["id"],
+                body.reason,
+                directive_id,
+                body.expected_status,
+            ),
+        )
+        if cursor.rowcount != 1:
+            await db.rollback()
+            raise HTTPException(status_code=409, detail="Directiva no cancel·lable")
+        # 8) Audit només de la cancel·lació efectiva (cap en replays).
+        await log_audit(
+            db,
+            caller["id"],
+            "CANCEL",
+            "directive",
+            resource_id=directive_id,
+            payload=json.dumps({"expected_status": body.expected_status}),
+        )
+        await db.commit()
+        cursor = await db.execute("SELECT * FROM directives WHERE id = ?", (directive_id,))
+        updated = await cursor.fetchone()
+    return _row_to_response(updated)
+
+
 @router.get("/inbox", response_model=list[DirectiveResponse])
 async def directive_inbox(
     request: Request,
@@ -579,12 +708,20 @@ async def complete_directive(
     directive_id = validate_identifier(directive_id, "directive_id")
     await _claimed_by_caller(directive_id, caller)
     async with get_db() as db:
-        await db.execute(
+        cursor = await db.execute(
             """UPDATE directives SET status = 'completed', completed_at = datetime('now'),
                    result = ?, error = NULL
                WHERE id = ? AND status = 'claimed' AND claimed_by_agent_id = ?""",
             (json.dumps(body.result), directive_id, caller["id"]),
         )
+        # D3-C race hardening: the pre-check above is not sufficient in
+        # a race (a concurrent cancel/claim could have moved the row
+        # between the fetch and this UPDATE). rowcount != 1 means THIS
+        # request did NOT produce the authoritative state -> rollback,
+        # NO audit, 409. Never a false 200.
+        if cursor.rowcount != 1:
+            await db.rollback()
+            raise HTTPException(status_code=409, detail="La directiva ja no està en estat reclamat")
         await log_audit(db, caller["id"], "COMPLETE", "directive", resource_id=directive_id)
         await db.commit()
         cursor = await db.execute("SELECT * FROM directives WHERE id = ?", (directive_id,))
@@ -602,12 +739,17 @@ async def fail_directive(
     directive_id = validate_identifier(directive_id, "directive_id")
     await _claimed_by_caller(directive_id, caller)
     async with get_db() as db:
-        await db.execute(
+        cursor = await db.execute(
             """UPDATE directives SET status = 'failed', completed_at = datetime('now'),
                    error = ?
                WHERE id = ? AND status = 'claimed' AND claimed_by_agent_id = ?""",
             (body.error, directive_id, caller["id"]),
         )
+        # D3-C race hardening: same rule as complete — exactly ONE
+        # winner. The loser rolls back, writes NO audit and gets 409.
+        if cursor.rowcount != 1:
+            await db.rollback()
+            raise HTTPException(status_code=409, detail="La directiva ja no està en estat reclamat")
         await log_audit(db, caller["id"], "FAIL", "directive", resource_id=directive_id)
         await db.commit()
         cursor = await db.execute("SELECT * FROM directives WHERE id = ?", (directive_id,))
@@ -630,12 +772,18 @@ async def reject_directive(
     if row["status"] not in {"pending", "claimed"}:
         raise HTTPException(status_code=409, detail="Directiva ja finalitzada")
     async with get_db() as db:
-        await db.execute(
+        cursor = await db.execute(
             """UPDATE directives SET status = 'rejected', completed_at = datetime('now'),
                    error = ? WHERE id = ? AND target_agent_id = ?
                    AND status IN ('pending','claimed')""",
             (body.reason, directive_id, caller["id"]),
         )
+        # D3-C race hardening: the conditional UPDATE is authoritative;
+        # rowcount != 1 (e.g. a concurrent CANCEL already won) means no
+        # transition happened -> rollback + 409, with no audit row.
+        if cursor.rowcount != 1:
+            await db.rollback()
+            raise HTTPException(status_code=409, detail="Directiva ja finalitzada")
         await log_audit(db, caller["id"], "REJECT", "directive", resource_id=directive_id)
         await db.commit()
         cursor = await db.execute("SELECT * FROM directives WHERE id = ?", (directive_id,))
