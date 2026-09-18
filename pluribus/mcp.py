@@ -119,18 +119,18 @@ TOOLS = [
         },
     },
     {
-        "name": "knowledge_traverse",
-        "description": "Navega el knowledge graph des d'una entitat: troba nodes i arestes relacionats amb BFS pur (sense embeddings, nomes SQL). Ideal per consultes relacionals rapides com 'que coneix X?' o 'qui treballa amb Y?'.",
-        "input_schema": {
-            "type": "object",
-            "properties": {
-                "entity": {"type": "string", "description": "ID o nom de l'entitat inicial (ex: 'Alice', 'uuid-xxx')"},
-                "hops": {"type": "integer", "default": 2, "description": "Profunditat BFS (1-3)"},
-                "direction": {"type": "string", "enum": ["out", "in", "both"], "default": "both", "description": "Direccio: out (subject->object), in (object->subject), both"}
+            "name": "knowledge_traverse",
+            "description": "Navega el knowledge graph des d'una entitat: troba nodes i arestes relacionats amb BFS pur (sense embeddings, nomes SQL). Ideal per consultes relacionals rapides com 'que coneix X?' o 'qui treballa amb Y?'.",
+            "input_schema": {
+                "type": "object",
+                "properties": {
+                    "entity": {"type": "string", "minLength": 1, "description": "ID o nom de l'entitat inicial (ex: 'Alice', 'uuid-xxx')"},
+                    "hops": {"type": "integer", "minimum": 1, "maximum": 3, "default": 2, "description": "Profunditat BFS (1-3)"},
+                    "direction": {"type": "string", "enum": ["out", "in", "both"], "default": "both", "description": "Direcció: out (subject->object), in (object->subject), both"}
+                },
+                "required": ["entity"]
             },
-            "required": ["entity"]
         },
-    },
 ]
 
 
@@ -526,19 +526,19 @@ async def _tool_ls(args: dict[str, Any], id_: Any) -> JSONResponse:
         }, id_)
     except Exception as e:
         return _error(-32603, f"Error listing facts: {str(e)}", id_)
-async def _tool_knowledge_traverse(args, id_):
+async def _tool_knowledge_traverse(args: dict[str, Any], id_: Any) -> JSONResponse:
     """Graph traversal BFS pur (sense embeddings) via /v1/knowledge/traverse."""
     entity = args.get("entity", "")
-    if not entity:
-        return _error(-32602, "entity is required", id_)
+    if not isinstance(entity, str) or not entity:
+        return _error(-32602, "entity must be a non-empty string", id_)
 
     hops = args.get("hops", 2)
-    if not isinstance(hops, int) or hops < 1 or hops > 3:
-        hops = 2
+    if isinstance(hops, bool) or not isinstance(hops, int) or hops < 1 or hops > 3:
+        return _error(-32602, "hops must be an integer between 1 and 3", id_)
 
     direction = args.get("direction", "both")
     if direction not in ("out", "in", "both"):
-        direction = "both"
+        return _error(-32602, "direction must be one of: out, in, both", id_)
 
     try:
         async with get_db() as db:
