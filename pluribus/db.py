@@ -329,11 +329,25 @@ async def _migrate_db() -> None:
                 aliases TEXT DEFAULT '[]',
                 description TEXT DEFAULT '',
                 metadata TEXT DEFAULT '{}',
+                scope TEXT NOT NULL DEFAULT 'shared',
                 created_at TEXT DEFAULT (datetime('now')),
                 updated_at TEXT DEFAULT (datetime('now')),
                 deleted_at TEXT
             )
         """)
+        cursor = await db.execute("PRAGMA table_info(entities)")
+        entity_cols = {row["name"] for row in await cursor.fetchall()}
+        if "type" not in entity_cols:
+            await db.execute("ALTER TABLE entities ADD COLUMN type TEXT DEFAULT ''")
+        if "aliases" not in entity_cols:
+            await db.execute("ALTER TABLE entities ADD COLUMN aliases TEXT DEFAULT '[]'")
+        if "description" not in entity_cols:
+            await db.execute("ALTER TABLE entities ADD COLUMN description TEXT DEFAULT ''")
+        if "metadata" not in entity_cols:
+            await db.execute("ALTER TABLE entities ADD COLUMN metadata TEXT DEFAULT '{}'")
+        if "deleted_at" not in entity_cols:
+            await db.execute("ALTER TABLE entities ADD COLUMN deleted_at TEXT")
+
         await db.execute("CREATE INDEX IF NOT EXISTS idx_entities_name ON entities(name)")
         await db.execute("CREATE INDEX IF NOT EXISTS idx_entities_type ON entities(type)")
 
@@ -349,17 +363,68 @@ async def _migrate_db() -> None:
                 created_at TEXT DEFAULT (datetime('now')),
                 updated_at TEXT DEFAULT (datetime('now')),
                 expires_at TEXT,
-                deleted_at TEXT
+                deleted_at TEXT,
+                scope TEXT NOT NULL DEFAULT 'shared'
             )
         """)
+        cursor = await db.execute("PRAGMA table_info(triples)")
+        triple_cols = {row["name"] for row in await cursor.fetchall()}
+        if "confidence" not in triple_cols:
+            await db.execute("ALTER TABLE triples ADD COLUMN confidence REAL DEFAULT 1.0")
+        if "source_agent_id" not in triple_cols:
+            await db.execute("ALTER TABLE triples ADD COLUMN source_agent_id TEXT")
+        if "metadata" not in triple_cols:
+            await db.execute("ALTER TABLE triples ADD COLUMN metadata TEXT DEFAULT '{}'")
+        if "expires_at" not in triple_cols:
+            await db.execute("ALTER TABLE triples ADD COLUMN expires_at TEXT")
+        if "deleted_at" not in triple_cols:
+            await db.execute("ALTER TABLE triples ADD COLUMN deleted_at TEXT")
+
         await db.execute("CREATE INDEX IF NOT EXISTS idx_triples_subject ON triples(subject_id)")
         await db.execute("CREATE INDEX IF NOT EXISTS idx_triples_object ON triples(object_id)")
         await db.execute("CREATE INDEX IF NOT EXISTS idx_triples_predicate ON triples(predicate)")
         await db.execute("CREATE INDEX IF NOT EXISTS idx_triples_deleted ON triples(deleted_at)")
 
         await _migrate_documents(db)
+        await _migrate_entities_and_triples_scope(db)
 
         await db.commit()
+
+
+async def _migrate_entities_and_triples_scope(db) -> None:
+    """Idempotent migration: add scope column to legacy entities/triples."""
+    cursor = await db.execute("PRAGMA table_info(entities)")
+    entity_cols = {row["name"] for row in await cursor.fetchall()}
+    if "type" not in entity_cols:
+        await db.execute(
+            "ALTER TABLE entities ADD COLUMN type TEXT DEFAULT ''"
+        )
+    if "scope" not in entity_cols:
+        await db.execute(
+            "ALTER TABLE entities ADD COLUMN scope TEXT NOT NULL DEFAULT 'shared'"
+        )
+
+    cursor = await db.execute("PRAGMA table_info(triples)")
+    triple_cols = {row["name"] for row in await cursor.fetchall()}
+    if "confidence" not in triple_cols:
+        await db.execute(
+            "ALTER TABLE triples ADD COLUMN confidence REAL DEFAULT 1.0"
+        )
+    if "source_agent_id" not in triple_cols:
+        await db.execute(
+            "ALTER TABLE triples ADD COLUMN source_agent_id TEXT"
+        )
+    if "metadata" not in triple_cols:
+        await db.execute(
+            "ALTER TABLE triples ADD COLUMN metadata TEXT DEFAULT '{}'"
+        )
+    if "scope" not in triple_cols:
+        await db.execute(
+            "ALTER TABLE triples ADD COLUMN scope TEXT NOT NULL DEFAULT 'shared'"
+        )
+
+    await db.execute("CREATE INDEX IF NOT EXISTS idx_entities_scope ON entities(scope)")
+    await db.execute("CREATE INDEX IF NOT EXISTS idx_triples_scope ON triples(scope)")
 
 
 async def _migrate_documents(db) -> None:
