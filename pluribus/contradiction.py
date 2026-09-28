@@ -12,7 +12,7 @@ import logging
 import re
 from typing import Optional
 
-import numpy as np
+from pluribus._numpy_fallback import np
 import requests
 
 from pluribus.config import settings

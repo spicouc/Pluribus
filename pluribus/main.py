@@ -23,9 +23,16 @@ from pluribus.authorization import (
 from pluribus.compact import compact_database
 from pluribus.config import settings
 from pluribus.dashboard import router as dashboard_router
+from pluribus.dashboard_control import router as dashboard_control_router
+from pluribus.dashboard_observability import router as dashboard_observability_router
+from pluribus.dashboard_session import (
+    auth_router as dashboard_session_router,
+    login_router as dashboard_login_router,
+)
 from pluribus.db import get_db, init_db
 from pluribus.directives import router as directives_router
 from pluribus.directives_schema import init_directives_db
+from pluribus.documents import router as documents_router
 from pluribus.embedding import embedding_service
 from pluribus.expiry_worker import expiry_worker_loop
 from pluribus.identity_provider import router as identity_provider_router
@@ -158,6 +165,23 @@ app.include_router(xerrameca_console_entry_router)
 app.include_router(admin_config_view_router, dependencies=[Depends(dashboard_authorize)])
 app.include_router(admin_config_router, dependencies=[Depends(dashboard_authorize)])
 app.include_router(dashboard_router, dependencies=[Depends(dashboard_authorize)])
+# D1 unified dashboard observability — narrow read-only endpoints. Each
+# endpoint carries its own guard (dashboard_session_authorize) which
+# accepts either an HttpOnly session cookie (browser) or an X-API-Key
+# header (server-to-server, tests, CI). The router itself does NOT
+# inherit any global dependency because the previous memory_dependencies
+# guard was path-routed for /v1/memory/* and did NOT cover
+# /v1/dashboard/*.
+app.include_router(dashboard_observability_router)
+# D3-B dashboard control — endpoints amb guard propi
+# (dashboard_control_authorize per a mutations / dashboard_session_authorize
+# per a lectura). El router NO hereta cap dependència global.
+app.include_router(dashboard_control_router)
+app.include_router(dashboard_session_router)
+# Public login page + form submission at /dashboard/login. No
+# API key required on this path — the user pastes a one-time code
+# minted server-to-server via POST /v1/dashboard/login-code.
+app.include_router(dashboard_login_router)
 # Intercept MCP semantic/recall/sync/directive calls while delegating other tools.
 app.include_router(mcp_async_router, dependencies=[Depends(mcp_authorize)])
 app.include_router(mcp_router, dependencies=[Depends(mcp_authorize)])
@@ -167,6 +191,10 @@ app.include_router(xerrameca_router)
 app.include_router(xerrameca_runner_router)
 app.include_router(xerrameca_monitor_router)
 app.include_router(webhooks_router)
+# Document library CRUD + versioning (L1). Documents are scope-safe and do
+# their own defense-in-depth authorization (read/write/delete + scope), like
+# recall.py, so they are safe for REST and non-HTTP callers.
+app.include_router(documents_router)
 # Current graph model is global, so fail closed to admin until it becomes scope-aware.
 app.include_router(knowledge_router, dependencies=[Depends(knowledge_authorize)])
 
