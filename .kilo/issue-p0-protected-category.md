@@ -98,6 +98,47 @@ Amb `patch("pluribus.authorization._fact_scope_category", new=AsyncMock(return_v
 4. `test_admin_can_recategorize_a_persistent_fact` → permès
 5. `test_non_admin_may_tag_a_standard_fact` → permès; fixa que la protecció és contra l'esborrament, no contra l'etiquetatge
 
+### Test del handler — demanat per la revisió del supervisor
+
+Cal **complementar** els tests anteriors amb un test del handler `update_memory`, perquè els dos punts de control no es desincronitzin. El supervisor ho va demanar explícitament i és el test que fa que la defensa en profunditat sigui real i no nominal.
+
+Fes-lo amb **BD real**, no amb `get_db` mocat. El patró ja existeix al suite: `TemporaryPluribusDb` a `tests/test_third_wave_hardening.py:24-53` (patch de `settings.DB_PATH` i `settings.EMBED_DIM`, `init_db()`, helper `_insert_fact`); `tests/test_chunk_embeddings.py:14-20` fa el mateix.
+
+El motiu: el que es vols provar és precisament que el handler **carrega `category` al SELECT**. Amb BD real, el test falla si algú oblida el `category` a la projecció de `memory.py:692`; amb BD mocat, es testeja el que vols que passi i no la causa. A més `update_memory` ja necessita `settings.EMBED_DIM` per al BLOB placeholder, de manera que el patch és el mateix.
+
+Amb el fet inserit com a `system`:
+
+```python
+request = make_request("/v1/memory/fact-1", "PUT")
+request.state.agent = standard_agent()          # read/write/delete, admin=False
+body = UpdateRequest(content="x", category="events")
+with self.assertRaises(HTTPException) as ctx:
+    await update_memory(request, "fact-1", body, BackgroundTasks())
+self.assertEqual(ctx.exception.status_code, 403)
+```
+
+### Buit detectat al criteri de tancament
+
+El criteri de tancament del supervisor inclou `DELETE system/config/entities no-admin = 403`. Aquesta garantia **ja es compleix avui** (`memory.py:790-796`, `authorization.py:202-203`) però **no té cap test**: no apareix `delete_memory`, `_PROTECTED` ni cap cas de DELETE sobre categoria protegida a tot `tests/`. Ningú detectaria si es trenca.
+
+Com que el helper nou serà compartit, hi ha d'afegir els casos positius del mateix protocol:
+
+- `delete_memory` no-admin sobre fet `system` → 403
+- `delete_memory` admin sobre fet `system` → 204
+
+### Criteri de tancament validat pel supervisor
+
+- non-admin `system -> events` = 403
+- non-admin `system -> system` = permès
+- non-admin edita contingut de `system` = permès
+- admin `system -> events` = permès
+- non-admin `events -> system` = permès
+- DELETE `system/config/entities` no-admin = 403
+- `compileall` = PASS
+- suite completa = PASS
+
+L'últim i el penúltim **no estan verificats**: l'entorn de revisió no tenia `pip` ni xarxa.
+
 ## Documentació
 
 `README.md:240` diu `Categories persistents system, config i entities: eliminació admin-only.` — imprecís, cal afegir-hi que no es poden des-protegir i que l'escriptura de categories protegides sí que es permet.
