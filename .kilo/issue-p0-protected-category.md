@@ -98,6 +98,10 @@ Amb `patch("pluribus.authorization._fact_scope_category", new=AsyncMock(return_v
 4. `test_admin_can_recategorize_a_persistent_fact` → permès
 5. `test_non_admin_may_tag_a_standard_fact` → permès; fixa que la protecció és contra l'esborrament, no contra l'etiquetatge
 
+> **Correcció (revisió posterior del codi).** Inicialment vaig indicar `standard_agent()`, però **aquest helper només existeix a `tests/test_input_validation.py:53`**, no a `test_authorization.py`. Allà el dict d'agent es construeix inline a cada test (`:61-64`, `:78-81`, `:88-91`).
+>
+> **Fes el dict inline**, seguint l'estil del propi fitxer; evita acoblar dos fitxers de test entre ells.
+
 ### Test del handler — demanat per la revisió del supervisor
 
 Cal **complementar** els tests anteriors amb un test del handler `update_memory`, perquè els dos punts de control no es desincronitzin. El supervisor ho va demanar explícitament i és el test que fa que la defensa en profunditat sigui real i no nominal.
@@ -106,16 +110,33 @@ Fes-lo amb **BD real**, no amb `get_db` mocat. El patró ja existeix al suite: `
 
 El motiu: el que es vols provar és precisament que el handler **carrega `category` al SELECT**. Amb BD real, el test falla si algú oblida el `category` a la projecció de `memory.py:692`; amb BD mocat, es testeja el que vols que passi i no la causa. A més `update_memory` ja necessita `settings.EMBED_DIM` per al BLOB placeholder, de manera que el patch és el mateix.
 
-Amb el fet inserit com a `system`:
+Amb el fet inserit com a `system`. Detall important: el helper `_insert_fact` de `test_third_wave_hardening.py:39-45` fixa `'events'` a cegues, així que **la inserció ha de ser explícita**:
+
+```python
+await db.execute(
+    "INSERT INTO facts(id, scope, category, content) VALUES (?, 'shared', 'system', 'x')",
+    ("fact-1",),
+)
+```
+
+Així que el dict d'agent es pot construir inline, com fa la resta de `test_authorization.py`:
 
 ```python
 request = make_request("/v1/memory/fact-1", "PUT")
-request.state.agent = standard_agent()          # read/write/delete, admin=False
+request.state.agent = {
+    "id": "agent-1",
+    "permissions": {"read": True, "write": True, "delete": True, "admin": False},
+    "allowed_scopes": ["shared"],
+}
 body = UpdateRequest(content="x", category="events")
 with self.assertRaises(HTTPException) as ctx:
     await update_memory(request, "fact-1", body, BackgroundTasks())
 self.assertEqual(ctx.exception.status_code, 403)
 ```
+
+El patch d'`EMBED_DIM` a 4 no és opcional: `memory.py:735` construeix el BLOB placeholder amb `b"\x00" * (settings.EMBED_DIM * 4)`.
+
+Per als dos `make_request` duplicats, la diferència d'un header `content-type` és **irrellevant** en tots dos casos dels test: `memory_authorize` llegeix el cos directament, i `update_memory` rep el body ja construït com a `UpdateRequest`, no com a JSON cru.
 
 ### Buit detectat al criteri de tancament
 
