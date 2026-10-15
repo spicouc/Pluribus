@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import unittest
+from unittest.mock import AsyncMock, patch
 
 from fastapi import HTTPException
 from starlette.requests import Request
@@ -108,6 +109,67 @@ class GuardTests(unittest.IsolatedAsyncioTestCase):
             "allowed_scopes": [],
         }
         await knowledge_authorize(request)
+
+
+class PersistentCategoryGuardTests(unittest.IsolatedAsyncioTestCase):
+    """PUT /v1/memory/{id} must not let a non-admin un-protect a fact."""
+
+    def _agent(self, *, admin: bool = False) -> dict:
+        return {
+            "permissions": {"read": True, "write": True, "delete": True, "admin": admin},
+            "allowed_scopes": ["shared"],
+        }
+
+    def _request(self, body: dict) -> Request:
+        request = make_request("/v1/memory/fact-1", "PUT", body=body)
+        return request
+
+    async def test_non_admin_cannot_unprotect_a_persistent_fact(self) -> None:
+        request = self._request({"content": "x", "category": "events"})
+        request.state.agent = self._agent()
+        with patch(
+            "pluribus.authorization._fact_scope_category",
+            new=AsyncMock(return_value=("shared", "system")),
+        ):
+            with self.assertRaises(HTTPException) as ctx:
+                await memory_authorize(request)
+        self.assertEqual(ctx.exception.status_code, 403)
+
+    async def test_non_admin_can_edit_content_of_a_persistent_fact(self) -> None:
+        request = self._request({"content": "x"})
+        request.state.agent = self._agent()
+        with patch(
+            "pluribus.authorization._fact_scope_category",
+            new=AsyncMock(return_value=("shared", "system")),
+        ):
+            await memory_authorize(request)
+
+    async def test_non_admin_may_repeat_the_same_persistent_category(self) -> None:
+        request = self._request({"content": "x", "category": "system"})
+        request.state.agent = self._agent()
+        with patch(
+            "pluribus.authorization._fact_scope_category",
+            new=AsyncMock(return_value=("shared", "system")),
+        ):
+            await memory_authorize(request)
+
+    async def test_admin_can_recategorize_a_persistent_fact(self) -> None:
+        request = self._request({"content": "x", "category": "events"})
+        request.state.agent = self._agent(admin=True)
+        with patch(
+            "pluribus.authorization._fact_scope_category",
+            new=AsyncMock(return_value=("shared", "system")),
+        ):
+            await memory_authorize(request)
+
+    async def test_non_admin_may_tag_a_standard_fact(self) -> None:
+        request = self._request({"content": "x", "category": "system"})
+        request.state.agent = self._agent()
+        with patch(
+            "pluribus.authorization._fact_scope_category",
+            new=AsyncMock(return_value=("shared", "events")),
+        ):
+            await memory_authorize(request)
 
 
 if __name__ == "__main__":

@@ -29,6 +29,29 @@ def _request_agent(request: Request) -> dict[str, Any]:
     return agent
 
 
+def _assert_category_change_allowed(
+    agent: dict[str, Any],
+    current_category: str,
+    requested_category: str | None,
+) -> None:
+    """Deny non-admins the ability to *un-protect* a persistent fact.
+
+    The protection is against deletion, not against writing: recategorising a
+    normal fact or re-sending the same protected category is allowed. Only a
+    change that moves a fact out of a protected category is admin-only.
+    """
+    if requested_category is None or requested_category == current_category:
+        return
+    if current_category not in _PROTECTED_CATEGORIES:
+        return
+    if agent.get("permissions", {}).get("admin", False):
+        return
+    raise HTTPException(
+        status_code=403,
+        detail="Canviar la categoria d'un fet persistent requereix permís admin",
+    )
+
+
 def _require(agent: dict[str, Any], permission: str, scope: str | None = None) -> None:
     perms = agent.get("permissions", {}) or {}
     if perms.get("admin", False):
@@ -184,13 +207,14 @@ async def memory_authorize(request: Request) -> None:
         if not fact_id or "/" in fact_id:
             return
         _validated(lambda value: validate_identifier(value, "fact_id"), fact_id)
+        requested_category: str | None = None
         if method == "PUT":
             body = await request.json()
             if not isinstance(body, dict):
                 raise HTTPException(status_code=422, detail="Cos JSON invàlid")
             _validated(validate_content, body.get("content", ""))
             if "category" in body and body.get("category") is not None:
-                _validated(validate_category, body.get("category"))
+                requested_category = _validated(validate_category, body.get("category"))
             if "metadata" in body:
                 _validated(validate_metadata, body.get("metadata"))
 
@@ -198,6 +222,7 @@ async def memory_authorize(request: Request) -> None:
         if fact is None:
             return
         scope, category = fact
+        _assert_category_change_allowed(agent, category, requested_category)
         _require(agent, "write" if method == "PUT" else "delete", scope)
         if method == "DELETE" and category in _PROTECTED_CATEGORIES and not agent.get("permissions", {}).get("admin", False):
             raise HTTPException(status_code=403, detail="Fet de categoria persistent; requereix permís admin")

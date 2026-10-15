@@ -59,6 +59,18 @@ def _require_admin(agent: dict[str, Any]) -> None:
         raise HTTPException(status_code=403, detail="Xerrameca: permís admin requerit")
 
 
+def _require_admin_or_elevated(agent: dict[str, Any], elevated: bool) -> None:
+    """Admin-only gate for services also reachable from the self-service command.
+
+    Elevation is an explicit, typed argument rather than a mutated agent dict,
+    so any future admin check added to these services must opt into it visibly
+    instead of being silently bypassed.
+    """
+    if elevated or _is_admin(agent):
+        return
+    raise HTTPException(status_code=403, detail="Xerrameca: permís admin requerit")
+
+
 def _require_permission(agent: dict[str, Any], permission: str, scope: str) -> None:
     if _is_admin(agent):
         return
@@ -323,9 +335,12 @@ async def _conversation_payload(db: Any, conv: Any) -> dict[str, Any]:
 
 
 async def create_conversation(
-    agent: dict[str, Any], body: ConversationCreateRequest
+    agent: dict[str, Any],
+    body: ConversationCreateRequest,
+    *,
+    elevated: bool = False,
 ) -> dict[str, Any]:
-    _require_admin(agent)
+    _require_admin_or_elevated(agent, elevated)
     scope = _clean_scope(body.scope)
     name = body.name.strip()
     objective = _clean_content(body.objective)
@@ -462,8 +477,13 @@ async def _create_turn(
     return turn_id
 
 
-async def start_conversation(agent: dict[str, Any], conversation_id: str) -> dict[str, Any]:
-    _require_admin(agent)
+async def start_conversation(
+    agent: dict[str, Any],
+    conversation_id: str,
+    *,
+    elevated: bool = False,
+) -> dict[str, Any]:
+    _require_admin_or_elevated(agent, elevated)
     async with get_db() as db:
         await db.execute("BEGIN IMMEDIATE")
         await _require_system_enabled(db)
@@ -1281,9 +1301,12 @@ async def finish_conversation(
 
 
 async def cancel_conversation(
-    agent: dict[str, Any], conversation_id: str
+    agent: dict[str, Any],
+    conversation_id: str,
+    *,
+    elevated: bool = False,
 ) -> dict[str, Any]:
-    _require_admin(agent)
+    _require_admin_or_elevated(agent, elevated)
     async with get_db() as db:
         await db.execute("BEGIN IMMEDIATE")
         conv = await _conversation(db, conversation_id)

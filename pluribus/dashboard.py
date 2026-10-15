@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import json
 import os
-import subprocess
 from datetime import datetime, timedelta
 
 from fastapi import APIRouter, Request
@@ -191,71 +190,6 @@ async def get_config() -> JSONResponse:
     
     return JSONResponse(config)
 
-
-@router.post("/api/config/save")
-async def save_config(request: Request) -> JSONResponse:
-    """Guarda canvis de configuració al .env i reinicia el servei."""
-    body = await request.json()
-    env_path = "/opt/pluribus/.env"
-    restart = body.pop("_restart", False)
-    
-    # Llegir .env actual
-    lines = []
-    try:
-        with open(env_path) as f:
-            lines = f.readlines()
-    except FileNotFoundError:
-        lines = []
-    
-    # Actualitzar només les claus enviades (que comencin per PLURIBUS_)
-    updated_keys = []
-    for key, value in body.items():
-        if key.startswith("PLURIBUS_") and value is not None:
-            found = False
-            for i, line in enumerate(lines):
-                stripped = line.strip()
-                if stripped.startswith(key + "="):
-                    lines[i] = f"{key}={value}\n"
-                    found = True
-                    updated_keys.append(key)
-                    break
-            if not found:
-                lines.append(f"{key}={value}\n")
-                updated_keys.append(key)
-    
-    # Escriure .env
-    with open(env_path, "w") as f:
-        f.writelines(lines)
-    
-    result = {
-        "message": "Configuració guardada",
-        "updated_keys": updated_keys,
-        "restart": restart,
-    }
-    
-    if restart:
-        try:
-            subprocess.Popen(["systemctl", "restart", "pluribus"],
-                             stdout=subprocess.DEVNULL,
-                             stderr=subprocess.DEVNULL)
-            result["message"] = "Configuració guardada. Reiniciant Pluribus..."
-            result["restarting"] = True
-        except Exception as e:
-            result["error"] = f"Error al reiniciar: {e}"
-    
-    return JSONResponse(result)
-
-
-@router.get("/api/config/restart")
-async def restart_pluribus() -> JSONResponse:
-    """Reinicia el servei Pluribus."""
-    try:
-        subprocess.Popen(["systemctl", "restart", "pluribus"],
-                         stdout=subprocess.DEVNULL,
-                         stderr=subprocess.DEVNULL)
-        return JSONResponse({"message": "Reiniciant Pluribus..."})
-    except Exception as e:
-        return JSONResponse({"error": str(e)}, status_code=500)
 
 @router.get("/api/ollama/models")
 async def get_ollama_models() -> JSONResponse:
@@ -603,7 +537,7 @@ async function restartPluribus() {
   status.textContent = 'Reiniciant...';
 
   try {
-    const res = await fetch('/api/config/restart');
+    const res = await fetch('/api/config/restart', { method: 'POST' });
     const data = await res.json();
     status.textContent = data.message || 'Reiniciant Pluribus...';
     status.style.color = '#86efac';
