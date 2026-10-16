@@ -351,3 +351,98 @@ class TraverseResponse(BaseModel):
     hops: int = 0
     total_nodes: int = 0
     total_edges: int = 0
+
+
+# ── Knowledge scope phase 2: Entity/Triple write models ────────────────
+
+class EntityCreateRequest(BaseModel):
+    name: str = Field(..., min_length=1, max_length=256)
+    type: str = Field(default="", max_length=64)
+    aliases: list[str] = Field(default_factory=list)
+    description: str = Field(default="")
+    metadata: dict[str, Any] = Field(default_factory=dict)
+    scope: str
+
+    _name = field_validator("name")(validate_identifier)
+    _type = field_validator("type")(validate_identifier)
+    _scope = field_validator("scope")(validate_scope)
+    _metadata = field_validator("metadata")(validate_metadata)
+
+
+class EntityCreateResponse(BaseModel):
+    id: str
+    name: str
+    type: str
+    aliases: list[str]
+    description: str
+    metadata: dict[str, Any]
+    scope: str
+    created_at: str
+    updated_at: str
+
+
+class EntityUpdateRequest(BaseModel):
+    type: Optional[str] = Field(None, max_length=64)
+    aliases: Optional[list[str]] = None
+    description: Optional[str] = None
+    metadata: Optional[dict[str, Any]] = None
+
+    _type = field_validator("type")(validate_identifier)
+    _metadata = field_validator("metadata")(validate_metadata)
+
+
+class EntityUpdateResponse(BaseModel):
+    id: str
+    name: str
+    type: str
+    aliases: list[str]
+    description: str
+    metadata: dict[str, Any]
+    scope: str
+    created_at: str
+    updated_at: str
+
+
+class TripleCreateRequest(BaseModel):
+    subject_id: str
+    predicate: str = Field(..., min_length=1, max_length=64, pattern=r"^[A-Za-z0-9._:-]+$")
+    object_id: str
+    confidence: float = Field(default=1.0, ge=0.0, le=1.0)
+    metadata: dict[str, Any] = Field(default_factory=dict)
+    scope: str
+
+    _subject_id = field_validator("subject_id")(validate_identifier)
+    _object_id = field_validator("object_id")(validate_identifier)
+    _scope = field_validator("scope")(validate_scope)
+    _metadata = field_validator("metadata")(validate_metadata)
+
+
+class TripleCreateResponse(BaseModel):
+    id: str
+    subject_id: str
+    predicate: str
+    object_id: str
+    confidence: float
+    metadata: dict[str, Any]
+    scope: str
+    created_at: str
+    updated_at: str
+
+
+class TripleUpdateRequest(BaseModel):
+    confidence: Optional[float] = Field(None, ge=0.0, le=1.0)
+    metadata: Optional[dict[str, Any]] = None
+
+    _metadata = field_validator("metadata")(validate_metadata)
+
+
+class TripleUpdateResponse(BaseModel):
+    id: str
+    subject_id: str
+    predicate: str
+    object_id: str
+    confidence: float
+    metadata: dict[str, Any]
+    scope: str
+    created_at: str
+    updated_at: str

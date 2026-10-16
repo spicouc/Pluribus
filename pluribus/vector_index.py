@@ -10,8 +10,7 @@ import struct
 import time
 from typing import Any, Optional
 
-import numpy as np
-from turbovec import IdMapIndex
+from pluribus._numpy_fallback import np
 
 from pluribus.config import settings
 
@@ -103,6 +102,7 @@ class VectorIndex:
             self._building = False
 
     def _set_empty_index(self, generation: int, db_path: str) -> None:
+        from turbovec import IdMapIndex
         self._index = IdMapIndex(dim=settings.EMBED_DIM, bit_width=4)
         self._meta_by_ext = {}
         self._ext_by_chunk = {}
@@ -169,6 +169,7 @@ class VectorIndex:
             ext_ids_arr = np.asarray(
                 [_chunk_id_to_u64(cid) for cid in chunk_ids], dtype=np.uint64
             )
+            from turbovec import IdMapIndex
             index = IdMapIndex(dim=settings.EMBED_DIM, bit_width=4)
             index.add_with_ids(vectors_arr, ext_ids_arr)
             index.prepare()
