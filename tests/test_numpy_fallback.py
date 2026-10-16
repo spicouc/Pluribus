@@ -19,15 +19,30 @@ class NumpyFallbackTests(unittest.IsolatedAsyncioTestCase):
 
     def setUp(self) -> None:
         self._original_import = builtins.__import__
-        for mod in list(sys.modules):
-            if mod.startswith("pluribus"):
-                del sys.modules[mod]
+        # Snapshot the live Pluribus modules so they can be restored verbatim
+        # afterwards. Deleting them without restoring a snapshot would drop the
+        # shared ``pluribus.config.settings`` instance; later tests that import
+        # a Pluribus module lazily would then re-create it with production
+        # defaults (``/opt/pluribus/data/...``) and bypass their patched DB.
+        self._saved_modules = {
+            name: module
+            for name, module in sys.modules.items()
+            if name == "pluribus" or name.startswith("pluribus.")
+        }
+        for name in list(self._saved_modules):
+            del sys.modules[name]
 
     def tearDown(self) -> None:
         builtins.__import__ = self._original_import
-        for mod in list(sys.modules):
-            if mod.startswith("pluribus"):
-                del sys.modules[mod]
+        # Drop anything the test imported fresh, then restore the exact
+        # original module objects (and therefore the original settings).
+        for name in [
+            name
+            for name in sys.modules
+            if name == "pluribus" or name.startswith("pluribus.")
+        ]:
+            del sys.modules[name]
+        sys.modules.update(self._saved_modules)
 
     def _mock_numpy_import(self, error: Exception) -> None:
         original = builtins.__import__
