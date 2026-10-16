@@ -9,7 +9,7 @@ import asyncio
 import json
 from typing import Any, Optional
 
-import numpy as np
+from pluribus._numpy_fallback import np
 from fastapi import APIRouter, BackgroundTasks, Request
 from pydantic import BaseModel, Field
 

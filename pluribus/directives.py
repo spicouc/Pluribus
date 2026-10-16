@@ -8,8 +8,9 @@ Pluribus coordinates directives but never executes shell/code itself.
 from __future__ import annotations
 
 import json
+import sqlite3
 from datetime import datetime, timedelta, timezone
-from typing import Any
+from typing import Any, Literal
 
 from fastapi import APIRouter, HTTPException, Query, Request
 from pydantic import BaseModel, Field, field_validator
@@ -90,6 +91,21 @@ class DirectiveRejectRequest(BaseModel):
     reason: str = Field(default="rejected", min_length=1, max_length=4096)
 
 
+class DashboardCancelRequest(BaseModel):
+    """Body of a dashboard CANCEL (D3-C canonical safe cancel).
+
+    ``expected_status`` is the optimistic-concurrency guard the caller
+    observed in the UI: if the stored status moved on (claim, complete,
+    fail, reject, expiry) the mutation is a 409, never a silent win.
+    ``reason`` doubles as the idempotency signature: replaying the SAME
+    reason by the SAME actor is a 200 replay; a different reason (or a
+    different actor) is a 409 conflict.
+    """
+
+    reason: str = Field(min_length=1, max_length=4096)
+    expected_status: Literal["pending", "claimed"]
+
+
 class DirectiveResponse(BaseModel):
     id: str
     issuer_agent_id: str
@@ -108,6 +124,9 @@ class DirectiveResponse(BaseModel):
     completed_at: str | None = None
     result: dict[str, Any] | None = None
     error: str | None = None
+    cancelled_at: str | None = None
+    cancelled_by_agent_id: str | None = None
+    cancellation_reason: str | None = None
 
 
 class DirectiveGrantResponse(BaseModel):
@@ -172,6 +191,58 @@ def _future_sql(seconds: int) -> str:
     return (datetime.now(timezone.utc) + timedelta(seconds=seconds)).strftime("%Y-%m-%d %H:%M:%S")
 
 
+def _ttl_times(seconds: int) -> tuple[str, str]:
+    """Return (created_at, expires_at) from the SAME server clock.
+
+    Both are stored as ``%Y-%m-%d %H:%M:%S`` UTC text so that
+    ``expires_at - created_at == ttl_seconds`` EXACTLY for new rows.
+    Exactness is what makes the effective TTL a deterministic part of
+    the idempotency signature (D3-B corrective).
+    """
+    now = datetime.now(timezone.utc)
+    created_at = now.strftime("%Y-%m-%d %H:%M:%S")
+    expires_at = (now + timedelta(seconds=seconds)).strftime("%Y-%m-%d %H:%M:%S")
+    return created_at, expires_at
+
+
+def _row_ttl_seconds(row: Any) -> int | None:
+    """Deterministic effective TTL (seconds) of a stored directive row.
+
+    Computed as ``expires_at - created_at`` on the stored UTC text
+    timestamps. Rows written by the current code are exact; unparseable
+    legacy timestamps yield None (never equal to any requested TTL).
+    """
+    try:
+        created = datetime.strptime(str(row["created_at"]), "%Y-%m-%d %H:%M:%S")
+        expires = datetime.strptime(str(row["expires_at"]), "%Y-%m-%d %H:%M:%S")
+    except (TypeError, ValueError):
+        return None
+    return int(round((expires - created).total_seconds()))
+
+
+def _same_directive_semantics(
+    row: Any,
+    body: DirectiveCreateRequest,
+    arguments_json: str,
+) -> bool:
+    """Semantic equality between a stored row and a request payload.
+
+    Compares target/scope/action/required_capability/arguments AND the
+    effective TTL (expires_at - created_at), so a retry that asks for a
+    different ttl_seconds is a CONFLICT, never a silent replay (D3-B).
+    """
+    ttl_original = _row_ttl_seconds(row)
+    return (
+        ttl_original is not None
+        and ttl_original == body.ttl_seconds
+        and row["target_agent_id"] == body.target_agent_id
+        and row["scope"] == body.scope
+        and row["action"] == body.action
+        and row["required_capability"] == body.required_capability
+        and row["arguments"] == arguments_json
+    )
+
+
 def _row_to_response(row: Any) -> DirectiveResponse:
     data = dict(row)
     raw_result = data.get("result")
@@ -193,6 +264,9 @@ def _row_to_response(row: Any) -> DirectiveResponse:
         completed_at=data.get("completed_at"),
         result=_json_dict(raw_result) if raw_result is not None else None,
         error=data.get("error"),
+        cancelled_at=data.get("cancelled_at"),
+        cancelled_by_agent_id=data.get("cancelled_by_agent_id"),
+        cancellation_reason=data.get("cancellation_reason"),
     )
 
 
@@ -325,9 +399,18 @@ async def list_directive_grants(request: Request, agent_id: str) -> list[Directi
     ]
 
 
-@router.post("", status_code=201, response_model=DirectiveResponse)
-async def create_directive(request: Request, body: DirectiveCreateRequest) -> DirectiveResponse:
-    caller = _caller(request)
+async def create_directive_for_actor(
+    caller: dict[str, Any],
+    body: DirectiveCreateRequest,
+) -> DirectiveResponse:
+    """Servei compartit i autoritatiu de creació de directives.
+
+    Usat tant per POST /v1/directives (agent→agent) com per l'endpoint
+    D3-B de control del dashboard (POST /v1/dashboard/control/assign),
+    de manera que TOTA la lògica de negoci viu en un sol lloc:
+    checks de scope de l'emissor, existència/activitat del destinatari,
+    grants de delegació i d'execució, replay d'idempotència i audit.
+    """
     _assert_scope(caller, body.scope)
     target = await _agent_record(body.target_agent_id)
     if not _json_dict(target.get("permissions")).get("admin", False):
@@ -350,64 +433,202 @@ async def create_directive(request: Request, body: DirectiveCreateRequest) -> Di
         )
 
     arguments_json = json.dumps(body.arguments, sort_keys=True, separators=(",", ":"))
+
     if body.idempotency_key:
         async with get_db() as db:
             cursor = await db.execute(
                 """SELECT * FROM directives
-                   WHERE issuer_agent_id = ? AND idempotency_key = ?""",
+                  WHERE issuer_agent_id = ? AND idempotency_key = ?""",
                 (caller["id"], body.idempotency_key),
             )
             existing = await cursor.fetchone()
         if existing:
-            same = (
-                existing["target_agent_id"] == body.target_agent_id
-                and existing["scope"] == body.scope
-                and existing["action"] == body.action
-                and existing["required_capability"] == body.required_capability
-                and existing["arguments"] == arguments_json
-            )
-            if not same:
+            if not _same_directive_semantics(existing, body, arguments_json):
                 raise HTTPException(status_code=409, detail="idempotency_key reutilitzada amb una directiva diferent")
             return _row_to_response(existing)
 
-    expires_at = _future_sql(body.ttl_seconds)
+    created_at, expires_at = _ttl_times(body.ttl_seconds)
+    try:
+        async with get_db() as db:
+            cursor = await db.execute(
+                """INSERT INTO directives(
+                      issuer_agent_id, target_agent_id, scope, action, arguments,
+                      required_capability, idempotency_key, created_at, expires_at
+                  ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                (
+                    caller["id"],
+                    body.target_agent_id,
+                    body.scope,
+                    body.action,
+                    arguments_json,
+                    body.required_capability,
+                    body.idempotency_key,
+                    created_at,
+                    expires_at,
+                ),
+            )
+            rowid = cursor.lastrowid
+            cursor = await db.execute("SELECT * FROM directives WHERE rowid = ?", (rowid,))
+            row = await cursor.fetchone()
+            await log_audit(
+                db,
+                caller["id"],
+                "CREATE",
+                "directive",
+                resource_id=row["id"],
+                payload=json.dumps(
+                    {
+                        "target_agent_id": body.target_agent_id,
+                        "scope": body.scope,
+                        "action": body.action,
+                        "required_capability": body.required_capability,
+                    }
+                ),
+            )
+            await db.commit()
+    except sqlite3.IntegrityError:
+        # A real concurrent race on idx_directives_idempotency
+        # (issuer_agent_id, idempotency_key): the fast-path SELECT above
+        # was empty for BOTH requests, so both tried to INSERT and the
+        # loser hit the partial UNIQUE index. The failed INSERT aborted
+        # this connection's transaction and the context manager closed
+        # the connection, so the re-check below runs on a FRESH, clean
+        # connection that sees the winner's committed row.
+        if not body.idempotency_key:
+            # Partial UNIQUE index never matches NULL keys: this error
+            # cannot be an idempotency race — surface the real failure.
+            raise
+        async with get_db() as db:
+            cursor = await db.execute(
+                """SELECT * FROM directives
+                  WHERE issuer_agent_id = ? AND idempotency_key = ?""",
+                (caller["id"], body.idempotency_key),
+            )
+            existing = await cursor.fetchone()
+        if existing is None:
+            # No row exists for this issuer+key → the IntegrityError did
+            # NOT come from the idempotency race. Re-raise the original
+            # error instead of hiding a genuine failure.
+            raise
+        if _same_directive_semantics(existing, body, arguments_json):
+            # Atomic replay: the concurrent identical request won.
+            return _row_to_response(existing)
+        raise HTTPException(status_code=409, detail="idempotency_key reutilitzada amb una directiva diferent")
+    return _row_to_response(row)
+
+
+@router.post("", status_code=201, response_model=DirectiveResponse)
+async def create_directive(request: Request, body: DirectiveCreateRequest) -> DirectiveResponse:
+    """Endpoint REST original — comportament idèntic (backward-compatible)."""
+    return await create_directive_for_actor(_caller(request), body)
+
+
+async def cancel_directive_for_actor(
+    caller: dict[str, Any],
+    directive_id: str,
+    body: DashboardCancelRequest,
+) -> DirectiveResponse:
+    """Servei autoritatiu i atòmic de cancel·lació (D3-C CANONICAL SAFE CANCEL).
+
+    Compartit per l'endpoint del dashboard (POST
+    /v1/dashboard/control/{directive_id}/cancel) i, si calgués, per
+    qualsevol altre camí: TOTA la lògica viu aquí, mai al router.
+
+    Cicle de vida: ``pending -> cancelled`` i ``claimed -> cancelled``.
+    CANCEL ≠ REJECT (no mata cap procés del sistema operatiu: és la
+    retirada de la directiva) i els terminals són immutables.
+
+    Ordre EXACTE de comprovacions:
+      1) validació de l'identificador,
+      2) existència (404),
+      3) autorització issuer-or-admin (403),
+      4) revalidació de l'scope ACTUAL de la fila (403),
+      5) replay idempotent (200 sense audit nou) o replay conflictiu (409),
+      6) expected_status obsolet / estat terminal immutable (409),
+      7) transició atòmica amb comprovació de ``rowcount`` (409 si no guanya),
+      8) audit NOMÉS si la transició s'ha convertit en estat real (rowcount==1),
+      9) retorn de la fila refrescada.
+
+    Prohibit en aquest camí: cap escriptura a Memory (``facts``), cap
+    escriptura a telemetria d'agents (work_state / current_task_id /
+    current_project / current_blocker) ni cap escriptura a
+    ``directive_grants``.
+    """
+    directive_id = validate_identifier(directive_id, "directive_id")
+    row = await _fetch_directive(directive_id)
+
+    # 3) Només l'emissor de la directiva (o un admin) pot cancel·lar-la.
+    if caller["id"] != row["issuer_agent_id"] and not _is_admin(caller):
+        raise HTTPException(
+            status_code=403,
+            detail="Només l'emissor de la directiva o un admin poden cancel·lar-la",
+        )
+
+    # 4) L'scope s'ha de revalidar contra l'estat ACTUAL de la fila:
+    #    un canvi de scopes de l'agent des de la creació no s'ignora.
+    _assert_scope(caller, row["scope"])
+
+    # 5) Replay idempotent. Un segon POST idèntic (mateix actor, mateixa
+    #    reason) retorna 200 amb la fila existent i SENSE audit nou.
+    #    Qualsevol altra combinació és un conflicte: no es reescriu
+    #    mai una cancel·lació aliena ni s'hi afegeix audit.
+    if row["status"] == "cancelled":
+        if (
+            row["cancelled_by_agent_id"] == caller["id"]
+            and row["cancellation_reason"] == body.reason
+        ):
+            return _row_to_response(row)
+        raise HTTPException(
+            status_code=409,
+            detail="Directiva ja cancel·lada (replay conflictiu)",
+        )
+
+    # 6) Guarda optimista: si l'estat ha canviat des que el client el va
+    #    llegir (claim/complete/fail/reject/expire) la cancel·lació és
+    #    409. Els estats terminals són immutables i queden coberts aquí.
+    if row["status"] != body.expected_status:
+        raise HTTPException(
+            status_code=409,
+            detail="Directiva no cancel·lable (estat inesperat)",
+        )
+
+    # 7) Transició atòmica: exactament UN guanyador. La condició
+    #    ``status`` de l'UPDATE és autoritativa; un perdedor de la cursa
+    #    rep rowcount 0 → rollback → 409 (mai un 200 fals).
     async with get_db() as db:
         cursor = await db.execute(
-            """INSERT INTO directives(
-                   issuer_agent_id, target_agent_id, scope, action, arguments,
-                   required_capability, idempotency_key, expires_at
-               ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
+            """UPDATE directives
+                  SET status = 'cancelled',
+                      cancelled_at = ?,
+                      cancelled_by_agent_id = ?,
+                      cancellation_reason = ?,
+                      completed_at = datetime('now')
+                WHERE id = ? AND status = ?
+                  AND status IN ('pending','claimed')""",
             (
+                _now_sql(),
                 caller["id"],
-                body.target_agent_id,
-                body.scope,
-                body.action,
-                arguments_json,
-                body.required_capability,
-                body.idempotency_key,
-                expires_at,
+                body.reason,
+                directive_id,
+                body.expected_status,
             ),
         )
-        rowid = cursor.lastrowid
-        cursor = await db.execute("SELECT * FROM directives WHERE rowid = ?", (rowid,))
-        row = await cursor.fetchone()
+        if cursor.rowcount != 1:
+            await db.rollback()
+            raise HTTPException(status_code=409, detail="Directiva no cancel·lable")
+        # 8) Audit només de la cancel·lació efectiva (cap en replays).
         await log_audit(
             db,
             caller["id"],
-            "CREATE",
+            "CANCEL",
             "directive",
-            resource_id=row["id"],
-            payload=json.dumps(
-                {
-                    "target_agent_id": body.target_agent_id,
-                    "scope": body.scope,
-                    "action": body.action,
-                    "required_capability": body.required_capability,
-                }
-            ),
+            resource_id=directive_id,
+            payload=json.dumps({"expected_status": body.expected_status}),
         )
         await db.commit()
-    return _row_to_response(row)
+        cursor = await db.execute("SELECT * FROM directives WHERE id = ?", (directive_id,))
+        updated = await cursor.fetchone()
+    return _row_to_response(updated)
 
 
 @router.get("/inbox", response_model=list[DirectiveResponse])
@@ -487,12 +708,20 @@ async def complete_directive(
     directive_id = validate_identifier(directive_id, "directive_id")
     await _claimed_by_caller(directive_id, caller)
     async with get_db() as db:
-        await db.execute(
+        cursor = await db.execute(
             """UPDATE directives SET status = 'completed', completed_at = datetime('now'),
                    result = ?, error = NULL
                WHERE id = ? AND status = 'claimed' AND claimed_by_agent_id = ?""",
             (json.dumps(body.result), directive_id, caller["id"]),
         )
+        # D3-C race hardening: the pre-check above is not sufficient in
+        # a race (a concurrent cancel/claim could have moved the row
+        # between the fetch and this UPDATE). rowcount != 1 means THIS
+        # request did NOT produce the authoritative state -> rollback,
+        # NO audit, 409. Never a false 200.
+        if cursor.rowcount != 1:
+            await db.rollback()
+            raise HTTPException(status_code=409, detail="La directiva ja no està en estat reclamat")
         await log_audit(db, caller["id"], "COMPLETE", "directive", resource_id=directive_id)
         await db.commit()
         cursor = await db.execute("SELECT * FROM directives WHERE id = ?", (directive_id,))
@@ -510,12 +739,17 @@ async def fail_directive(
     directive_id = validate_identifier(directive_id, "directive_id")
     await _claimed_by_caller(directive_id, caller)
     async with get_db() as db:
-        await db.execute(
+        cursor = await db.execute(
             """UPDATE directives SET status = 'failed', completed_at = datetime('now'),
                    error = ?
                WHERE id = ? AND status = 'claimed' AND claimed_by_agent_id = ?""",
             (body.error, directive_id, caller["id"]),
         )
+        # D3-C race hardening: same rule as complete — exactly ONE
+        # winner. The loser rolls back, writes NO audit and gets 409.
+        if cursor.rowcount != 1:
+            await db.rollback()
+            raise HTTPException(status_code=409, detail="La directiva ja no està en estat reclamat")
         await log_audit(db, caller["id"], "FAIL", "directive", resource_id=directive_id)
         await db.commit()
         cursor = await db.execute("SELECT * FROM directives WHERE id = ?", (directive_id,))
@@ -538,12 +772,18 @@ async def reject_directive(
     if row["status"] not in {"pending", "claimed"}:
         raise HTTPException(status_code=409, detail="Directiva ja finalitzada")
     async with get_db() as db:
-        await db.execute(
+        cursor = await db.execute(
             """UPDATE directives SET status = 'rejected', completed_at = datetime('now'),
                    error = ? WHERE id = ? AND target_agent_id = ?
                    AND status IN ('pending','claimed')""",
             (body.reason, directive_id, caller["id"]),
         )
+        # D3-C race hardening: the conditional UPDATE is authoritative;
+        # rowcount != 1 (e.g. a concurrent CANCEL already won) means no
+        # transition happened -> rollback + 409, with no audit row.
+        if cursor.rowcount != 1:
+            await db.rollback()
+            raise HTTPException(status_code=409, detail="Directiva ja finalitzada")
         await log_audit(db, caller["id"], "REJECT", "directive", resource_id=directive_id)
         await db.commit()
         cursor = await db.execute("SELECT * FROM directives WHERE id = ?", (directive_id,))
