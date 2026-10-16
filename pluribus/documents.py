@@ -877,7 +877,10 @@ async def update_document(
             try:
                 await rebuild_document_index(db, document_id=document_id)
             except Exception:  # pragma: no cover - never block a valid update
-                logger.exception("chunk/FTS rebuild failed on update for doc %s", document_id)
+                # The raw document_id is untrusted (path param) and is already
+                # recorded in the audit log; never interpolate it into a log
+                # message (log-injection / forged log lines).
+                logger.exception("chunk/FTS rebuild failed on update")
 
         await log_audit(
             db,
@@ -926,7 +929,9 @@ async def delete_document(request: Request, document_id: str) -> DeleteResult:
         try:
             await rebuild_document_index(db, document_id=document_id)
         except Exception:  # pragma: no cover - never block a valid delete
-            logger.exception("chunk/FTS rebuild failed on delete for doc %s", document_id)
+            # See the update path: document_id is untrusted and already logged
+            # via log_audit, so it must not be interpolated into a log message.
+            logger.exception("chunk/FTS rebuild failed on delete")
         await log_audit(
             db,
             agent["id"],
