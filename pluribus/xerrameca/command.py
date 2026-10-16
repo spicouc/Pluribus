@@ -99,18 +99,6 @@ def _require_command_access(agent: dict[str, Any]) -> None:
         )
 
 
-def _internal_admin(agent: dict[str, Any]) -> dict[str, Any]:
-    """Elevate only after command-specific self-service checks have passed.
-
-    Existing create/start/cancel services intentionally remain admin-only. The
-    audit identity is preserved: only the permissions view is elevated inside
-    this narrow command boundary.
-    """
-    permissions = dict(agent.get("permissions") or {})
-    permissions["admin"] = True
-    return {**agent, "permissions": permissions}
-
-
 def _json_list(value: Any) -> list[str]:
     if isinstance(value, list):
         return [str(item) for item in value]
@@ -328,7 +316,6 @@ async def _start(agent: dict[str, Any], tokens: list[str]) -> dict[str, Any]:
     _require_command_access(agent)
     target_token, objective, rounds, timeout, delay, supervisor = _parse_start(tokens)
     target = await _resolve_target(agent, target_token)
-    privileged = _internal_admin(agent)
     body = ConversationCreateRequest(
         name=(f"{agent.get('name') or agent['id']} ↔ {target['name']}")[:128],
         objective=objective,
@@ -341,14 +328,14 @@ async def _start(agent: dict[str, Any], tokens: list[str]) -> dict[str, Any]:
         turn_timeout_seconds=timeout,
         persist_summary=True,
     )
-    created = await create_conversation(privileged, body)
+    created = await create_conversation(agent, body, elevated=True)
     try:
         await _set_turn_delay(created["id"], delay)
-        started = await start_conversation(privileged, created["id"])
+        started = await start_conversation(agent, created["id"], elevated=True)
         await _annotate_kickoff(created["id"], delay)
     except Exception:
         try:
-            await cancel_conversation(privileged, created["id"])
+            await cancel_conversation(agent, created["id"], elevated=True)
         except Exception:
             pass
         raise
@@ -423,7 +410,7 @@ async def _stop(agent: dict[str, Any], conversation_id: str) -> dict[str, Any]:
             status_code=403,
             detail="Només l'agent que ha iniciat aquesta Xerrameca la pot cancel·lar",
         )
-    stopped = await cancel_conversation(_internal_admin(agent), conversation_id)
+    stopped = await cancel_conversation(agent, conversation_id, elevated=True)
     stopped = await _enrich_conversation(stopped)
     return {
         "kind": "stopped",

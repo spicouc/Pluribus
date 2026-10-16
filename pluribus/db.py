@@ -154,7 +154,6 @@ async def _migrate_audit_log_actions(db) -> None:
 async def get_db() -> aiosqlite.Connection:
     """Obté una connexió a SQLite dins d'un context manager asíncron."""
     db_path = Path(settings.DB_PATH)
-    db_path.parent.mkdir(parents=True, exist_ok=True)
     conn = await aiosqlite.connect(str(db_path))
     conn.row_factory = aiosqlite.Row
     await conn.execute("PRAGMA journal_mode=WAL")
@@ -627,6 +626,11 @@ async def init_db() -> None:
     sql_path = Path(__file__).resolve().parent.parent / "scripts" / "init_db.sql"
     if not sql_path.exists():
         raise FileNotFoundError(f"No es troba l'script SQL: {sql_path}")
+
+    # The DB parent directory is created once, before serving traffic, instead
+    # of on every get_db() call. Deployment (README) still creates it, but this
+    # keeps startup self-sufficient.
+    Path(settings.DB_PATH).parent.mkdir(parents=True, exist_ok=True)
 
     sql = sql_path.read_text(encoding="utf-8")
     async with get_db() as db:

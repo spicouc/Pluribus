@@ -237,7 +237,7 @@ El timer inclòs executa el worker cada 15 minuts. Un error fatal o errors de co
 - `allowed_scopes` aplicat a REST, MCP i generació automàtica de relacions.
 - Inventari global d'agents: admin-only; un agent estàndard només pot consultar-se a si mateix.
 - Registre i eliminació d'agents: admin-only.
-- Categories persistents `system`, `config` i `entities`: eliminació admin-only.
+- Categories persistents `system`, `config` i `entities`: eliminació **i canvi de categoria** admin-only (un no-admin no pot des-protegir un fet per esborrar-lo després). Escriure o actualitzar el contingut d'aquestes categories sí que està permès.
 - Configuració, restart i dades globals del dashboard: admin-only.
 - JSON de permisos corrupte falla tancat, sense concedir accessos per defecte.
 - Webhooks signats i amb destinació/IP validada i fixada per entrega.

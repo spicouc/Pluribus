@@ -120,6 +120,46 @@ class RoutePrecedenceTests(unittest.IsolatedAsyncioTestCase):
             response = await self.client.get("/api/config/restart")
         self.assertEqual(response.status_code, 405)
 
+    async def test_docs_are_reachable_for_admin(self) -> None:
+        with patch(
+            "pluribus.security._authenticate_agent",
+            new=AsyncMock(return_value=self.agent),
+        ):
+            response = await self.client.get("/openapi.json")
+        self.assertEqual(response.status_code, 200)
+
+    async def test_docs_are_forbidden_for_non_admin(self) -> None:
+        non_admin = {
+            "id": "reader-route-test",
+            "name": "reader",
+            "permissions": '{"read":true,"write":false,"admin":false}',
+            "allowed_scopes": '["shared"]',
+        }
+        with patch(
+            "pluribus.security._authenticate_agent",
+            new=AsyncMock(return_value=non_admin),
+        ):
+            for path in ("/docs", "/redoc", "/openapi.json"):
+                response = await self.client.get(path)
+                self.assertEqual(response.status_code, 403, path)
+
+    async def test_audit_failure_is_surfaced_not_swallowed(self) -> None:
+        with patch(
+            "pluribus.security._authenticate_agent",
+            new=AsyncMock(return_value=self.agent),
+        ), patch(
+            "pluribus.admin_config._atomic_update_env",
+        ), patch(
+            "pluribus.admin_config._audit",
+            new=AsyncMock(side_effect=RuntimeError("audit down")),
+        ):
+            response = await self.client.post(
+                "/api/config/save",
+                json={"PLURIBUS_RATE_LIMIT": "150"},
+            )
+        self.assertEqual(response.status_code, 500)
+        self.assertIn("auditoria", response.json()["detail"])
+
 
 if __name__ == "__main__":
     unittest.main()

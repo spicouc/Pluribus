@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import logging
 import os
 from pathlib import Path
 import re
@@ -19,6 +20,8 @@ from fastapi.responses import JSONResponse
 from pluribus.audit import log_audit
 from pluribus.config import settings
 from pluribus.db import get_db
+
+logger = logging.getLogger("pluribus.admin_config")
 
 router = APIRouter(tags=["admin-config"])
 
@@ -202,19 +205,21 @@ def _restart_service(delay_seconds: float = 0.5) -> threading.Timer:
 
 
 async def _audit(agent_id: str, action: str, payload: dict[str, Any]) -> None:
-    try:
-        async with get_db() as db:
-            await log_audit(
-                db,
-                agent_id,
-                action,
-                "config",
-                resource_id="pluribus.env",
-                payload=json.dumps(payload, sort_keys=True),
-            )
-            await db.commit()
-    except Exception:
-        pass
+    """Write an audit entry, propagating failures instead of swallowing them.
+
+    A configuration change that cannot be recorded must be visible to the
+    caller; the callers below turn an audit failure into a 500.
+    """
+    async with get_db() as db:
+        await log_audit(
+            db,
+            agent_id,
+            action,
+            "config",
+            resource_id="pluribus.env",
+            payload=json.dumps(payload, sort_keys=True),
+        )
+        await db.commit()
 
 
 @router.post("/api/config/save")
@@ -235,7 +240,15 @@ async def secure_save_config(request: Request) -> JSONResponse:
     except RuntimeError as exc:
         raise HTTPException(status_code=500, detail=str(exc)) from exc
 
-    await _audit(agent["id"], "CONFIG_UPDATE", {"updated_keys": sorted(updates)})
+    try:
+        await _audit(agent["id"], "CONFIG_UPDATE", {"updated_keys": sorted(updates)})
+    except Exception as exc:
+        logger.error("No s'ha pogut auditar CONFIG_UPDATE: %s", exc)
+        raise HTTPException(
+            status_code=500,
+            detail="Configuració aplicada però l'auditoria ha fallat; revisa els logs",
+        ) from exc
+
     result: dict[str, Any] = {
         "message": "Configuració guardada",
         "updated_keys": sorted(updates),
@@ -251,8 +264,15 @@ async def secure_save_config(request: Request) -> JSONResponse:
 @router.post("/api/config/restart")
 async def secure_restart(request: Request) -> JSONResponse:
     agent = _require_admin(request)
+    try:
+        await _audit(agent["id"], "SERVICE_RESTART", {})
+    except Exception as exc:
+        logger.error("No s'ha pogut auditar SERVICE_RESTART: %s", exc)
+        raise HTTPException(
+            status_code=500,
+            detail="No s'ha pogut registrar l'auditoria; el servei no s'ha reiniciat",
+        ) from exc
     _restart_service()
-    await _audit(agent["id"], "SERVICE_RESTART", {})
     return JSONResponse({"message": "Reiniciant Pluribus..."})
 
 

@@ -64,9 +64,12 @@ async def _decorate(payload: dict[str, Any]) -> dict[str, Any]:
 
 
 async def create_conversation(
-    agent: dict[str, Any], body: ConversationCreateRequest
+    agent: dict[str, Any],
+    body: ConversationCreateRequest,
+    *,
+    elevated: bool = False,
 ) -> dict[str, Any]:
-    payload = await legacy.create_conversation(agent, body)
+    payload = await legacy.create_conversation(agent, body, elevated=elevated)
     async with get_db() as db:
         await db.execute(
             """UPDATE xerrameca_conversations
@@ -113,14 +116,19 @@ def _kickoff_content(conv: Any, participants: list[dict[str, Any]]) -> str:
     )
 
 
-async def start_conversation(agent: dict[str, Any], conversation_id: str) -> dict[str, Any]:
+async def start_conversation(
+    agent: dict[str, Any],
+    conversation_id: str,
+    *,
+    elevated: bool = False,
+) -> dict[str, Any]:
     async with get_db() as db:
         conv = await legacy._conversation(db, conversation_id)
         protocol = conv["protocol_version"] if "protocol_version" in conv.keys() else "legacy-v0"
     if protocol != PROTOCOL_VERSION:
-        return await legacy.start_conversation(agent, conversation_id)
+        return await legacy.start_conversation(agent, conversation_id, elevated=elevated)
 
-    payload = await legacy.start_conversation(agent, conversation_id)
+    payload = await legacy.start_conversation(agent, conversation_id, elevated=elevated)
     async with get_db() as db:
         await db.execute("BEGIN IMMEDIATE")
         conv = await legacy._conversation(db, conversation_id)

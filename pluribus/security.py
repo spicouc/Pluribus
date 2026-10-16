@@ -21,6 +21,11 @@ _LEGACY_SCAN_WINDOW = 60.0
 _LEGACY_SCAN_PER_CLIENT = 5
 _LEGACY_SCAN_GLOBAL = 30
 
+# FastAPI's generated docs expose the full API surface. They stay reachable with
+# an API key, but only admins get to read them; discovery by regular agents is
+# intentionally dropped in favour of a smaller authenticated attack surface.
+_ADMIN_ONLY_DOCS = {"/docs", "/redoc", "/openapi.json", "/docs/oauth2-redirect"}
+
 
 class LRUCache:
     """Petit cache LRU protegit per lock per resultats de bcrypt."""
@@ -77,7 +82,7 @@ def _cleanup_rate_limiter() -> None:
 def _check_rate_limit(agent_id: str) -> bool:
     global _last_rate_cleanup
     now = time.time()
-    if now - _last_rate_cleanup >= 60:
+    if now - _last_rate_cleanup >= settings.RATE_LIMIT_WINDOW:
         _cleanup_rate_limiter()
     window_start = now - settings.RATE_LIMIT_WINDOW
     valid = [ts for ts in _rate_limiter[agent_id] if ts >= window_start]
@@ -243,6 +248,11 @@ def register_security_middleware(app: FastAPI) -> None:
                     agent_found["allowed_scopes"] = json.loads(agent_found["allowed_scopes"])
             except Exception:
                 agent_found["allowed_scopes"] = []
+            if path in _ADMIN_ONLY_DOCS and not (agent_found.get("permissions") or {}).get("admin", False):
+                return JSONResponse(
+                    status_code=403,
+                    content={"detail": "La documentació de l'API requereix permís admin"},
+                )
             request.state.agent = agent_found
             return await call_next(request)
 

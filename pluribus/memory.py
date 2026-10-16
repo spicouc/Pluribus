@@ -14,6 +14,7 @@ from fastapi import APIRouter, BackgroundTasks, Depends, HTTPException, Query, R
 from starlette.responses import JSONResponse
 
 from pluribus.audit import log_audit
+from pluribus.authorization import _PROTECTED_CATEGORIES, _assert_category_change_allowed
 from pluribus.config import settings
 from pluribus.db import get_db
 from pluribus.webhooks import trigger_fact_created_webhooks
@@ -22,8 +23,9 @@ from pluribus.expiry_worker import expire_old_facts
 
 # ── Categories persistents de la flota ─────────────────────────────────
 # Els fets d'infraestructura (system/config/entities) no es poden esborrar
-# per agents sense permís admin, perquè constitueixen la memòria persistent.
-_PROTECTED_CATEGORIES = {"system", "config", "entities"}
+# ni des-protegir per agents sense permís admin. La constant viu a
+# `pluribus.authorization` perquè el guard central i aquest handler no es
+# puguin desincronitzar.
 
 from pluribus.models import (
     AuditEntry,
@@ -689,7 +691,7 @@ async def update_memory(
     async with get_db() as db:
         # Comprova que el fet existeix i no està eliminat
         cursor = await db.execute(
-            "SELECT id, content, metadata FROM facts WHERE id = ? AND deleted_at IS NULL",
+            "SELECT id, content, metadata, category FROM facts WHERE id = ? AND deleted_at IS NULL",
             (fact_id,),
         )
         existing = await cursor.fetchone()
@@ -697,6 +699,11 @@ async def update_memory(
             raise HTTPException(status_code=404, detail="Fet no trobat")
 
         existing_dict = dict(existing)
+        _assert_category_change_allowed(
+            agent,
+            existing_dict.get("category") or "",
+            body.category,
+        )
         new_metadata = body.metadata
         if new_metadata is None:
             try:
