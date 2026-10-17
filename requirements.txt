@@ -8,4 +8,4 @@ httpx>=0.27.0
 requests>=2.31.0
 numpy>=1.24.0
 python-dotenv>=1.0.0
-turbovec>=0.7.0
+turbovec>=0.8.0
